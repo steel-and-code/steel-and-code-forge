@@ -139,7 +139,9 @@ hard to express at a shell prompt, the design is wrong, not the terminal.
 
 Code lives under `forge/`; `forge/workflows/` is the top-level entry point for
 orchestration logic, `forge/agents/` for agent definitions. The interface layer
-that a person drives has no home yet — no `forge/cli/` directory exists.
+a person drives lives in `forge/cli/`, and is the `forge` command. It currently
+classifies operations and asks for approval; it executes nothing, because no
+execution layer exists behind the approval gate yet.
 
 ### OpenRouter — model gateway
 
@@ -227,7 +229,6 @@ differ.
 - OpenRouter integration, or any model provider client.
 - n8n wiring.
 - Agent logic, prompts, or execution.
-- CLI, TUI, or any interface implementation.
 - Database or persistence layer.
 - Public API and its schema.
 - Python classes for the agent contract.
@@ -257,6 +258,9 @@ Decisions taken during design that are not obvious from the surface list, and
 would otherwise be re-litigated:
 
 - Terminal-first, HTTP secondary (see Interaction surfaces).
+- One binary, agent name as a subcommand — `forge byte`, later `forge ember`.
+  Not one binary per agent.
+- The terminal entry point classifies and asks; execution arrives later.
 - Model access behind one gateway interface; no vendor names above it.
 - Agents are configuration, not classes or services.
 - Agents may use credentials but never see them.
@@ -268,8 +272,6 @@ would otherwise be re-litigated:
 
 ## Open questions
 
-- What does the terminal entry point look like: one command per agent, or a
-  single command that takes an agent name?
 - What is the session model: persistent resumable sessions, or one-shot runs?
 - Does the website get a different interface from n8n, or one shared secondary
   surface with per-consumer credentials?

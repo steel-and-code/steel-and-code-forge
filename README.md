@@ -12,6 +12,7 @@ agent logic, no UI, no database, and no API exist yet.
 forge/
   agents/     agent definitions (Byte, Ember, Fin)
   models/     model client abstractions (OpenRouter gateway)
+  cli/        terminal entry point (the `forge` command)
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
@@ -49,19 +50,47 @@ Byte is the only agent specified so far. See
 
 Initial scaffold. The enforcement pipeline is complete for v1: workspace
 containment, secret-source classification, command classification, and the
-terminal approval step that sits between classification and execution. Byte's
-agent contract is fully specified — system instructions and memory included.
-Next steps, in order:
+terminal approval step that sits between classification and execution. A
+terminal entry point exists and drives all of it. Byte's agent contract is
+fully specified — system instructions and memory included.
 
-1. Define the terminal entry point and drive the approval prompt from it. The
-   classifiers and the approval step are ready for it; the command execution
-   layer they hand off to does not exist yet.
+Nothing executes yet. Next steps, in order:
+
+1. Implement the command execution layer behind the approval gate. This is the
+   one piece the pipeline is still missing.
 2. Define the model gateway contract in `forge/models/`.
 3. Implement the agent contract in `forge/agents/`.
 4. Implement session memory, the one memory scope v1 enables.
 5. Define the secondary HTTP surface n8n and the website will call.
 6. Wire n8n trigger handling.
 7. Write the remaining tools.
+
+## Terminal interface
+
+```
+forge                                          status and exit code
+forge check command --workspace DIR [-- PROG ARG...]
+forge check path    --workspace DIR PATH [PATH...]
+```
+
+Shared options go after the leaf subcommand: `--workspace`, `--agent`, `--json`,
+`--classify-only`, `--unattended`. The `--` separator is required on
+`check command` so a command's own flags are never read as Forge's.
+
+Exit codes: 0 success, 1 refused, 2 malformed invocation, 3 approval would be
+required, 4 internal failure.
+
+```bash
+forge check command --workspace . -- pytest tests/ -q
+forge check command --workspace . -- rm -rf build      # prompts; runs nothing
+forge check path --workspace . secrets.json
+```
+
+The CLI classifies and asks. It never executes, and an approved operation says
+so. It holds no policy: command and secret verdicts are ranked together by the
+approval layer, so `forge check command -- cat secrets.json` reports
+`APPROVAL REQUIRED` even though `cat` is ordinary. See
+[docs/byte-tools.md](docs/byte-tools.md) for the full behaviour.
 
 ## Documentation
 
