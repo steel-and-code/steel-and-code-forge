@@ -614,10 +614,14 @@ built on top without re-running any of these checks. `approval.py` builds on
 exactly those fields and adds nothing of its own.
 
 Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
-`tests/test_commands.py` (174), and `tests/test_approval.py` (70). 326 passing.
+`tests/test_commands.py` (174), `tests/test_approval.py` (100),
+`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 522 passing.
 
-Not implemented, by decision: command execution, agent runtime, CLI/TUI, HTTP
-surface, memory.
+Implemented: workspace containment, secret classification, command
+classification, terminal approval, the terminal interface, and command execution.
+
+Not implemented, by decision: `shell=True`, credential injection, agent
+runtime, CLI/TUI, HTTP surface, memory.
 
 **CLI status.** A terminal entry point now exists in `forge/cli/`:
 `main.py` owns argv, wiring, and exit codes; `render.py` is pure presentation.
@@ -729,6 +733,229 @@ availability check and the same strict parse, so it is not a bypass.
 Two things this step deliberately does not do. It performs no git lookup, so
 git context is only what a caller supplies. And it executes nothing — an
 `ApprovalOutcome` is a handoff to a future execution layer.
+
+### Command execution
+
+Status: **implemented** in `forge/tools/execution.py`. It is the only place Forge
+launches a process.
+
+The layer holds no policy. It does not classify, does not approve, and cannot
+widen a permission. It runs an operation that was already approved, or returns a
+result saying it did not run.
+
+#### Approvals are single-spend capabilities
+
+An approved outcome is a capability: `claim()` spends it, exactly once, for
+exactly one operation. The state lives in a `ClaimToken` held inside the frozen
+`ApprovalOutcome`, not in a field the caller threads forward.
+
+That placement is the guarantee. Copying an outcome — by assignment,
+`dataclasses.replace()`, `copy.copy()`, or `copy.deepcopy()` — copies a
+*reference* to the same token, so every copy shares one claim and only one can
+win. A per-executor "already spent" set would have let a second executor launch
+the same approved command again; a plain dataclass flag would have been copied
+rather than shared.
+
+`ClaimToken.__deepcopy__` returns `self` for the same reason: the default path
+would try to pickle the lock and raise, and an implementation that *cloned* the
+token would mint a second spendable capability.
+
+`consume()` remains as a compatibility alias and delegates to `claim()`, so the
+two cannot disagree. The old `consumed` field is gone; `claimed` is computed
+from the token and cannot go stale.
+
+#### Approvals are structurally bound to the invocation
+
+An approval for `rm -rf build` does not authorise `rm -rf src`. Forge recomputes
+a digest from both the approved request and the requested execution, and refuses
+unless they match. The caller is not trusted to assert the two correspond.
+
+The digest covers:
+
+| Field | Note |
+| --- | --- |
+| Program token | **Exact**, as supplied — not the classifier's normalised basename. |
+| Argv | Exact tokens, boundaries preserved. |
+| Workspace | Resolved. |
+| Cwd | Resolved. |
+| Invocation form | argv or shell. |
+
+The program token is bound verbatim on purpose. The classifier lowercases a
+basename to match rules against, and reusing that normalisation here would make
+`/usr/bin/rm` and `rm` one approval — approving one would authorise whichever
+file the other resolved to. Classification answers *which rules apply*;
+execution binding answers *which operation runs*.
+
+argv boundaries matter for the same reason: `["-rf", "a b"]` and `["-rf", "a",
+"b"]` render identically in the human-readable detail string and are different
+operations. Binding cannot be built from that string.
+
+No environment and no value of any kind enters the digest, so it cannot serve as
+an offline check against a guessable secret. That is also why a future
+credential design needs opaque handles rather than raw values.
+
+**A shell-string approval cannot be spent by an argv execution.** A shell string
+is not an argv invocation, so there is nothing to bind; the executor refuses.
+This is a structural reason `shell=True` is out of scope, not only a policy one.
+
+#### Claim timing
+
+    validation → atomic claim → launch
+
+Validation failure does **not** spend the approval. A mismatched or malformed
+request leaves the operator's yes intact for the operation they actually
+approved; a caller bug must not become a second, silent refusal.
+
+Once the claim succeeds the approval is spent, **even if the launch then fails**.
+One approval authorises one launch attempt. A retry after the environment
+changed must go back through approval, because the executor cannot know what
+changed.
+
+#### Execution states
+
+| State | Meaning | `exit_code` |
+| --- | --- | --- |
+| `COMPLETED` | Ran, exit 0. | 0 |
+| `FAILED` | Ran, non-zero. | the child's |
+| `TIMED_OUT` | Forge signalled it. | `None` |
+| `LAUNCH_FAILED` | Could not start. | `None` |
+| `INVALID_APPROVAL` | Capability or binding problem. | `None` |
+| `INVALID_REQUEST` | Malformed input: bad timeout, bad cwd, unsupported option. | `None` |
+
+Forge state and child exit code are separate. A failing test suite is `FAILED`,
+which is a normal result to report rather than an error.
+
+Every refusal is a result, never an exception. A caller that forgot to handle
+something gets something it cannot mistake for a completed run, not a traceback.
+
+#### Environment
+
+Forge-owned and fixed. **The parent environment is not inherited.** It holds
+whatever the operator's shell had — tokens, SSH agents, database URLs — and
+passing it through would hand every executed command every secret the session
+held.
+
+| Variable | Value |
+| --- | --- |
+| `PATH` | `/usr/local/bin:/usr/bin:/bin` |
+| `HOME` | The workspace root |
+| `LANG` / `LC_ALL` | `C.UTF-8` |
+| `PWD` | The resolved cwd |
+
+`HOME` points at the workspace so tools do not scatter state into the operator's
+real home directory. A test runner writing `~/.cache` is normal, and it should
+not reach outside.
+
+There is **no caller-supplied environment** in v1 — not defaulted-to-empty,
+absent. There is no argument through which `PYTHONPATH`, `LD_PRELOAD`, or a
+credential could be passed. Binding environment *names* would not have been
+sufficient anyway: `PYTHONPATH=/safe` and `PYTHONPATH=/attacker` have identical
+key sets and radically different behaviour.
+
+stdin is `DEVNULL`: the child sees EOF immediately rather than waiting for input.
+
+#### Output is bounded while the child runs
+
+One drain thread per stream, reading **to EOF continuously** and retaining only
+the first N bytes.
+
+Reading does not stop at the cap. A drainer that returned once it had its N
+bytes would let the child fill the pipe buffer and block forever — turning a
+truncation into a hang, which is worse than the unbounded output it was meant to
+prevent. Bytes beyond the cap are counted and discarded, never stored.
+
+| Limit | Value |
+| --- | --- |
+| Retained per stream | 1 MiB default, 16 MiB hard maximum |
+| Byte accounting | Total **seen** reported separately from **retained** |
+
+The retained head is kept, because a traceback's useful part is at the top and
+finding the tail would require holding everything. Truncation is always flagged:
+a truncated result that did not say so would be silently wrong.
+
+stdout and stderr are separate, capped independently, and decoded once with
+`errors="replace"` so malformed bytes cannot raise.
+
+#### Secret-bearing output
+
+**Process output is untrusted and may contain sensitive data.** It is bounded,
+not redacted, and no redaction guarantee is made.
+
+The secret classifier classifies paths and reads candidate files for PEM markers
+and key names. Applying it to a stream of unbounded process output would be a
+different problem with different failure modes, and claiming otherwise would be
+the false assurance the rest of this document avoids.
+
+So v1's posture is: bounded capture, byte counts recorded rather than content,
+output never written to a log or memory, and the policy stated once rather than
+tracked in a field that is always true. A redaction design is real work and
+belongs to its own pass, after an audit trail exists to review what was redacted.
+
+#### Timeout and the process tree
+
+| Setting | Value |
+| --- | --- |
+| Default | 120s |
+| Hard maximum | 900s |
+| SIGTERM grace | 5s, then SIGKILL |
+
+A request timeout may only **lower** the executor's configured default. A timeout
+above it is `INVALID_REQUEST` rather than silently clamped — clamping would run
+the command for less time than asked while reporting success, which is a
+bounded-but-wrong answer. Trusted configuration may set the default anywhere up
+to the hard ceiling.
+
+Every child is started with `start_new_session=True`, making it a process-group
+leader. On timeout Forge sends SIGTERM to the **group**, waits 5 seconds, then
+SIGKILLs the group and reaps.
+
+Signalling only the direct child would leave its descendants running — a command
+that backgrounds work would keep holding the workspace and a process slot long
+after the timeout. SIGKILL is sent unconditionally after the grace window rather
+than polling, because a process that traps SIGTERM would otherwise survive.
+
+Linux-first, like the rest of the security layer. Windows job objects are out of
+scope.
+
+#### Workspace revalidation — and its limit
+
+Immediately before launch, Forge re-proves the workspace root's identity, cwd
+containment, and containment of every approved target, re-resolving symlinks.
+Detected drift fails closed.
+
+> **This is not a sandbox and does not eliminate TOCTOU.** A race necessarily
+> remains between the final validation and whatever an arbitrary child opens
+> afterwards. Targets that were never enumerable — a path named inside inline
+> source, for instance — cannot be re-proved at all, because nothing about them
+> was ever known. True isolation would require an OS-level primitive —
+> namespaces, containerisation, or capability restriction — which is a separate
+> design and not part of this layer.
+
+Nor is the resolved executable path bound: it is resolved at launch, and a file
+can be replaced between resolution and `execve`. The digest proves the
+*invocation* matches the approval; the resolved path recorded in metadata is
+evidence of what ran, not a guarantee about it.
+
+#### Audit metadata
+
+`ExecutionResult.event()` produces an `ExecutionEvent` carrying agent, program,
+arg **count**, workspace, cwd, fingerprint, approval rule, timings, child exit
+code, state, byte counts, and truncation flags.
+
+No stdout, no stderr, **no argv**, no environment. Arguments carry secrets as
+readily as files do — `curl -H "Authorization: Bearer ..."` — so raw argv appears
+in neither the result nor the event. Byte *counts* rather than content, so a
+reviewer can tell a quiet run from a noisy one without the record holding what
+was said.
+
+The fingerprint is the audit join key: it links an execution to the exact
+approval that authorised it without recording either.
+
+Nothing durable is recorded yet. Writing these events somewhere reviewable is the
+audit pass, and it should exist before durable memory is switched on.
+
+Not implemented by decision: `shell=True`, credentials or environment injection,
+stdin, and any second entry point to execution.
 
 ### Needed before Byte is usable
 

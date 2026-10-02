@@ -139,9 +139,14 @@ hard to express at a shell prompt, the design is wrong, not the terminal.
 
 Code lives under `forge/`; `forge/workflows/` is the top-level entry point for
 orchestration logic, `forge/agents/` for agent definitions. The interface layer
-a person drives lives in `forge/cli/`, and is the `forge` command. It currently
-classifies operations and asks for approval; it executes nothing, because no
-execution layer exists behind the approval gate yet.
+a person drives lives in `forge/cli/`, and is the `forge` command. It classifies
+operations and asks for approval; `forge check` still executes nothing.
+
+`forge/tools/execution.py` is the one place Forge launches a process. It runs an
+operation only when handed an already-approved outcome whose binding digest
+matches the invocation exactly, and an approved outcome is a single-spend
+capability that cannot be replayed — including by a second executor. The CLI
+does not call it yet; a future `forge exec` would.
 
 ### OpenRouter — model gateway
 
@@ -260,7 +265,12 @@ would otherwise be re-litigated:
 - Terminal-first, HTTP secondary (see Interaction surfaces).
 - One binary, agent name as a subcommand — `forge byte`, later `forge ember`.
   Not one binary per agent.
-- The terminal entry point classifies and asks; execution arrives later.
+- The terminal entry point classifies and asks; `forge check` still executes
+  nothing.
+- Execution lives in exactly one module and requires a claimed approval. There
+  is no second path to `subprocess`.
+- An approved outcome is a single-spend capability, and it is bound to the exact
+  invocation it approved.
 - Model access behind one gateway interface; no vendor names above it.
 - Agents are configuration, not classes or services.
 - Agents may use credentials but never see them.

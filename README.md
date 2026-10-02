@@ -16,7 +16,7 @@ forge/
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (326 passing)
+tests/        pytest suite (522 passing)
 docs/         architecture and design notes
 ```
 
@@ -54,16 +54,19 @@ terminal approval step that sits between classification and execution. A
 terminal entry point exists and drives all of it. Byte's agent contract is
 fully specified — system instructions and memory included.
 
-Nothing executes yet. Next steps, in order:
+The execution layer exists and runs approved operations; the CLI does not call
+it yet, so `forge check` still executes nothing. Next steps, in order:
 
-1. Implement the command execution layer behind the approval gate. This is the
-   one piece the pipeline is still missing.
+1. Wire a `forge exec` subcommand to the executor, and decide what Byte is
+   allowed to run without asking.
 2. Define the model gateway contract in `forge/models/`.
 3. Implement the agent contract in `forge/agents/`.
 4. Implement session memory, the one memory scope v1 enables.
-5. Define the secondary HTTP surface n8n and the website will call.
-6. Wire n8n trigger handling.
-7. Write the remaining tools.
+5. Record execution and approval events somewhere reviewable. Nothing is
+   recorded durably yet, and this should exist before durable memory is enabled.
+6. Define the secondary HTTP surface n8n and the website will call.
+7. Wire n8n trigger handling.
+8. Write the remaining tools.
 
 ## Terminal interface
 
