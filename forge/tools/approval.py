@@ -32,7 +32,10 @@ secret sources second, classification later, prompt last.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
+import threading
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -53,6 +56,7 @@ __all__ = [
     "Approver",
     "DeniedByPolicy",
     "ApprovalConsumed",
+    "ClaimToken",
     "render_prompt",
     "parse_response",
     "effective_classification",
@@ -182,14 +186,85 @@ class DeniedByPolicy(Exception):
         self.reason = reason
 
 
-class ApprovalConsumed(Exception):
-    """Raised when a settled outcome is consumed more than once.
+class ClaimToken:
+    """Single-spend state shared by every copy of one :class:`ApprovalOutcome`.
 
-    An approval covers one operation and is not remembered. Enforcing that with
-    a consumed flag rather than a convention means a future execution layer
-    cannot re-use a settled approval for a second call, which is the one way
-    "per-operation" could quietly become "per-session".
+    An approval authorises one operation. That has to be an intrinsic property
+    of the approval itself, not a bookkeeping detail of whoever spends it: a
+    per-executor "already used" set would let a second executor spend the same
+    approval, and a plain dataclass flag would be copied rather than shared.
+
+    So the state lives here, in a small mutable object held by an otherwise
+    frozen dataclass. Copying the outcome -- by assignment, ``replace()``,
+    ``copy.copy()``, or ``copy.deepcopy()`` -- copies the *reference* to this
+    object, so every copy shares one claim and only one of them can ever win.
+
+    The check-and-set happens under a lock, so concurrent claims resolve to
+    exactly one winner rather than racing.
+
+    ``__copy__`` and ``__deepcopy__`` return ``self`` deliberately. The default
+    deepcopy path would try to pickle the lock and raise ``TypeError``; and any
+    implementation that *cloned* the token would hand out a second spendable
+    capability, which is precisely the hole this class exists to close.
     """
+
+    __slots__ = ("_lock", "_claimed")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._claimed = False
+
+    def claim(self) -> bool:
+        """Atomically transition unclaimed -> claimed.
+
+        Returns:
+            ``True`` for exactly one caller over this token's lifetime, and
+            ``False`` for every later one.
+        """
+        with self._lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
+
+    @property
+    def claimed(self) -> bool:
+        """Whether this approval has been spent."""
+        with self._lock:
+            return self._claimed
+
+    def __copy__(self) -> "ClaimToken":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "ClaimToken":
+        # Sharing, not cloning: a deepcopy of an outcome must not be a second
+        # capability to spend the same approval.
+        return self
+
+
+class ApprovalConsumed(Exception):
+    """Raised when an already-claimed approval is claimed again.
+
+    An approval covers one operation and is not remembered. An approval that
+    cannot be spent twice is enforced by the shared :class:`ClaimToken` inside
+    :class:`ApprovalOutcome`, so the guarantee holds across copies and across
+    concurrent callers rather than depending on any single caller behaving.
+    """
+
+
+def _realpath_or_empty(path: Path | None) -> str:
+    """Resolve ``path`` for fingerprinting, or yield an empty string.
+
+    A path that cannot be resolved still contributes a stable, distinct value,
+    which is the safe direction: an unresolvable approval cannot match a
+    resolvable execution.
+    """
+    if path is None:
+        return ""
+    try:
+        return os.path.realpath(str(path))
+    except (OSError, ValueError):
+        return f"<unresolvable:{path}>"
 
 
 @dataclass(frozen=True)
@@ -254,6 +329,25 @@ class ApprovalRequest:
     git_context: str | None = None
     matched_rules: tuple[str, ...] = ()
 
+    # -- execution binding ------------------------------------------------
+    #
+    # The exact structural identity of the invocation, kept separately from
+    # `detail`, which is a human-readable join and loses token boundaries.
+    # `detail` cannot prove what will be launched; these can.
+    program: str | None = None
+    args: tuple[str, ...] | None = None
+    cwd: Path | None = None
+    is_shell_form: bool = False
+
+    @property
+    def executable_bindable(self) -> bool:
+        """Whether this request carries a command-shaped identity.
+
+        A secret-source request is a file access, not a command, so it has no
+        program to bind. False there rather than half-filled.
+        """
+        return self.program is not None
+
     @property
     def targets_determinable(self) -> bool:
         """Whether the affected targets are known before execution."""
@@ -298,6 +392,10 @@ class ApprovalRequest:
             is_shell=verdict.is_shell,
             git_context=git_context,
             matched_rules=verdict.matched_rules,
+            program=verdict.program_token or verdict.program,
+            args=tuple(verdict.args),
+            cwd=verdict.cwd,
+            is_shell_form=verdict.is_shell,
         )
 
     @classmethod
@@ -338,6 +436,99 @@ class ApprovalRequest:
             git_context=git_context,
             matched_rules=verdict.matched_rules,
         )
+
+    # -- execution binding ------------------------------------------------
+
+    @staticmethod
+    def fingerprint_for(
+        program: str,
+        args: tuple[str, ...],
+        workspace: Path,
+        cwd: Path,
+        is_shell_form: bool = False,
+    ) -> str:
+        """The binding digest for a launch identity, without building a request.
+
+        Exists so a caller that has an invocation but not an approval -- the
+        execution layer, computing what it is about to ask permission for --
+        can derive the same digest without fabricating an ApprovalRequest and
+        inventing a classification it did not produce. The request method below
+        delegates here, so there is one implementation.
+        """
+        parts = (
+            "forge-approval-v1",
+            program,
+            "\x00".join(args),
+            _realpath_or_empty(workspace),
+            _realpath_or_empty(cwd),
+            "shell" if is_shell_form else "argv",
+        )
+        return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+    def execution_fingerprint(self) -> str:
+        """A digest binding this approval to one exact invocation.
+
+        Covers, and only covers, the things that decide what gets launched:
+
+            the exact program token
+            the exact argv tokens, with boundaries preserved
+            the resolved workspace
+            the resolved cwd
+            whether the invocation is a shell string
+
+        The program token is bound **verbatim**. The classifier lowercases a
+        basename to match rules against, but that normalisation is a
+        classification convenience and reusing it here would be wrong: it would
+        make ``/usr/bin/rm`` and ``rm`` the same approval, so approving one
+        would authorise whichever file the other happened to resolve to.
+        Execution binding answers a different question -- *which operation is
+        being launched* -- and needs the exact token the operator saw.
+
+        Nothing secret enters this digest. There is no environment and no value
+        of any kind in the input, so the result cannot be used as an offline
+        check against a guessable secret. That is also why a future credential
+        design needs opaque handles rather than raw values: a digest of a
+        low-entropy value would be a verification oracle for it.
+
+        Deliberately *not* included: the resolved executable path. Resolving it
+        is a launch-time act, and a digest of it would still not close the
+        window between resolution and execve. The resolved path is recorded in
+        execution metadata as evidence of what ran, not bound as a guarantee.
+        """
+        return ApprovalRequest.fingerprint_for(
+            self.program or "",
+            tuple(self.args or ()),
+            self.workspace,
+            self.cwd or self.workspace,
+            self.is_shell_form,
+        )
+
+    def to_public_dict(self) -> dict[str, object]:
+        """A serialisable projection with no private or non-public field."""
+        body: dict[str, object] = {
+            "kind": self.kind.value,
+            "agent": self.agent,
+            "tool": self.tool,
+            "operation": self.operation,
+            "rule": self.rule,
+            "classification": self.classification.value,
+            "reason": self.reason,
+            "workspace": str(self.workspace),
+            "detail": self.detail,
+            "is_shell": self.is_shell,
+        }
+        if self.intent is not None:
+            body["intent"] = self.intent
+        if self.targets:
+            body["targets"] = [str(t) for t in self.targets]
+        if self.git_context is not None:
+            body["git_context"] = self.git_context
+        if self.matched_rules:
+            body["matched_rules"] = list(self.matched_rules)
+        if self.program is not None:
+            body["program"] = self.program
+            body["arg_count"] = len(self.args or ())
+        return body
 
     # -- rendering ------------------------------------------------------
 
@@ -432,6 +623,9 @@ def parse_response(raw: str | None) -> bool:
 class ApprovalOutcome:
     """The settled result of routing one operation through approval.
 
+    An approved outcome is a **single-spend capability**. :meth:`claim` spends
+    it, exactly once, for exactly one operation.
+
     Attributes:
         decision: What happened.
         request: The request that was settled, or ``None`` when the
@@ -442,16 +636,23 @@ class ApprovalOutcome:
             present. Retained so a later audit surface can show what was
             answered; v1 records no durable audit trail, and this is an
             in-memory field that dies with the outcome.
-        consumed: Whether the outcome has been used. An approval is good for one
-            operation; :meth:`consume` is how the future execution layer claims
-            it, and claiming twice raises.
     """
 
     decision: ApprovalDecision
     detail: str
     request: ApprovalRequest | None = None
     operator_response: str | None = None
-    consumed: bool = field(default=False)
+
+    # The single-spend state. `repr=False` and `compare=False` keep it out of
+    # reprs and equality; the field is private and read only through
+    # `claimed`/`claim`, so no caller can mutate it directly.
+    #
+    # `default_factory` gives every *distinct* outcome its own token. Copies of
+    # one outcome share the reference, which is what makes the guarantee hold
+    # across assignment, replace(), copy.copy(), and copy.deepcopy().
+    _token: ClaimToken = field(
+        default_factory=ClaimToken, repr=False, compare=False
+    )
 
     @property
     def approved(self) -> bool:
@@ -465,12 +666,21 @@ class ApprovalOutcome:
         )
 
     @property
+    def claimed(self) -> bool:
+        """Whether this approval has been spent.
+
+        Computed from the shared token rather than stored, so it cannot go stale
+        and cannot disagree with the gate :meth:`claim` actually uses.
+        """
+        return self._token.claimed
+
+    @property
     def human_decided(self) -> bool:
         """Whether a human made this call.
 
         False for both policy denials and for an unattended failure. A denial
-        is not something a human declined -- no, because the answer could not
-        be anything but no.
+        is not something a human declined -- no, because the answer could not be
+        anything but no.
         """
         return self.decision.human_decided
 
@@ -484,19 +694,56 @@ class ApprovalOutcome:
         """
         return self.decision is ApprovalDecision.DENIED_UNATTENDED
 
-    def consume(self) -> "ApprovalOutcome":
-        """Claim this outcome for one execution and return it marked consumed.
+    def claim(self) -> "ApprovalOutcome":
+        """Spend this approval. Authorises exactly one operation, once.
+
+        Returns ``self``. The return value exists for callers that want to bind
+        the claimed outcome to whatever they do next -- the execution layer
+        passes the returned outcome to the launcher -- but it carries no
+        additional state: the spend has already happened, whether or not
+        anything is done with it.
 
         Raises:
-            ApprovalConsumed: Already consumed. An approval covers one
-                operation; a second claim would silently widen it.
+            ApprovalConsumed: Already claimed. A second claim would silently
+                widen a per-operation approval into a reusable one.
         """
-        if self.consumed:
+        if not self._token.claim():
             raise ApprovalConsumed(
-                "this approval has already been consumed; approval is "
+                "this approval has already been claimed; approval is "
                 "per-operation and is not reusable"
             )
-        return replace(self, consumed=True)
+        return self
+
+    def consume(self) -> "ApprovalOutcome":
+        """Compatibility alias for :meth:`claim`.
+
+        Kept because ``consume`` was the original name and callers may still
+        read it. The semantics are identical -- both delegate to the shared
+        token -- so the two cannot disagree.
+        """
+        return self.claim()
+
+    def to_public_dict(self) -> dict[str, object]:
+        """A token-free projection, safe to serialise.
+
+        The claim token is deliberately absent: it is not state worth
+        recording, it holds no information an audit needs, and omitting it here
+        gives one obvious place that decides what leaves an outcome.
+
+        Note that ``dataclasses.asdict`` is *not* this method -- asdict copies
+        every field including the private one, and the result is not
+        serialisable. Callers wanting a safe projection use this.
+        """
+        body: dict[str, object] = {
+            "decision": self.decision.value,
+            "detail": self.detail,
+            "claimed": self.claimed,
+        }
+        if self.operator_response is not None:
+            body["operator_response"] = self.operator_response
+        if self.request is not None:
+            body["request"] = self.request.to_public_dict()
+        return body
 
     def __str__(self) -> str:  # pragma: no cover - operator convenience
         target = self.request.detail if self.request is not None else "-"

@@ -287,6 +287,10 @@ class CommandVerdict:
         reason: Human-readable explanation. Safe for an operator. Never
             contains environment values.
         program: The normalised program basename.
+        program_token: The program exactly as supplied, before normalisation.
+            Execution binding uses this rather than ``program``: the normalised
+            basename exists to match classification rules against, and binding
+            on it would make ``/usr/bin/rm`` and ``rm`` the same approval.
         args: The arguments as supplied.
         cwd: The resolved working directory.
         matched_rules: Every rule that fired, not only the deciding one.
@@ -310,6 +314,10 @@ class CommandVerdict:
     targets_resolved: tuple[Path, ...] = ()
     owned_pids: frozenset[int] = field(default_factory=frozenset)
     is_shell: bool = False
+    # The program exactly as supplied, before normalisation. Declared after the
+    # non-default fields deliberately: a dataclass rejects a defaulted field
+    # that precedes a non-defaulted one.
+    program_token: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -673,6 +681,7 @@ class CommandClassifier:
                 rule=cwd_resolution.rule,
                 reason=f"working directory is outside the workspace: {cwd_resolution.reason}",
                 program=program,
+                program_token=command.program,
                 args=command.args,
                 cwd=cwd_resolution.resolved or self.workspace.root,
                 matched_rules=(cwd_resolution.rule,),
@@ -748,6 +757,7 @@ class CommandClassifier:
             rule=deciding.rule_id if deciding else "none",
             reason=reason,
             program=program,
+            program_token=command.program,
             args=command.args,
             cwd=cwd,
             matched_rules=tuple(matched_ids),

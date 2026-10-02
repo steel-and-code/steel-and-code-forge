@@ -13,7 +13,10 @@ real resolved target list.
 
 from __future__ import annotations
 
+import copy
 import io
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -398,24 +401,11 @@ def test_approver_remembers_nothing_between_operations(
 
     assert first.approved and second.approved
     assert len(channel.presented) == 2
-
-
-def test_outcome_can_be_consumed_once() -> None:
-    outcome = ApprovalOutcome(
-        decision=ApprovalDecision.APPROVED, detail="approved", consumed=False
-    )
-
-    claimed = outcome.consume()
-
-    assert claimed.consumed is True
-    assert outcome.consumed is False  # frozen: the original is untouched
-
-
-def test_consuming_twice_raises() -> None:
-    outcome = ApprovalOutcome(decision=ApprovalDecision.APPROVED, detail="approved")
-
-    with pytest.raises(ApprovalConsumed):
-        outcome.consume().consume()
+    # Two decisions produce two independent capabilities, so spending one
+    # leaves the other spendable.
+    assert not first.claimed
+    first.claim()
+    assert first.claimed and not second.claimed
 
 
 def test_approving_the_same_command_twice_uses_two_separate_outcomes(
@@ -425,13 +415,13 @@ def test_approving_the_same_command_twice_uses_two_separate_outcomes(
     approver = Approver(channel)
     command = classifier.classify(_cmd("git", "commit", "-m", "x"))
 
-    approver.submit_command(command, agent="byte").consume()
+    approver.submit_command(command, agent="byte").claim()
     second = approver.submit_command(command, agent="byte")
 
-    # A second approval was genuinely required and genuinely given, and its
-    # outcome is unconsumed.
+    # A second approval was genuinely required and genuinely given, and it is
+    # still spendable.
     assert second.approved
-    assert second.consumed is False
+    assert not second.claimed
 
 
 # ==========================================================================
@@ -986,6 +976,232 @@ def test_no_secret_verdicts_leaves_command_verdict_unchanged(
     assert outcome.decision is ApprovalDecision.APPROVED
     assert outcome.request is not None
     assert outcome.request.rule == "cmd.git_commit"
+
+
+# ==========================================================================
+# Single-spend approvals
+# ==========================================================================
+#
+# An approved outcome is a capability. Spending it is guarded by a ClaimToken
+# held inside the frozen dataclass, so the guarantee survives assignment,
+# replace(), copy.copy(), copy.deepcopy(), and concurrent callers -- rather than
+# depending on any single consumer threading the returned value forward.
+
+def _approved() -> ApprovalOutcome:
+    return ApprovalOutcome(decision=ApprovalDecision.APPROVED, detail="test")
+
+
+def test_claiming_an_unclaimed_approval_succeeds() -> None:
+    outcome = _approved()
+
+    assert outcome.claimed is False
+    outcome.claim()
+    assert outcome.claimed is True
+
+
+def test_claiming_the_same_outcome_twice_raises() -> None:
+    outcome = _approved()
+    outcome.claim()
+
+    with pytest.raises(ApprovalConsumed):
+        outcome.claim()
+
+
+def test_claiming_the_original_twice_raises() -> None:
+    """The original object is spent, not a copy handed back by claim().
+
+    claim() returns self, so the caller's variable and the returned value are
+    the same object. If claim() had returned a marked *copy* -- as the old
+    implementation did -- the original would still look unspent and could be
+    spent again.
+    """
+    outcome = _approved()
+    claimed = outcome.claim()
+
+    assert claimed is outcome
+    with pytest.raises(ApprovalConsumed):
+        outcome.claim()
+
+
+def test_two_references_to_one_outcome_cannot_both_claim() -> None:
+    outcome = _approved()
+    alias = outcome
+
+    outcome.claim()
+
+    with pytest.raises(ApprovalConsumed):
+        alias.claim()
+
+
+def test_replace_shares_the_claim_token() -> None:
+    outcome = _approved()
+    replaced = replace(outcome, detail="different")
+
+    outcome.claim()
+
+    with pytest.raises(ApprovalConsumed):
+        replaced.claim()
+
+
+def test_replace_before_claiming_still_shares() -> None:
+    outcome = _approved()
+    replaced = replace(outcome)
+
+    replaced.claim()
+
+    assert outcome.claimed is True
+
+
+def test_copy_copy_shares_the_claim_token() -> None:
+    outcome = _approved()
+    copied = copy.copy(outcome)
+
+    outcome.claim()
+
+    with pytest.raises(ApprovalConsumed):
+        copied.claim()
+
+
+def test_copy_deepcopy_shares_the_claim_token() -> None:
+    """A deepcopy must not mint a second spendable capability.
+
+    This is why ClaimToken implements __deepcopy__ returning self. The default
+    path would try to pickle the lock and raise TypeError; an implementation
+    that cloned the token would hand out a second capability, which is exactly
+    the hole the token exists to close.
+    """
+    outcome = _approved()
+    deep = copy.deepcopy(outcome)
+
+    assert deep._token is outcome._token
+
+    outcome.claim()
+    with pytest.raises(ApprovalConsumed):
+        deep.claim()
+
+
+def test_concurrent_claims_yield_exactly_one_winner() -> None:
+    outcome = _approved()
+    winners: list[int] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(32)
+
+    def attempt() -> None:
+        barrier.wait()
+        try:
+            outcome.claim()
+        except ApprovalConsumed:
+            return
+        with lock:
+            winners.append(1)
+
+    threads = [threading.Thread(target=attempt) for _ in range(32)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(winners) == 1
+
+
+def test_consume_is_an_alias_for_claim() -> None:
+    outcome = _approved()
+
+    outcome.consume()
+
+    assert outcome.claimed is True
+    with pytest.raises(ApprovalConsumed):
+        outcome.consume()
+
+
+def test_consumed_field_no_longer_exists() -> None:
+    """The field was removed; `claimed` is the live state.
+
+    A stored flag could disagree with the token, and this is the test that stops
+    someone reintroducing one.
+    """
+    assert "consumed" not in ApprovalOutcome.__dataclass_fields__
+    assert not hasattr(_approved(), "consumed")
+
+
+def test_claimed_is_computed_not_stored() -> None:
+    assert "claimed" not in ApprovalOutcome.__dataclass_fields__
+
+
+def test_claim_token_is_absent_from_repr() -> None:
+    assert "ClaimToken" not in repr(_approved())
+    assert "_token" not in repr(_approved())
+
+
+def test_claim_token_is_absent_from_equality() -> None:
+    """Two outcomes differing only in claim state compare equal.
+
+    Otherwise spending an approval would change its value, which would be a
+    surprising thing for a security-relevant object.
+    """
+    outcome = _approved()
+    before = outcome == ApprovalOutcome(decision=ApprovalDecision.APPROVED, detail="test")
+
+    outcome.claim()
+    after = outcome == ApprovalOutcome(decision=ApprovalDecision.APPROVED, detail="test")
+
+    assert before and after
+
+
+def test_claim_token_is_absent_from_public_dict() -> None:
+    body = _approved().to_public_dict()
+
+    assert "_token" not in body
+    assert "claimed" in body
+
+
+def test_public_dict_is_json_serialisable() -> None:
+    import json
+
+    body = _approved().to_public_dict()
+
+    assert json.loads(json.dumps(body))["decision"] == "approved"
+
+
+def test_public_dict_reflects_claim_state() -> None:
+    outcome = _approved()
+    assert outcome.to_public_dict()["claimed"] is False
+
+    outcome.claim()
+    assert outcome.to_public_dict()["claimed"] is True
+
+
+def test_claim_token_absent_from_rendered_prompt(
+    classifier: CommandClassifier,
+) -> None:
+    outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
+        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+    )
+
+    prompt = outcome.request.render()  # type: ignore[union-attr]
+
+    # Matched as a field reference, not a bare substring: pytest's tmp_path
+    # embeds the test name in the workspace path, so "_token" appears in an
+    # unrelated directory name.
+    assert "ClaimToken" not in prompt
+    assert "_token=" not in prompt
+    assert "_token:" not in prompt
+
+
+def test_claiming_a_denied_outcome_is_possible_but_useless() -> None:
+    """claim() does not check the decision; execute() does.
+
+    Keeping the two separate means the capability has one job -- being spent
+    once -- and every decision about whether it was ever *earned* stays with the
+    approver and the executor.
+    """
+    denied = ApprovalOutcome(
+        decision=ApprovalDecision.DENIED_BY_POLICY, detail="nope"
+    )
+
+    denied.claim()
+
+    assert denied.claimed is True
 
 
 def test_module_exposes_no_execution_surface() -> None:
