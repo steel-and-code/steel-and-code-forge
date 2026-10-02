@@ -29,24 +29,47 @@ docs/         architecture and design notes
 | n8n | Automation and triggers. Schedules and events enter Forge here. |
 | Byte, Ember, Fin | Agents. Distinct roles running on Forge. |
 
-See [docs/architecture.md](docs/architecture.md) for detail.
+See [docs/architecture.md](docs/architecture.md) for detail and
+[docs/agent-contract.md](docs/agent-contract.md) for the per-agent fields.
+
+Forge is **terminal-first**. The primary human interface is CLI/TUI; HTTP and
+APIs are secondary integration surfaces for n8n, the Steel & Code website, and
+future services. The core is provider-agnostic.
 
 ## Agent roles (working definitions)
 
-- **Byte** — engineering worker. Builds and maintains code.
-- **Ember** — TBD (documentation/pipeline role, to be defined).
-- **Fin** — TBD (analysis/accounting role, to be defined).
+- **Byte** — software engineering agent. Builds and maintains code.
+- **Ember** — TBD. Role not yet decided.
+- **Fin** — TBD. Role not yet decided.
+
+Byte is the only agent specified so far. See
+[docs/agent-contract.md](docs/agent-contract.md).
 
 ## Status
 
-Initial scaffold. Next steps, in order:
+Initial scaffold. The enforcement pipeline is complete for v1: workspace
+containment, secret-source classification, and command classification. Next
+steps, in order:
 
-1. Decide the language/runtime dependency set and add a `pyproject.toml`.
-2. Define the OpenRouter client contract in `forge/models/`.
-3. Define the agent interface in `forge/agents/`.
-4. Define the Forge public interface the website will call.
-5. Wire n8n trigger handling.
-6. Write tests.
+1. Draft Byte's system instructions (`docs/agent-contract.md`).
+2. Settle Byte's memory configuration.
+3. Define the terminal entry point and the approval prompt. This is the
+   primary interface, and the classifiers are ready for it.
+4. Define the model gateway contract in `forge/models/`.
+5. Implement the agent contract in `forge/agents/`.
+6. Define the secondary HTTP surface n8n and the website will call.
+7. Wire n8n trigger handling.
+8. Write the remaining tools.
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) — layers, surfaces, data flow.
+- [docs/agent-contract.md](docs/agent-contract.md) — the nine agent fields and
+  Byte as the first concrete example.
+- [docs/byte-tools.md](docs/byte-tools.md) — Byte v1 tool set, git action
+  policy, and permission model.
+- [docs/byte-security-classification.md](docs/byte-security-classification.md) —
+  secret-source and known-dangerous command patterns, workspace boundary.
 
 ## Development
 
@@ -57,8 +80,8 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Those commands will not work yet — `pyproject.toml` is not part of this
-first pass. They document the intended shape.
+This works. There is no application code yet — no agent runtime, no CLI, no
+interfaces. What exists is the security classification layer and its tests.
 
 ## Configuration
 
