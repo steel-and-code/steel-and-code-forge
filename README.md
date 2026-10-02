@@ -15,7 +15,7 @@ forge/
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (not yet written)
+tests/        pytest suite (326 passing)
 docs/         architecture and design notes
 ```
 
@@ -48,13 +48,15 @@ Byte is the only agent specified so far. See
 ## Status
 
 Initial scaffold. The enforcement pipeline is complete for v1: workspace
-containment, secret-source classification, and command classification. Next
+containment, secret-source classification, command classification, and the
+terminal approval step that sits between classification and execution. Next
 steps, in order:
 
 1. Draft Byte's system instructions (`docs/agent-contract.md`).
 2. Settle Byte's memory configuration.
-3. Define the terminal entry point and the approval prompt. This is the
-   primary interface, and the classifiers are ready for it.
+3. Define the terminal entry point and drive the approval prompt from it. The
+   classifiers and the approval step are ready for it; the command execution
+   layer they hand off to does not exist yet.
 4. Define the model gateway contract in `forge/models/`.
 5. Implement the agent contract in `forge/agents/`.
 6. Define the secondary HTTP surface n8n and the website will call.
@@ -81,7 +83,8 @@ pytest
 ```
 
 This works. There is no application code yet — no agent runtime, no CLI, no
-interfaces. What exists is the security classification layer and its tests.
+interfaces, and no command execution. What exists is the security classification
+layer, the terminal approval step that consumes it, and their tests.
 
 ## Configuration
 

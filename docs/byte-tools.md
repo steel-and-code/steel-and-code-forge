@@ -542,22 +542,92 @@ Still needed, none of which block starting implementation:
 
 ## Implementation status
 
-Three pieces of the pipeline are implemented, in `forge/tools/`:
+Four pieces of the pipeline are implemented, in `forge/tools/`:
 
 - `workspace.py` — path resolution and containment. Fails closed.
 - `secrets.py` — the two-tier secret-source classification.
 - `commands.py` — command classification for structured invocations.
+- `approval.py` — the terminal approval step. Consumes `CommandVerdict` and
+  `SecretVerdict`; does not re-classify and does not execute.
 
-All three return a structured result rather than a boolean, carrying
+The first three return a structured result rather than a boolean, carrying
 `classification`, `rule`, `reason`, resolved paths, `tier`/`matched_rules`, and
 where applicable the underlying containment result, so the approval UX can be
-built on top without re-running any of these checks.
+built on top without re-running any of these checks. `approval.py` builds on
+exactly those fields and adds nothing of its own.
 
-Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64), and
-`tests/test_commands.py` (174). 256 passing.
+Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
+`tests/test_commands.py` (174), and `tests/test_approval.py` (70). 326 passing.
 
-Not implemented, by decision: command execution, approval prompting, agent
-runtime, CLI/TUI, HTTP surface, memory.
+Not implemented, by decision: command execution, agent runtime, CLI/TUI, HTTP
+surface, memory.
+
+### How the approval step behaves
+
+`Approver` is the entry point. It is constructed with an `ApprovalChannel` and
+holds no state between operations, so there is no session-wide allow and no
+allowlist — v1 has neither, and a stateless class is what guarantees it.
+
+Routing, in order:
+
+1. A `deny` from the command verdict, or from any secret verdict supplied
+   alongside it, produces `DENIED_BY_POLICY`. No prompt is rendered and the
+   channel is never consulted. `ApprovalRequest.from_command` and
+   `.from_secret` raise `DeniedByPolicy` on a denial rather than return
+   something an operator could wave through, and `Approver.resolve` re-checks
+   the classification so a hand-built request cannot turn a denial into a
+   prompt. This is "approval narrows a permission, it never widens one" made
+   structural rather than conventional.
+2. An `allow` produces `APPROVED` without consulting the channel. A routine
+   development command should not need a human to say yes.
+3. Anything `approval_required` goes to the channel. No channel, or a channel
+   that cannot reach anyone, produces `DENIED_UNATTENDED` — not auto-approved,
+   not queued, not silently skipped. The detail says the operation was not run
+   and not queued, so the unattended case is reportable.
+4. Otherwise the prompt is rendered and the answer parsed.
+
+`REJECTED` and `DENIED_UNATTENDED` both stop the operation, but only the first
+means a person was there and said no. They stay distinct so a caller can tell
+"the operator declined" from "there was no operator".
+
+Response parsing is an exact affirmative: `y` or `yes`, case-insensitive, after
+trimming. Everything else declines, including an empty line, EOF, and an
+interrupt.
+
+`ApprovalOutcome.consume()` claims an approved outcome for one execution and
+raises on a second claim. Approval is per-operation; making that a flag rather
+than a convention is what stops it quietly becoming per-session.
+
+Two prompt behaviours worth recording because they are decisions rather than
+formatting:
+
+- **Absent fields are stated, not omitted.** No agent-supplied reason renders
+  `Reason: not supplied`; no caller-supplied git context renders
+  `Git context: not supplied`; an unresolvable target list renders
+  `Affected targets: not determinable`. The spec's reasoning is that an
+  operator seeing "not determinable" can decide differently from one seeing
+  nothing, and a missing line is indistinguishable from an absent field.
+- **A shell invocation is labelled.** The prompt says the invocation is a shell
+  string and was not parsed, because `cmd.shell_string` is gated precisely
+  because nothing inside it was checked. A prompt that omitted that would imply
+  a level of analysis that does not exist.
+
+The agent-supplied reason is optional at this layer by design. The approval
+module should not invent a rationale it was not given; a future agent runtime
+may require one before it constructs a request, and that is the runtime's
+policy rather than this module's.
+
+`TerminalApprovalChannel` is stdlib `print` and `input` and nothing else. It is
+deliberately thin — no colours, no key handling, no TUI. All of that is
+interface design belonging to the CLI layer, and none of it is needed to ask a
+question and record the answer. A channel that has no TTY reports itself
+unavailable and the operation fails closed. `ScriptedApprovalChannel` replays
+answers for tests and non-interactive driving; it goes through the same
+availability check and the same strict parse, so it is not a bypass.
+
+Two things this step deliberately does not do. It performs no git lookup, so
+git context is only what a caller supplies. And it executes nothing — an
+`ApprovalOutcome` is a handoff to a future execution layer.
 
 ### Needed before Byte is usable
 
