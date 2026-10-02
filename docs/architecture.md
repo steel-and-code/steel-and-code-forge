@@ -262,6 +262,8 @@ would otherwise be re-litigated:
 - Agents may use credentials but never see them.
 - Approval is per-operation; no blanket approval in v1.
 - Approval-required operations fail closed when unattended.
+- Memory is a Forge-wide architecture, not a per-agent choice.
+- Memory is session-only in v1; durable project memory designed, disabled.
 - The project environment is provisioned by a human, not by the agent.
 
 ## Open questions
@@ -272,8 +274,6 @@ would otherwise be re-litigated:
 - Does the website get a different interface from n8n, or one shared secondary
   surface with per-consumer credentials?
 - Are Ember and Fin single agents or families of agents?
-- Does each agent get an isolated memory scope, or shared memory with
-  permissions?
 - Which model capability levels should the gateway expose as configuration, and
   which model does each agent default to?
 - Does Forge ever call out to n8n, or only receive from it?
@@ -282,5 +282,9 @@ would otherwise be re-litigated:
   as written? All five classification decisions are settled: two-tier secret
   sources, wildcard deletes denied, inline code approval-gated without analysis,
   network commands approval-gated, Linux-only scope.
-- What is Byte's system instructions content, and its memory configuration?
-  These are the last two fields blocking Byte from running.
+
+**Resolved:** memory scope is a single Forge-wide decision, not a per-agent one,
+with Byte as the reference agent. Session memory in v1; durable project memory
+designed and disabled; personal memory out of scope. Ember, Fin, and future
+agents inherit the architecture unless a future contract explicitly changes it.
+The full model is in [agent-contract.md](agent-contract.md).

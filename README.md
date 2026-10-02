@@ -49,19 +49,19 @@ Byte is the only agent specified so far. See
 
 Initial scaffold. The enforcement pipeline is complete for v1: workspace
 containment, secret-source classification, command classification, and the
-terminal approval step that sits between classification and execution. Next
-steps, in order:
+terminal approval step that sits between classification and execution. Byte's
+agent contract is fully specified — system instructions and memory included.
+Next steps, in order:
 
-1. Draft Byte's system instructions (`docs/agent-contract.md`).
-2. Settle Byte's memory configuration.
-3. Define the terminal entry point and drive the approval prompt from it. The
+1. Define the terminal entry point and drive the approval prompt from it. The
    classifiers and the approval step are ready for it; the command execution
    layer they hand off to does not exist yet.
-4. Define the model gateway contract in `forge/models/`.
-5. Implement the agent contract in `forge/agents/`.
-6. Define the secondary HTTP surface n8n and the website will call.
-7. Wire n8n trigger handling.
-8. Write the remaining tools.
+2. Define the model gateway contract in `forge/models/`.
+3. Implement the agent contract in `forge/agents/`.
+4. Implement session memory, the one memory scope v1 enables.
+5. Define the secondary HTTP surface n8n and the website will call.
+6. Wire n8n trigger handling.
+7. Write the remaining tools.
 
 ## Documentation
 

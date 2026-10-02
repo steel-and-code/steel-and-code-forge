@@ -380,6 +380,16 @@ Credential values must not appear in:
 Where a command needs a secret and might echo it, Forge treats the output as
 secret-bearing and does not return it verbatim.
 
+**Memory is the surface most likely to be missed here.** Every other item above
+is a surface something writes to deliberately, during a run, where the write is
+visible. Memory is the one where writing is silent and the value persists. The
+memory model in [agent-contract.md](agent-contract.md) therefore carries a
+concrete implementation requirement: a memory writer must classify candidate
+content with the existing secret classifier before writing it, and must fail
+closed on an unreadable check exactly as `secrets.py` does. Reusing that
+classifier rather than adding a second redaction pass is what keeps the rule in
+one place.
+
 ### Consequence
 
 Byte cannot read `.env` to learn what a project needs. It runs the project, and
@@ -561,6 +571,12 @@ Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
 
 Not implemented, by decision: command execution, agent runtime, CLI/TUI, HTTP
 surface, memory.
+
+Both remaining agent-contract decisions are now settled in
+[agent-contract.md](agent-contract.md): Byte's system instructions are specified
+as seven instruction blocks, and the memory model is session memory in v1 with
+durable project memory designed and disabled. Byte's runtime status is
+**Partial** — every field answered, nothing implemented.
 
 ### How the approval step behaves
 
