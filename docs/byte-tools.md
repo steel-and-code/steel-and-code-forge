@@ -268,6 +268,53 @@ The secret-source check sits at step 2, before tool permission, because it does
 not depend on what Byte is allowed to do — a secret is a secret regardless of
 configuration.
 
+### Verdicts are ranked together, and one approval covers the operation
+
+Steps 2 and 5 both produce a classification for the same operation, and they do
+not agree by default. An ordinary command reading a name-guess file is `ALLOW`
+from the command rules and `APPROVAL_REQUIRED` from the secret rules. Neither
+verdict is wrong; they describe different properties of one action.
+
+**The rule: every verdict participating in an operation is ranked together and
+the strictest wins.**
+
+    DENY  >  APPROVAL_REQUIRED  >  ALLOW
+
+Consequences, all of which are enforced in `Approver.submit_command` rather than
+in any caller:
+
+| Command | Secret(s) | Outcome |
+| --- | --- | --- |
+| allow | allow | Allowed. No prompt. |
+| allow | approval_required | **Approval required.** The command is ordinary; the file is not. |
+| allow | deny | Denied by policy. |
+| approval_required | allow | Approval required, for the command's own reason. |
+| approval_required | approval_required | Approval required. |
+| approval_required | deny | Denied by policy. |
+| any | any deny | Denied by policy, whatever the command said. |
+
+Two properties follow from "together" and both matter:
+
+**One approval decision per operation, not one per verdict.** A command reading
+three gated files produces one prompt, not three. The operator is approving a
+single command; a prompt per target trains them to answer without reading, which
+defeats review-then-confirm.
+
+**A secret denial outranks a command allow.** `cat .env` is not a dangerous
+command. It is a read of a structurally secret file, which no approval prompt
+can make safe.
+
+The rule lives in the approval layer so that every future caller inherits it. A
+caller that ranked verdicts itself would eventually rank them differently, which
+is precisely how this was wrong before: `submit_command` consulted only secret
+*denials*, so a name-guess read through `exec_command` was approved without
+asking while the same file through `read_file` prompted.
+
+When a secret verdict is what made an otherwise-automatic operation gated, the
+prompt names the escalating secret rule rather than the command rule. An
+operator shown `APPROVAL REQUIRED` for `cat secrets.json` with no stated reason
+would be reading a prompt without information.
+
 ## Command execution and classification
 
 ### The problem
@@ -571,6 +618,44 @@ Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
 
 Not implemented, by decision: command execution, agent runtime, CLI/TUI, HTTP
 surface, memory.
+
+**CLI status.** A terminal entry point now exists in `forge/cli/`:
+`main.py` owns argv, wiring, and exit codes; `render.py` is pure presentation.
+It classifies, it asks, and it executes nothing.
+
+    forge                                          status, exit 0
+    forge check command --workspace DIR [-- PROG ARG...]
+    forge check path    --workspace DIR PATH [PATH...]
+
+Shared options (`--workspace`, `--agent`, `--json`, `--classify-only`,
+`--unattended`) are attached to the two leaf parsers through a shared argparse
+parent, so the supported placement is the only placement. The `--` separator is
+required on `check command`: Forge's options go before it, the command's own
+arguments after it.
+
+The requester identity defaults to `forge-cli`, not `byte`. There is no Byte
+runtime yet, so claiming Byte requested an operation would be a fabrication an
+operator could act on. `forge byte` will pass `byte` explicitly when that
+runtime exists.
+
+Six states are distinguished: `ALLOW`, `APPROVAL REQUIRED`, `APPROVED`,
+`REJECTED`, `DENIED BY POLICY`, `DENIED UNATTENDED`. The last three are all
+refusals and share exit code 1, but they are different events and are labelled
+and reported distinctly. Exit codes: 0 success, 1 refused, 2 malformed
+invocation, 3 approval would be required in `--classify-only` mode, 4 internal
+failure.
+
+Two behaviours worth recording. An approved operation prints "execution is not
+implemented yet, so nothing ran" — approving something that then silently did
+nothing would be worse than no approval at all. And a relative path given to
+`check path` resolves against the named workspace rather than the shell's
+directory, because over SSH the shell directory is often unrelated and
+classifying a different file than the operator named is a silent wrong answer.
+
+The CLI holds no policy. It builds a `Workspace`, calls the classifiers, hands
+verdicts to `Approver`, and renders what comes back. It never constructs an
+`ApprovalRequest`, so a denial cannot become a prompt by any route, and
+`tests/test_cli.py` asserts each of these properties rather than trusting them.
 
 Both remaining agent-contract decisions are now settled in
 [agent-contract.md](agent-contract.md): Byte's system instructions are specified

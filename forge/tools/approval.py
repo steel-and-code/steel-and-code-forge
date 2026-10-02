@@ -36,11 +36,11 @@ import sys
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Protocol, Sequence, runtime_checkable
 
 from .commands import CommandVerdict
 from .secrets import SecretVerdict
-from .workspace import Classification
+from .workspace import Classification, strictest
 
 __all__ = [
     "ApprovalDecision",
@@ -55,9 +55,50 @@ __all__ = [
     "ApprovalConsumed",
     "render_prompt",
     "parse_response",
+    "effective_classification",
+    "escalating_secret",
     "AFFIRMATIVE_RESPONSES",
     "NOT_SUPPLIED",
 ]
+
+
+def effective_classification(
+    command: Classification, *secrets: Classification
+) -> Classification:
+    """The strictest classification across every verdict in one operation.
+
+    The shared ranking rule, in one place:
+
+        DENY > APPROVAL_REQUIRED > ALLOW
+
+    Exposed as a module function so that a caller which reports a classification
+    *without* asking anyone -- a ``--classify-only`` mode, say -- reports the same
+    answer as the full approval path. A caller that ranked verdicts itself
+    would eventually rank them differently, which is how the same file came to
+    require approval through one entry point and not another.
+
+    Args:
+        command: The command verdict's classification.
+        secrets: Classifications of every target's secret verdict.
+
+    Returns:
+        The strictest of them all.
+    """
+    return strictest(command, *secrets)
+
+
+def escalating_secret(
+    secrets: Sequence["SecretVerdict"], level: Classification
+) -> "SecretVerdict | None":
+    """The first secret verdict at ``level``, or ``None``.
+
+    Used to name *which* rule made the operation gated, so a prompt can say why
+    an ordinary-looking command needs a decision.
+    """
+    for secret in secrets:
+        if secret.classification is level:
+            return secret
+    return None
 
 # The only responses that approve. Exact word, case-insensitive, after trimming.
 # Everything else rejects, including an empty line, a bare newline, "yeah",
@@ -606,34 +647,51 @@ class Approver:
         intent: str | None = None,
         git_context: str | None = None,
     ) -> ApprovalOutcome:
-        """Route a classified command.
+        """Route a classified command together with the secret verdicts for its targets.
 
-        The secret verdicts are checked *first*, before anything else, because
-        the enforcement pipeline puts the secret-source check above the prompt:
-        a file whose location or content proves it holds credentials is denied
-        regardless of what the command is, and no operator decision can change
-        that.
+        Every verdict that participates in the operation is ranked together and
+        the strictest wins:
+
+            DENY > APPROVAL_REQUIRED > ALLOW
+
+        so a command that is itself ordinary is still gated when it would read a
+        name-guess secret, and denied outright when it would read a structural
+        one. The rule lives here rather than in any caller, because every future
+        caller inherits it and none of them can forget it.
+
+        Ranking the whole set together also means **one** approval decision for
+        the operation. Several gated targets produce one prompt, not one per
+        target: the operator is approving a single command, and a prompt per
+        target would train them to approve without reading.
 
         Args:
             verdict: The command classification result. Not re-run here.
             agent: Which agent is asking. Displayed in the prompt.
             secret_verdicts: Secret classifications of the paths this command
-                would touch, if the caller performed them. Any denial among them
-                is a policy denial.
+                would touch, if the caller performed them. Every one
+                participates in the ranking.
             tool: The tool being called.
             intent: The agent's own reason, in its words. Optional.
             git_context: Caller-supplied git context. No lookup is performed
                 here.
         """
-        for secret in secret_verdicts:
-            if secret.classification is Classification.DENY:
-                return ApprovalOutcome(
-                    decision=ApprovalDecision.DENIED_BY_POLICY,
-                    detail=(
-                        f"secret source denied the operation before approval: "
-                        f"{secret.rule}: {secret.reason}"
-                    ),
-                )
+        effective = effective_classification(
+            verdict.classification,
+            *(secret.classification for secret in secret_verdicts),
+        )
+
+        # A secret denial is reported in its own terms. "secret.env denied this"
+        # tells an operator something actionable; "cmd.none denied this" would
+        # point them at a rule that never fired.
+        denying_secret = escalating_secret(secret_verdicts, Classification.DENY)
+        if denying_secret is not None:
+            return ApprovalOutcome(
+                decision=ApprovalDecision.DENIED_BY_POLICY,
+                detail=(
+                    f"secret source denied the operation before approval: "
+                    f"{denying_secret.rule}: {denying_secret.reason}"
+                ),
+            )
 
         try:
             request = ApprovalRequest.from_command(
@@ -644,6 +702,25 @@ class Approver:
                 decision=ApprovalDecision.DENIED_BY_POLICY,
                 detail=f"denied by classification: {denial.reason}",
             )
+
+        # The request carries the command's own verdict. When a secret verdict is
+        # what made the operation gated, the request has to say so -- otherwise
+        # `resolve` would see ALLOW, approve without asking, and the escalation
+        # would be lost. The prompt names the escalating secret so the operator
+        # can see *why* an ordinary-looking command needs a decision.
+        if effective is not verdict.classification:
+            escalating = escalating_secret(secret_verdicts, effective)
+            if escalating is not None:
+                request = replace(
+                    request,
+                    classification=effective,
+                    rule=escalating.rule,
+                    reason=(
+                        f"secret source requires approval: {escalating.rule}: "
+                        f"{escalating.reason}"
+                    ),
+                    matched_rules=request.matched_rules + escalating.matched_rules,
+                )
 
         return self.resolve(request)
 

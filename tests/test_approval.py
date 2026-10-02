@@ -33,8 +33,8 @@ from forge.tools.approval import (
     parse_response,
     render_prompt,
 )
-from forge.tools.commands import Command, CommandClassifier
-from forge.tools.secrets import SecretClassifier
+from forge.tools.commands import Command, CommandClassifier, CommandVerdict
+from forge.tools.secrets import SecretClassifier, SecretVerdict
 from forge.tools.workspace import Classification, Workspace
 
 
@@ -721,6 +721,271 @@ def test_unanswered_prompt_is_rejected_not_approved(
 # ==========================================================================
 # The layer does not execute and does not re-classify
 # ==========================================================================
+
+
+# ==========================================================================
+# Verdicts are ranked together: DENY > APPROVAL_REQUIRED > ALLOW
+# ==========================================================================
+#
+# The command verdict and every supplied secret verdict describe one operation,
+# so they are ranked as a set and the strictest wins. The rule lives in
+# `Approver.submit_command` so every future caller inherits it.
+#
+# The failure this closes: `cat secrets.json` is an ordinary command reading a
+# name-guess file. When only secret *denials* were consulted, the operation was
+# approved without asking, while the same file through `submit_secret` prompted.
+# The inconsistency was a hole, not a design.
+
+
+def _secret_verdicts(
+    classifier: SecretClassifier, *paths: Path
+) -> tuple[SecretVerdict, ...]:
+    """Classify paths against the real secret rules.
+
+    The classifier is passed rather than captured from a fixture because a
+    module-level helper cannot see a test function's arguments.
+    """
+    return tuple(classifier.classify(p) for p in paths)
+
+
+def _submit(
+    verdict: CommandVerdict,
+    secrets_found: tuple[SecretVerdict, ...],
+    responses: list[str | None] | None = None,
+) -> tuple[ApprovalOutcome, ScriptedApprovalChannel]:
+    channel = ScriptedApprovalChannel(responses or [])
+    outcome = Approver(channel).submit_command(
+        verdict, agent="byte", secret_verdicts=secrets_found
+    )
+    return outcome, channel
+
+
+def test_command_allow_with_secret_allow_approves_without_a_channel(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """Everything clean: no prompt at all."""
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", "plain.txt")),
+        _secret_verdicts(secrets, workspace.root / "plain.txt"),
+    )
+
+    assert outcome.decision is ApprovalDecision.APPROVED
+    assert channel.presented == []
+    assert outcome.operator_response is None
+
+
+def test_command_allow_with_secret_approval_required_prompts(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """An ordinary command reading a name-guess secret needs a human.
+
+    This is the case the hole left open. `cat` is not dangerous and the file is
+    not structural, but the filename suggests sensitivity and the spec says that
+    tier is approval-required rather than denied.
+    """
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", "secrets.json")),
+        _secret_verdicts(secrets, workspace.root / "secrets.json"),
+        ["y"],
+    )
+
+    assert channel.presented, "a name-guess secret must produce a prompt"
+    assert outcome.decision is ApprovalDecision.APPROVED
+
+
+def test_command_allow_with_secret_deny_is_policy_denial(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", ".env")),
+        _secret_verdicts(secrets, workspace.root / ".env"),
+        ["y"],
+    )
+
+    assert outcome.decision is ApprovalDecision.DENIED_BY_POLICY
+    assert channel.presented == []
+    assert "secret.env" in outcome.detail
+
+
+def test_command_approval_required_with_secret_allow_prompts(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """The command's own gate stands on its own; secrets do not interfere."""
+    outcome, channel = _submit(
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        _secret_verdicts(secrets, workspace.root / "plain.txt"),
+        ["y"],
+    )
+
+    assert len(channel.presented) == 1
+    assert outcome.decision is ApprovalDecision.APPROVED
+    assert outcome.request is not None
+    # The command's rule is what gated it, not a secret rule.
+    assert outcome.request.rule == "cmd.git_commit"
+
+
+def test_command_approval_required_with_secret_approval_required_is_one_prompt(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """One operation, one decision.
+
+    Both verdicts are gated, and the operator still answers a single question:
+    they are approving one command, not two verdicts.
+    """
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", "secrets.json")),
+        _secret_verdicts(secrets, workspace.root / "secrets.json"),
+        ["y"],
+    )
+
+    assert len(channel.presented) == 1
+
+
+def test_multiple_secrets_produce_one_prompt_not_one_each(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """A prompt per target would train the operator to approve without reading."""
+    targets = []
+    for name in ("secrets.json", "credentials.yaml", "app.token"):
+        path = workspace.root / name
+        path.write_text("name: value\n")
+        targets.append(path)
+
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", *(t.name for t in targets))),
+        _secret_verdicts(secrets, *targets),
+        ["y"],
+    )
+
+    assert len(channel.presented) == 1
+    assert outcome.decision is ApprovalDecision.APPROVED
+
+
+def test_command_approval_required_with_secret_deny_is_policy_denial(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """A gated command does not survive a structural secret among its targets."""
+    outcome, channel = _submit(
+        classifier.classify(_cmd("git", "add", "secrets.json")),
+        _secret_verdicts(secrets, workspace.root / ".env"),
+        ["y"],
+    )
+
+    assert outcome.decision is ApprovalDecision.DENIED_BY_POLICY
+    assert channel.presented == []
+
+
+def test_one_secret_deny_outranks_all_other_secret_verdicts(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """DENY wins over a name guess in the same operation.
+
+    The deciding rule named in the outcome is the secret denial, because that is
+    the one an operator can act on.
+    """
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", "secrets.json", ".env")),
+        _secret_verdicts(
+            secrets, workspace.root / "secrets.json", workspace.root / ".env"
+        ),
+        ["y"],
+    )
+
+    assert outcome.decision is ApprovalDecision.DENIED_BY_POLICY
+    assert channel.presented == []
+    assert "secret.env" in outcome.detail
+    assert "guess.secrets_json" not in outcome.detail
+
+
+def test_one_secret_approval_required_escalates_an_allow(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """A single name guess gates an otherwise-automatic command."""
+    clean = workspace.root / "plain.txt"
+    clean.write_text("ordinary\n")
+    guessed = workspace.root / "secrets.json"
+    guessed.write_text("{}\n")
+
+    outcome, channel = _submit(
+        classifier.classify(_cmd("cat", "plain.txt", "secrets.json")),
+        _secret_verdicts(secrets, clean, guessed),
+        ["n"],
+    )
+
+    assert len(channel.presented) == 1
+    assert outcome.decision is ApprovalDecision.REJECTED
+
+
+def test_unattended_secret_approval_requirement_fails_closed(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """No channel plus a gated secret is DENIED_UNATTENDED, not approved.
+
+    The pre-fix behaviour approved this outright, which is the worst version of
+    the bug: an unattended run would have read a name-guess secret with nobody
+    present to object.
+    """
+    outcome = Approver(None).submit_command(
+        classifier.classify(_cmd("cat", "secrets.json")),
+        agent="byte",
+        secret_verdicts=_secret_verdicts(secrets, workspace.root / "secrets.json"),
+    )
+
+    assert outcome.decision is ApprovalDecision.DENIED_UNATTENDED
+    assert outcome.denied
+    assert not outcome.human_decided
+
+
+def test_escalated_request_names_the_secret_rule(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    """The operator must see why an ordinary command needs a decision.
+
+    A prompt for `cat` with no stated reason teaches the operator to approve
+    without reading, which is exactly what review-then-confirm exists to avoid.
+    """
+    outcome, _ = _submit(
+        classifier.classify(_cmd("cat", "secrets.json")),
+        _secret_verdicts(secrets, workspace.root / "secrets.json"),
+        ["y"],
+    )
+
+    assert outcome.request is not None
+    assert outcome.request.rule == "guess.secrets_json"
+    assert "secret source requires approval" in outcome.request.reason
+
+
+def test_escalated_prompt_shows_the_secret_reason(
+    classifier: CommandClassifier, secrets: SecretClassifier, workspace: Workspace
+) -> None:
+    captured: list[str] = []
+
+    class _Capturing(ScriptedApprovalChannel):
+        def present(self, request, prompt):  # type: ignore[no-untyped-def]
+            captured.append(prompt)
+            return "y"
+
+    Approver(_Capturing(["y"])).submit_command(
+        classifier.classify(_cmd("cat", "secrets.json")),
+        agent="byte",
+        secret_verdicts=_secret_verdicts(secrets, workspace.root / "secrets.json"),
+    )
+
+    assert captured
+    assert "filename suggests stored secrets" in captured[0]
+
+
+def test_no_secret_verdicts_leaves_command_verdict_unchanged(
+    classifier: CommandClassifier,
+) -> None:
+    """Supplying nothing must not change existing behaviour."""
+    outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
+        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+    )
+
+    assert outcome.decision is ApprovalDecision.APPROVED
+    assert outcome.request is not None
+    assert outcome.request.rule == "cmd.git_commit"
 
 
 def test_module_exposes_no_execution_surface() -> None:
