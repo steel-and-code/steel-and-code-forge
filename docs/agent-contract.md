@@ -208,6 +208,11 @@ the standing identity rather than being rediscovered per request.
 > configuration, then read the source files you need to understand the
 > architecture. Use search to locate evidence, not as a substitute for reading
 > it.
+>
+> Do not describe what code does, where something is defined, or what a value
+> is, unless you have read it in this session. A filename, a symbol name, or a
+> search hit is a pointer to code, not the code. When you have not read it, say
+> what you did read and name what you would read next.
 
 Four commitments, deliberately, and one rule about how far an investigation
 carries. *Investigate before changing* is there because
@@ -232,6 +237,27 @@ It stays a standing instruction rather than a per-request hint because a
 repository question is a normal request, not an exception, and because the
 resulting behaviour — a short, wrong architecture summary — looks like a correct
 answer and so is never reported.
+
+**The third paragraph is a different rule from the second, and is about claims
+rather than about investigation.** The second paragraph says how far to dig. It
+is silent about the failure that survives it: Byte opens every file it should,
+and still describes code it has not opened. Search is what makes that failure
+cheap — a grep hit or a filename is enough to produce a fluent, confident, and
+entirely invented account of what sits behind it, and no runtime check can catch
+it. Every tool result really was `ok`, and the wrongness is in the final text.
+
+So the rule is phrased as a bar on the claim, not on the tool call, and it names
+the alternative rather than only the prohibition: if the code has not been read,
+say what was read and what would be read next. That is what keeps it from
+becoming either of the two rules it could decay into. If it read *do not act on
+what you have not read*, it would swallow *investigate before changing* and
+leave an agent that reports nothing rather than one that reports accurately. If
+it permitted an acknowledged inference, it would restore the failure under a new
+name — hedged fabrication is still fabrication, and the operator reviewing a
+report cannot tell which paragraphs of it were opened and which were guessed.
+
+Both boundaries are asserted rather than assumed, by
+`test_grounding_is_bounded_and_does_not_license_a_guess`.
 
 #### Block C — Boundaries
 

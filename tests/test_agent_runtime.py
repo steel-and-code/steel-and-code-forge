@@ -392,6 +392,88 @@ def test_the_recoverable_error_rule_survives_the_contract_comparison() -> None:
     assert "invalid_arguments" in contract["D"]
 
 
+#: Block B already says "Use search to locate evidence, not as a substitute for
+#: reading it", which constrains *investigation*. The grounding rule constrains
+#: something different: *claims*. The distinction is load-bearing, so both the
+#: runtime constant and the contract are checked for the exact phrase.
+GROUNDING_PHRASE = "unless you have read it in this session"
+
+#: The opening words of Block B, used to find the block without holding a
+#: second copy of its full text.
+BLOCK_B_OPENING = "Investigate before changing"
+
+
+def _block_b() -> str:
+    return next(b for b in BLOCKS if b.startswith(BLOCK_B_OPENING))
+
+
+def test_grounding_is_instructed_as_a_rule_about_claims() -> None:
+    """A claim about unread code is the failure the rule exists to stop.
+
+    Block B tells Byte how far to investigate, but nothing told it that a
+    summary of code it has not opened is a fabrication with extra steps. Search
+    output is not reading: an agent that finds a symbol name, a grep hit, or a
+    filename can produce a fluent and entirely invented description of what is
+    behind it. Nothing in the runtime catches that -- every tool result really
+    was ok, and the final answer is text, so the only place to stop it is the
+    standing instruction.
+    """
+    block = _block_b()
+
+    # The condition, stated as a bar on the claim rather than on the tool call.
+    assert GROUNDING_PHRASE in block
+    # It names the corrective action: read it, or say what you did read.
+    assert "read it" in block
+    assert "did read" in block, "the rule says what to do instead, not just what not to do"
+    # And it is scoped to claims, so it cannot be read as forbidding the tool
+    # calls that make reading possible.
+    assert "claims" in block or "describe" in block
+
+
+def test_grounding_is_bounded_and_does_not_license_a_guess() -> None:
+    """The rule constrains claims about unread code, and only that.
+
+    Two ways this could rot. A grounding rule that says "do not act on what you
+    have not read" would swallow Block B's *investigate first* instruction and
+    push the agent to claim certainty it does not have. A grounding rule that
+    permits an acknowledged inference would restore the failure under a new
+    name. Both are pinned here, and the denial rule is checked for the same
+    reason: this is a new paragraph in a block that already carries the single
+    strongest standing commitment, and a new paragraph is exactly where a
+    commitment gets loosened by accident.
+    """
+    block = _block_b()
+    grounding = block[block.index(GROUNDING_PHRASE):]
+
+    # Bounded: it is about reporting, not about refusing to work. The
+    # investigate-first commitment is untouched.
+    assert BLOCK_B_OPENING in block
+    assert "Investigate before changing anything" in block
+    # Not a licence to assert a guess with a caveat attached.
+    for banned in ("likely", "probably", "assume", "inferred", "guess"):
+        assert banned not in grounding, f"grounding rule licenses a guess: {banned}"
+    # The grounding paragraph is not a route around a permission decision, and
+    # the denial rule is still in Block D saying so.
+    for route in ("alias", "wrapper script", "different tool"):
+        assert route not in grounding, f"grounding rule opened a route: {route}"
+    assert BLOCK_D_DENIAL_PHRASE in next(
+        b for b in BLOCKS if b.startswith("Call tools with the exact")
+    )
+
+
+def test_grounding_survives_the_contract_comparison() -> None:
+    """The rule lives in the contract, so a prompt-only edit cannot introduce it.
+
+    Same reasoning as the recoverable-error rule: the contract is the record,
+    and the verbatim sync test then carries the wording into the prompt. A test
+    that only read ``byte.py`` would pass against a change that never went
+    through review.
+    """
+    contract = parse_contract_blocks(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    assert GROUNDING_PHRASE in contract["B"]
+
+
 # --------------------------------------------------------------------------
 # Approval integration
 # --------------------------------------------------------------------------

@@ -71,7 +71,12 @@ enough evidence to answer the question; do not stop at the first relevant \
 search result. Start with the high-signal project documentation and \
 configuration, then read the source files you need to understand the \
 architecture. Use search to locate evidence, not as a substitute for reading \
-it."""
+it.
+
+Do not describe what code does, where something is defined, or what a value \
+is, unless you have read it in this session. A filename, a symbol name, or a \
+search hit is a pointer to code, not the code. When you have not read it, say \
+what you did read and name what you would read next."""
 
 BLOCK_C = """\
 You operate inside one workspace root. Paths outside it are not yours to \
