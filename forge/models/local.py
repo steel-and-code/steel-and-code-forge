@@ -317,6 +317,12 @@ class LocalLlamaGateway:
         text, fenced_calls = LocalLlamaGateway._fenced_json_calls(text, allowed_tools)
         calls.extend(fenced_calls)
 
+        # Bare JSON is last resort, so it runs last and only on what the
+        # fenced pass left behind.
+        if not calls:
+            text, bare_calls = LocalLlamaGateway._bare_json_calls(text, allowed_tools)
+            calls.extend(bare_calls)
+
         usage_payload = payload.get("usage")
         usage = Usage()
 
@@ -408,6 +414,115 @@ class LocalLlamaGateway:
             text = text.strip()
 
         return text, calls
+
+    @classmethod
+    def _bare_json_calls(
+        cls,
+        text: str,
+        allowed_tools: set[str] | None,
+    ) -> tuple[str, list[ToolCall]]:
+        """Promote an unfenced JSON tool call sitting at the end of the message.
+
+        A local model that has not learned the OpenAI ``tool_calls`` field often
+        writes its call as a bare object anyway, with no fence around it. Without
+        this, the object stays in the prose, ``wants_tools`` is false, and the
+        runtime hands the operator a JSON blob dressed up as the agent's answer.
+
+        Every other recovery path in this module is forgiving, and this one is
+        not, because bare JSON is the shape a model is most likely to be
+        *describing* rather than requesting. So the promotion is narrow by
+        design:
+
+        *   Only the trailing non-whitespace segment is inspected. An object in
+            the middle of prose is text, however tool-shaped it looks.
+        *   The whole of that segment must be exactly one JSON object, with
+            exactly the keys ``name`` and ``arguments``. The fence path tolerates
+            extra keys because a fence is already a strong signal; an unfenced
+            object with neighbours is usually payload, not a request.
+        *   ``name`` must name a tool Forge actually offered and ``arguments``
+            must be an object. The allowed-tools check is the same one the fence
+            path applies: naming a tool is not a grant to run it.
+
+        Anything else leaves the message untouched. There is no partial result
+        and no attempt to find a call that "almost" fits -- a message that fails
+        these tests is a message Forge did not understand, and returning it
+        unchanged is the honest outcome.
+        """
+        calls: list[ToolCall] = []
+
+        if not text or not allowed_tools:
+            return text, calls
+
+        stripped = text.rstrip()
+        start = cls._trailing_object_start(stripped)
+
+        if start is None:
+            return text, calls
+
+        decoder = json.JSONDecoder()
+
+        try:
+            value, end = decoder.raw_decode(stripped, start)
+        except ValueError:
+            return text, calls
+
+        # The object must consume the trailing segment whole. Anything after it
+        # -- a closing bracket, trailing commentary, a second object -- means
+        # this was not a lone trailing call.
+        if end != len(stripped) or not isinstance(value, dict):
+            return text, calls
+
+        if set(value) != {"name", "arguments"}:
+            return text, calls
+
+        name = value["name"]
+        arguments = value["arguments"]
+
+        if not isinstance(name, str) or name not in allowed_tools:
+            return text, calls
+
+        if not isinstance(arguments, dict):
+            return text, calls
+
+        try:
+            argument_text = json.dumps(arguments, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return text, calls
+
+        calls.append(
+            ToolCall(
+                id="call_1",
+                name=name,
+                arguments=argument_text,
+            )
+        )
+
+        return text[:start].rstrip(), calls
+
+    @staticmethod
+    def _trailing_object_start(stripped: str) -> int | None:
+        """Where the final top-level JSON object in ``stripped`` begins.
+
+        Scans forward for each ``{`` and returns the one whose object runs to
+        the very end of the message. Text before that point is prose to be kept.
+        Braces nested inside string values are skipped by the decoder itself:
+        only a candidate that decodes cleanly to the end can win.
+        """
+        index = stripped.find("{")
+
+        while index != -1:
+            try:
+                _, end = json.JSONDecoder().raw_decode(stripped, index)
+            except ValueError:
+                index = stripped.find("{", index + 1)
+                continue
+
+            if end == len(stripped):
+                return index
+
+            index = stripped.find("{", index + 1)
+
+        return None
 
     @staticmethod
     def _scan_json_values(body: str) -> list[Any]:

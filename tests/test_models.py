@@ -761,6 +761,123 @@ def test_local_gateway_skips_malformed_object_between_valid_calls() -> None:
     ] == ["a.txt", "b.txt"]
 
 
+def _bare_response(content: str, allowed: set[str]) -> Any:
+    """Parse ``content`` as a local-model reply offering ``allowed`` tools."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    return LocalLlamaGateway._parse_response(payload, allowed_tools=allowed)
+
+
+def test_local_gateway_promotes_trailing_bare_json_tool_call() -> None:
+    """A local model may answer with an unfenced JSON call; trailing prose stays."""
+    content = (
+        "Let us read the main README file to get an overview.\n\n"
+        '{"name": "read_file", "arguments": '
+        '{"path": "/home/cybon/Projects/Steel-and-code-forge/README.md"}}'
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert response.wants_tools
+    assert response.tool_calls[0].name == "read_file"
+    assert json.loads(response.tool_calls[0].arguments) == {
+        "path": "/home/cybon/Projects/Steel-and-code-forge/README.md"
+    }
+    assert "Let us read the main README file to get an overview." in response.text
+    assert "{" not in response.text
+
+
+def test_local_gateway_promotes_bare_json_call_as_whole_message() -> None:
+    """The call alone, with no prose, is still a call."""
+    content = '{"name": "read_file", "arguments": {"path": "README.md"}}'
+
+    response = _bare_response(content, {"read_file"})
+
+    assert response.wants_tools
+    assert response.tool_calls[0].name == "read_file"
+    assert response.text == ""
+
+
+def test_local_gateway_rejects_bare_object_with_extra_keys() -> None:
+    """Bare promotion is strict: exactly name and arguments, nothing else.
+
+    The fence path tolerates extra keys; the bare path cannot afford to. An
+    unfenced object with neighbours is far likelier to be something the model
+    was merely *describing* than a request to run something.
+    """
+    content = '{"name": "read_file", "arguments": {"path": "a.txt"}, "id": "x"}'
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_rejects_bare_call_for_unoffered_tool() -> None:
+    """An unoffered name is prose even in the exact trailing shape."""
+    content = '{"name": "delete_everything", "arguments": {"path": "/repo"}}'
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_rejects_bare_call_with_non_dict_arguments() -> None:
+    """arguments must be an object; a shell string is not a promotion."""
+    content = '{"name": "exec_command", "arguments": "ls -la"}'
+
+    response = _bare_response(content, {"exec_command"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_ignores_json_shaped_object_mid_prose() -> None:
+    """Only the trailing segment is inspected; a mid-prose object is text."""
+    content = (
+        'Here is the config I read: {"database": {"host": "localhost"}}\n'
+        "Now I will stop and report."
+    )
+
+    response = _bare_response(content, {"search_files"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_rejects_bare_call_with_trailing_prose() -> None:
+    """A call-shaped object that is not last is not the trailing segment."""
+    content = (
+        '{"name": "read_file", "arguments": {"path": "README.md"}}\n'
+        "Let me know if you want more."
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_leaves_ordinary_trailing_json_as_text() -> None:
+    """The real trailing JSON case: JSON that is not a call stays text."""
+    content = 'The settings are {"database": {"host": "localhost"}, "retries": 3}'
+
+    response = _bare_response(content, {"search_files"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
 def test_local_gateway_leaves_ordinary_json_fence_as_text() -> None:
     """A code fence is not a grant: non-tool JSON stays prose."""
     from forge.models.local import LocalLlamaGateway
