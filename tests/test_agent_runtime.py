@@ -328,6 +328,70 @@ def test_the_contract_comparison_would_catch_wording_drift() -> None:
     assert normalise(baseline).lower() != normalise(baseline)
 
 
+#: The paragraph index of Block D's denial rule. Block D gained a recoverable-
+#: error rule, and the ordering is load-bearing: the model must read a malformed
+#: call as a fixable mistake *before* it reads the denial rule, or the denial
+#: paragraph reads as the general answer to every non-ok tool result.
+BLOCK_D_DENIAL_PHRASE = "If a tool call comes back denied, that is the answer."
+
+
+def test_invalid_arguments_is_instructed_as_a_recoverable_error() -> None:
+    """A malformed call is a fixable mistake, and Block D says so.
+
+    The dispatcher already returns ``invalid_arguments`` and already declines to
+    cache it, so the runtime invites a retry. If the standing instructions do not
+    say what to do with it, the only rule the model has been given about a
+    non-ok tool result is Block D's denial rule, and the correct behaviour --
+    read the error, fix the named field, call again -- gets read as forbidden.
+    That is the failure this test pins.
+    """
+    block = next(b for b in BLOCKS if b.startswith("Call tools with the exact"))
+
+    assert "invalid_arguments" in block
+    # It names the corrective action, not merely the condition.
+    assert "Read the error" in block
+    assert "again" in block
+    # A retry that changes nothing is not a retry.
+    assert "unchanged" in block
+
+
+def test_the_recoverable_error_rule_does_not_license_retrying_a_denial() -> None:
+    """The new paragraph is bounded; the denial rule is untouched.
+
+    The two rules sit in one block because they share a sentence boundary, which
+    is exactly why they can be confused. A recoverable-error instruction that
+    reached denials would be the worst version of this change: it would turn
+    Byte's single strongest standing commitment into a retry loop. So the denial
+    paragraph must still read as final, and the recoverable rule must be about
+    arguments, never about permission.
+    """
+    block = next(b for b in BLOCKS if b.startswith("Call tools with the exact"))
+
+    assert BLOCK_D_DENIAL_PHRASE in block
+    # Every circumvention route the denial rule closes is still closed.
+    for banned_route in ("alias", "wrapper script", "different tool"):
+        assert banned_route in block, f"denial rule lost a route: {banned_route}"
+    # Ordering: recoverable error first, denial second.
+    assert block.index("invalid_arguments") < block.index(BLOCK_D_DENIAL_PHRASE)
+    # The denial paragraph itself must not have picked up retry language.
+    denial_paragraph = block[block.index(BLOCK_D_DENIAL_PHRASE):]
+    assert "again" not in denial_paragraph, "denial rule now permits a retry"
+
+
+def test_the_recoverable_error_rule_survives_the_contract_comparison() -> None:
+    """The rule lives in the contract, so a prompt-only edit cannot introduce it.
+
+    ``test_invalid_arguments_is_instructed_as_a_recoverable_error`` would pass
+    against a change made only in ``byte.py``. The rule has to be settled in the
+    contract like every other block, so this asserts the contract's own Block D
+    carries it -- the contract is the record, and the verbatim sync test then
+    propagates it to the prompt rather than the prompt being edited directly.
+    """
+    contract = parse_contract_blocks(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    assert "invalid_arguments" in contract["D"]
+
+
 # --------------------------------------------------------------------------
 # Approval integration
 # --------------------------------------------------------------------------

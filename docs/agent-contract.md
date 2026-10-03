@@ -251,6 +251,11 @@ can explain it — not so it can be trusted with it.
 > Call tools with the exact arguments the task requires. Use structured
 > arguments, not shell strings, unless there is genuinely no other way.
 >
+> A result of invalid_arguments is a malformed call, not a decision about the
+> work. Read the error and correct the arguments it names, then call the tool
+> again when the task still requires it. Never repeat the same arguments
+> unchanged.
+>
 > If a tool call comes back denied, that is the answer. Do not look for a
 > different tool, a different argument order, an alias, a wrapper script, or a
 > way of phrasing the same operation. Do not ask the operator to run it for you
@@ -266,6 +271,41 @@ This is therefore a standing behavioural rule, not a second copy of a classifier
 rule. The classifier decides what to gate; this tells the agent what to do when
 something is gated. The instruction is the deliverable, so the language stays
 explicit and unhedged.
+
+**The two failure modes in this block are opposites, and separating them is the
+point.** A denied call is final and the agent's only correct move is to report
+it. A malformed call is nobody's decision at all: Forge parsed something the
+model wrote, could not make sense of it, and said so. The dispatcher already
+treats the second as retryable — it does not cache `invalid_arguments`, and its
+docstring records that only a model error is worth retrying with different
+arguments — so the contract and the runtime were already aligned. The
+*instruction* was the missing half. Left unstated, the only rule the model had
+been given about a non-ok tool result was the denial rule, and the one correct
+response to a typo — fix the named field, call again — read as forbidden. That
+is a defect of the same family as the denial pressure above, in the opposite
+direction: an over-broad rule suppressing correct work rather than a missing
+rule permitting unsafe work.
+
+The paragraph sits **before** the denial rule on purpose, so the malformed-call
+reading is established first. It is bounded in three ways, and each bound is
+tested rather than merely intended:
+
+1. **Corrected, not repeated.** "Never repeat the same arguments unchanged" is
+   what keeps this from becoming a retry loop; an unchanged retry re-raises the
+   same error and burns a turn for nothing.
+2. **Conditional on need.** "when the task still requires it" stops the agent
+   retrying an argument fix to obtain a result nobody asked for.
+3. **Confined to arguments.** The paragraph says nothing about permission, and
+   it is placed after the opening line on exact arguments and before the denial
+   rule, so nothing in it can be read as a route around one.
+
+What this paragraph does **not** do is modify denial behaviour. `denied`,
+`rejected`, and `denied_unattended` remain final answers, are still cached by
+the dispatcher, and still may not be retried, re-routed, or rephrased. A
+recoverable *argument* error and a permission *refusal* are different kinds of
+event, and only the first is recoverable. The test
+`test_the_recoverable_error_rule_does_not_license_retrying_a_denial` holds that
+boundary in place.
 
 #### Block E — When to request approval
 

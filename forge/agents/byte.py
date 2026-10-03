@@ -83,6 +83,11 @@ BLOCK_D = """\
 Call tools with the exact arguments the task requires. Use structured \
 arguments, not shell strings, unless there is genuinely no other way.
 
+A result of invalid_arguments is a malformed call, not a decision about the \
+work. Read the error and correct the arguments it names, then call the tool \
+again when the task still requires it. Never repeat the same arguments \
+unchanged.
+
 If a tool call comes back denied, that is the answer. Do not look for a \
 different tool, a different argument order, an alias, a wrapper script, or a \
 way of phrasing the same operation. Do not ask the operator to run it for you \
