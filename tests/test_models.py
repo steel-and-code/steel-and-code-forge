@@ -905,3 +905,162 @@ def test_local_gateway_leaves_ordinary_json_fence_as_text() -> None:
 
     assert not response.wants_tools
     assert response.text == content.strip()
+
+
+# --------------------------------------------------------------------------
+# Local gateway timeout configuration
+# --------------------------------------------------------------------------
+
+
+def test_local_timeout_environment_variable_name() -> None:
+    """The one supported name, asserted so a rename is deliberate."""
+    from forge.models.local import LOCAL_TIMEOUT_ENV
+
+    assert LOCAL_TIMEOUT_ENV == "FORGE_LOCAL_TIMEOUT_SECONDS"
+
+
+def test_local_gateway_defaults_to_120_seconds() -> None:
+    """Unset means the documented default, not zero and not infinite."""
+    from forge.models.local import DEFAULT_TIMEOUT_SECONDS, LocalLlamaGateway
+
+    gateway = LocalLlamaGateway(environ={})
+
+    assert DEFAULT_TIMEOUT_SECONDS == 120.0
+    assert gateway.timeout_seconds == 120.0
+
+
+def test_local_gateway_treats_blank_timeout_as_unset() -> None:
+    """An empty export behaves like an unset one, not as an error."""
+    from forge.models.local import LocalLlamaGateway
+
+    gateway = LocalLlamaGateway(
+        environ={"FORGE_LOCAL_TIMEOUT_SECONDS": "   "}
+    )
+
+    assert gateway.timeout_seconds == 120.0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("5", 5.0),
+        ("30.5", 30.5),
+        ("  45  ", 45.0),
+        ("0.25", 0.25),
+    ],
+)
+def test_local_gateway_reads_a_custom_timeout(raw: str, expected: float) -> None:
+    """A well-formed override is honoured, whitespace and all."""
+    from forge.models.local import LocalLlamaGateway
+
+    gateway = LocalLlamaGateway(environ={"FORGE_LOCAL_TIMEOUT_SECONDS": raw})
+
+    assert gateway.timeout_seconds == expected
+
+
+def test_local_gateway_explicit_timeout_wins_over_the_environment() -> None:
+    """An argument beats the environment, and the environment is not consulted."""
+    from forge.models.local import LocalLlamaGateway
+
+    gateway = LocalLlamaGateway(
+        timeout=7.0,
+        environ={"FORGE_LOCAL_TIMEOUT_SECONDS": "not-a-number"},
+    )
+
+    assert gateway.timeout_seconds == 7.0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["0", "-1", "-0.5", "abc", "12s", "1,5", "nan", "inf", "-inf"],
+)
+def test_local_gateway_rejects_an_invalid_timeout(raw: str) -> None:
+    """A bad value fails at construction, naming the variable.
+
+    Left to ``urlopen`` it would surface as an opaque transport error, or for a
+    negative value as no timeout at all.
+    """
+    from forge.models.local import LocalConfigurationError, LocalLlamaGateway
+
+    with pytest.raises(LocalConfigurationError) as caught:
+        LocalLlamaGateway(environ={"FORGE_LOCAL_TIMEOUT_SECONDS": raw})
+
+    message = str(caught.value)
+    assert "FORGE_LOCAL_TIMEOUT_SECONDS" in message
+
+    # The offending value is not echoed back. Short values are skipped because
+    # "0" and "inf" occur inside the variable name and the rule text itself.
+    if len(raw) >= 4:
+        assert raw not in message
+
+
+def test_local_configuration_error_is_a_gateway_error() -> None:
+    """The CLI already handles GatewayError at construction; this joins it."""
+    from forge.models.local import LocalConfigurationError
+
+    assert issubclass(LocalConfigurationError, GatewayError)
+
+
+def test_local_gateway_error_does_not_echo_the_environment() -> None:
+    """The message names the variable, never the surrounding mapping."""
+    from forge.models.local import LocalConfigurationError, LocalLlamaGateway
+
+    environ = {
+        "FORGE_LOCAL_TIMEOUT_SECONDS": "soon",
+        "OPENAI_API_KEY": "«redacted:sk-…»",
+        "AWS_SECRET_ACCESS_KEY": "aws-SECRET-999",
+    }
+
+    with pytest.raises(LocalConfigurationError) as caught:
+        LocalLlamaGateway(environ=environ)
+
+    message = str(caught.value)
+    assert "OPENAI_API_KEY" not in message
+    assert "AWS_SECRET" not in message
+    assert "sk-" not in message
+
+
+def test_local_gateway_passes_its_timeout_to_the_transport(monkeypatch) -> None:
+    """The configured value is what ``urlopen`` is actually given.
+
+    Asserting only ``timeout_seconds`` would leave the wiring untested: the
+    attribute could be right while the call site kept a literal.
+    """
+    import forge.models.local as local_module
+    from forge.models.local import LocalLlamaGateway
+
+    seen: dict[str, Any] = {}
+
+    class _Response:
+        status = 200
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]}
+            ).encode("utf-8")
+
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+    def fake_urlopen(request: Any, timeout: Any = None) -> _Response:
+        seen["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(local_module.urllib.request, "urlopen", fake_urlopen)
+
+    gateway = LocalLlamaGateway(environ={"FORGE_LOCAL_TIMEOUT_SECONDS": "12.5"})
+    gateway.complete(CompletionRequest(system="s", messages=(), model="m"))
+
+    assert seen["timeout"] == 12.5
+
+
+def test_local_gateway_still_needs_no_credential() -> None:
+    """The offline path constructs with a bare mapping and no key."""
+    from forge.models.local import LocalLlamaGateway
+
+    gateway = LocalLlamaGateway(environ={})
+
+    assert gateway.timeout_seconds == 120.0

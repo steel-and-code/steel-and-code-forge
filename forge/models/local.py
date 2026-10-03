@@ -7,9 +7,11 @@ No credential is required. Policy and permissions remain outside the gateway.
 from __future__ import annotations
 
 import json
+import math
+import os
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Mapping
 
 from .base import (
     CompletionRequest,
@@ -25,18 +27,92 @@ import xml.etree.ElementTree as ET
 LOCAL_LLAMA_ENDPOINT = "http://127.0.0.1:8080/v1/chat/completions"
 DEFAULT_TIMEOUT_SECONDS = 120.0
 
+#: The one supported override name. Named in errors, never valued in them.
+LOCAL_TIMEOUT_ENV = "FORGE_LOCAL_TIMEOUT_SECONDS"
+
+
+class LocalConfigurationError(GatewayError):
+    """The local gateway was configured with a value it cannot use.
+
+    Raised at construction, so a bad timeout cannot become a request that hangs
+    or a socket that closes mid-response. The message names the variable and the
+    rule it broke -- never the surrounding environment.
+    """
+
+
+def resolve_timeout_seconds(environ: Mapping[str, str]) -> float:
+    """Seconds to allow a local model call, from ``FORGE_LOCAL_TIMEOUT_SECONDS``.
+
+    An absent or blank value means "not set", so an empty export behaves like an
+    unset one rather than as a configuration error.
+
+    Raises:
+        LocalConfigurationError: the value is not a finite number, or is not
+            positive. Both would otherwise reach ``urlopen`` and fail there as a
+            transport error with nothing to point at the real cause.
+    """
+    raw = environ.get(LOCAL_TIMEOUT_ENV, "").strip()
+
+    if not raw:
+        return DEFAULT_TIMEOUT_SECONDS
+
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise LocalConfigurationError(
+            f"{LOCAL_TIMEOUT_ENV} must be a number of seconds greater than 0; "
+            "it is not a number"
+        ) from None
+
+    if not math.isfinite(value) or value <= 0:
+        raise LocalConfigurationError(
+            f"{LOCAL_TIMEOUT_ENV} must be a number of seconds greater than 0; "
+            "it is not a positive, finite duration"
+        )
+
+    return value
+
 
 class LocalLlamaGateway:
-    """ModelGateway backed by a local llama.cpp OpenAI-compatible server."""
+    """ModelGateway backed by a local llama.cpp OpenAI-compatible server.
+
+    Args:
+        endpoint: Override for the local API URL. Present for testing; not a
+            policy hook.
+        timeout: Seconds. Left ``None``, the timeout comes from
+            ``FORGE_LOCAL_TIMEOUT_SECONDS``; an explicit value here wins over the
+            environment, and is trusted rather than validated, as it always was.
+        environ: The mapping the timeout is read from. Passed in rather than read
+            from ``os.environ`` so a test never has to mutate the process
+            environment; ``None`` means the real process environment.
+
+    Raises:
+        LocalConfigurationError: ``FORGE_LOCAL_TIMEOUT_SECONDS`` is set to a
+            value that is not a positive, finite number of seconds.
+    """
 
     def __init__(
         self,
         *,
         endpoint: str = LOCAL_LLAMA_ENDPOINT,
-        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        timeout: float | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
         self._endpoint = endpoint
-        self._timeout = timeout
+        self._timeout = (
+            float(timeout)
+            if timeout is not None
+            else resolve_timeout_seconds(os.environ if environ is None else environ)
+        )
+
+    @property
+    def timeout_seconds(self) -> float:
+        """The seconds this gateway will wait on a local model call.
+
+        Read-only, so a caller can report the effective timeout without being
+        able to change it after construction.
+        """
+        return self._timeout
 
     def complete(self, request: CompletionRequest) -> ModelResponse:
         payload = self._build_payload(request)

@@ -716,7 +716,10 @@ def _build_model_gateway(
     )
 
     if provider == "local":
-        return LocalLlamaGateway()
+        # ``environ`` is the same injected mapping OpenRouter reads, so the
+        # local timeout is configured the same way and no test has to mutate
+        # the process environment to exercise either gateway.
+        return LocalLlamaGateway(environ=environ)
 
     if provider == "openrouter":
         return OpenRouterGateway(environ=environ)
