@@ -14,8 +14,12 @@ What the surface is, and what it deliberately is not:
     route, and why it does not weaken the fail-closed rule for machine-driven
     HTTP callers.
 *   It is **local**. Bound to ``127.0.0.1`` with no host flag, gated by a
-    per-process token and an exact ``Origin`` check on every capability-bearing
-    request, and sending no CORS headers at all.
+    per-process token and a same-origin check on every capability-bearing
+    request, and sending no CORS headers at all. The same-origin check is an
+    exact ``Origin`` on a POST and, on a read-only GET, an exact ``Origin`` or
+    the browser's own ``Sec-Fetch-Site: same-origin`` -- a browser sends no
+    ``Origin`` at all on a same-origin GET, so demanding one there would refuse
+    the Workbench's own page. See :mod:`forge.ui.security`.
 *   It is **one session**. One process, one active run. A second task while a
     run is in flight is a conflict, not a queue.
 *   It is **inert**. It observes through :class:`forge.events.EventSink` and
@@ -26,9 +30,11 @@ What the surface is, and what it deliberately is not:
 The modules divide as:
 
 ``security``
-    Capability checks. The UI token, the exact-Origin rule, and the
-    short-lived stream ticket that lets ``EventSource`` open an SSE connection
-    without putting the main token in a query string.
+    Capability checks. The UI token, the same-origin rules (exact ``Origin``
+    for state-changing requests, and for read-only ones an exact ``Origin``
+    *or* the browser's ``Sec-Fetch-Site``), and the short-lived stream ticket
+    that lets ``EventSource`` open an SSE connection without putting the main
+    token in a query string.
 ``broker``
     Thread-safe fan-out of events to any number of SSE subscribers, with
     bounded per-subscriber queues and an in-memory replay ring.

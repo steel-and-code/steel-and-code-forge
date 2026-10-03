@@ -324,10 +324,12 @@ def build_parser() -> argparse.ArgumentParser:
             "waits -- this is the same question the terminal asks, asked "
             "through a browser.\n\n"
             "Binds 127.0.0.1 only, with no option to widen it. Every request "
-            "carrying a capability requires an exact Origin match and a "
-            "per-process token. There is no flag for a public host in v1, and "
-            "an approval-required operation with no browser attached still "
-            "fails closed."
+            "carrying a capability requires a per-process token plus a "
+            "same-origin check (exact Origin on a POST; on a GET, exact "
+            "Origin or the browser's own Sec-Fetch-Site, since a same-origin "
+            "GET carries no Origin header). There is no flag for a public "
+            "host in v1, and an approval-required operation with no browser "
+            "attached still fails closed."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(

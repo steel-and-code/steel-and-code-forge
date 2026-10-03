@@ -35,11 +35,13 @@ from forge.ui.channel import (
 )
 from forge.ui.runner import build_dispatcher, build_runtime
 from forge.ui.security import (
+    SEC_FETCH_SITE_HEADER,
     TOKEN_HEADER,
     StreamTicketStore,
     UiToken,
     allowed_origins,
     check_origin,
+    check_same_origin,
 )
 from forge.ui.session import SessionBusy, UiSessionState, WorkbenchSession
 
@@ -180,6 +182,79 @@ def test_a_missing_origin_is_not_a_match() -> None:
 def test_no_origin_value_matches_everything() -> None:
     assert "null" not in allowed_origins(8765)
     assert not check_origin("null", allowed_origins(8765))
+
+
+# -- the read-only same-origin check ---------------------------------
+#
+# These four cases are the measured shape of a real Chrome 154 talking to a
+# page served from the Workbench, plus the cross-origin counterpart. The
+# browser sends no `Origin` on a same-origin GET; it sends `Sec-Fetch-Site`
+# on everything. A test that invented an `Origin` on the GET would have
+# passed against code that no browser can satisfy.
+
+
+def test_a_same_origin_get_without_an_origin_is_accepted() -> None:
+    """The real browser shape: no ``Origin``, ``Sec-Fetch-Site: same-origin``."""
+    # The header name is asserted because the whole check rests on a browser
+    # sending this exact spelling. A typo here would fail open into 403s that
+    # look like a dead server rather than a dead guard.
+    assert SEC_FETCH_SITE_HEADER == "Sec-Fetch-Site"
+    assert check_same_origin(None, "same-origin", allowed_origins(8765))
+
+
+def test_an_exact_origin_still_passes_the_read_check() -> None:
+    assert check_same_origin("http://127.0.0.1:8765", None, allowed_origins(8765))
+    assert check_same_origin("http://localhost:8765", "same-origin", allowed_origins(8765))
+
+
+def test_a_cross_origin_get_is_refused_even_claiming_same_origin() -> None:
+    """A wrong ``Origin`` ends the question; it does not fall through.
+
+    A non-browser client can write both headers, so accepting
+    ``Sec-Fetch-Site: same-origin`` alongside a foreign ``Origin`` would let
+    anyone who can set headers past the check. A real browser never sends that
+    pair, so refusing it costs the page nothing.
+    """
+    expected = allowed_origins(8765)
+    assert not check_same_origin("http://evil.example", "same-origin", expected)
+    assert not check_same_origin("http://127.0.0.1:9999", "same-origin", expected)
+    assert not check_same_origin("http://127.0.0.1:8765/", "same-origin", expected)
+
+
+def test_both_signals_absent_is_refused() -> None:
+    """Fails closed against a forger who strips headers."""
+    expected = allowed_origins(8765)
+    assert not check_same_origin(None, None, expected)
+    assert not check_same_origin(None, "", expected)
+
+
+def test_only_the_browser_attested_site_value_is_accepted() -> None:
+    """``cross-site``, ``same-site`` and ``none`` are not ``same-origin``.
+
+    ``same-site`` is the one worth naming: a page on ``localhost:9000`` is
+    same-*site* to ``localhost:8765`` and a different origin, so accepting it
+    would hand the stream to any other local server's page.
+    """
+    expected = allowed_origins(8765)
+    assert not check_same_origin(None, "cross-site", expected)
+    assert not check_same_origin(None, "same-site", expected)
+    assert not check_same_origin(None, "none", expected)
+    assert not check_same_origin(None, "SAME-ORIGIN", expected)
+
+
+def test_a_post_never_accepts_fetch_metadata_instead_of_an_origin() -> None:
+    """The split is by method, and the strict rule is unchanged for POSTs.
+
+    Asserted on the *behaviour* the POST routes depend on, not on a name:
+    :func:`check_origin` is what ``require_browser`` calls, and it has no
+    ``Sec-Fetch-Site`` branch to leak into.
+    """
+    expected = allowed_origins(8765)
+    assert not check_origin(None, expected)
+    # No Sec-Fetch-Site parameter exists to be passed: the strict check has
+    # exactly one input, so the metadata branch cannot be reached from it.
+    with pytest.raises(TypeError):
+        check_origin(None, expected, "same-origin")  # type: ignore[call-arg]
 
 
 # --------------------------------------------------------------------------

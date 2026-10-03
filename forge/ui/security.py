@@ -9,12 +9,18 @@ Three mechanisms, each answering a different question:
     cannot forge a header carrying it.
 
 ``check_origin``
-    *Did this request come from a page Forge served?* An exact string match,
-    not a "starts with localhost" check. Localhost is not a security boundary
-    on its own: any page in any tab on the machine can issue a request to
-    ``http://127.0.0.1:8765`` and a browser will attach its own ``Origin``
-    header. Comparing that header to an exact expected value is what
+    *Did this state-changing request come from a page Forge served?* An exact
+    string match, not a "starts with localhost" check. Localhost is not a
+    security boundary on its own: any page in any tab on the machine can issue
+    a request to ``http://127.0.0.1:8765`` and a browser will attach its own
+    ``Origin`` header. Comparing that header to an exact expected value is what
     distinguishes the Workbench page from a page on ``evil.example``.
+
+``check_same_origin``
+    *Did this read-only request come from the page Forge served?* ``Origin`` is
+    mandatory on a POST and **optional on a same-origin GET**, so ``Origin``
+    alone cannot answer this question. See the module-level note on what a
+    browser actually sends.
 
 ``StreamTicketStore``
     *May this request open the event stream?* A one-shot, short-lived ticket,
@@ -30,10 +36,63 @@ Two properties are deliberate and worth stating because they are easy to
 *   **No CORS headers, ever.** Not for the page, not for the API, not on error
     responses. A CORS header is a browser-enforced grant to another origin, and
     this surface has no legitimate cross-origin consumer. Absence is the policy.
-*   **A missing ``Origin`` is not a match.** Some non-browser clients send
-    none, and it would be convenient to treat that as "not a browser, allow
-    it". That is exactly the request a forged submission looks like when the
-    forger can suppress the header, so absence fails closed.
+*   **A missing ``Origin`` is not a match on a state-changing request.** Some
+    non-browser clients send none, and it would be convenient to treat that as
+    "not a browser, allow it". That is exactly the request a forged submission
+    looks like when the forger can suppress the header, so absence fails
+    closed.
+
+What a browser actually sends
+-----------------------------
+
+The rule above is about POSTs, and the distinction is not pedantry -- it is the
+difference between a working page and a dead one. Measured against Chrome 154
+on the wire, for a page served from ``http://127.0.0.1:8765``:
+
+===================  ===================  ===================  ==========
+Request              ``Origin``           ``Sec-Fetch-Site``   ``Referer``
+===================  ===================  ===================  ==========
+``GET /api/status``  **absent**           ``same-origin``      present
+``GET /api/events``  **absent**           ``same-origin``      present
+(``EventSource``)
+``POST /api/run``    present              ``same-origin``      present
+===================  ===================  ===================  ==========
+
+A browser sends ``Origin`` on a same-origin request when the *method* makes the
+answer relevant -- it is the CORS-preflight and CSRF signal, and a GET carries
+no cross-origin capability worth reporting. So a same-origin ``fetch`` GET and
+a same-origin ``EventSource`` GET both arrive with **no ``Origin`` at all**,
+while every POST from the same page carries one. Requiring an exact ``Origin``
+on those GETs does not fail closed, it fails *always*: the page's own requests
+are indistinguishable from a forger's, and the UI sits there refusing its own
+authorised caller.
+
+``Sec-Fetch-Site`` is the header that *is* sent on every one of those requests.
+It is a Fetch Metadata request header, which makes it the right signal here for
+two reasons:
+
+*   it is present on same-origin GETs, which is exactly where ``Origin`` is not;
+*   it is set by the browser, not the page. It is a forbidden header name, so
+    ``fetch``/``EventSource`` cannot attach or override it -- a page on
+    ``evil.example`` gets ``cross-site``, and the only client that can write
+    ``same-origin`` is not a browser at all, which is a different threat with a
+    different answer (it would also have to forge the token or a ticket).
+
+So the split is by method, and it is a split about what each method *can* do:
+
+*   **State-changing (every POST)** -- require an exact ``Origin``. Browsers
+    send it, so this costs the real page nothing, and a forger that suppresses
+    it is refused.
+*   **Read-only (the two GETs)** -- if an ``Origin`` is present it must match
+    exactly, with no fallback; otherwise ``Sec-Fetch-Site: same-origin`` is
+    required. So a cross-origin GET carrying an attacker ``Origin`` is refused,
+    and a request with neither header is refused: the check only stops being a
+    refusal for a request the browser itself vouched for.
+
+Neither branch is a relaxation of the token or the ticket. ``Sec-Fetch-Site``
+decides "was this the page I served", which is a question about the *request*;
+the token and the ticket decide "is this caller allowed to do this", which is a
+question about the *capability*. Both still have to pass.
 """
 
 from __future__ import annotations
@@ -48,8 +107,10 @@ __all__ = [
     "UiToken",
     "StreamTicketStore",
     "check_origin",
+    "check_same_origin",
     "allowed_origins",
     "TOKEN_HEADER",
+    "SEC_FETCH_SITE_HEADER",
     "TICKET_TTL_SECONDS",
     "TOKEN_BYTES",
 ]
@@ -59,6 +120,12 @@ __all__ = [
 #: and naming it as a token keeps it out of the credential-handling habits that
 #: would log it.
 TOKEN_HEADER = "X-Forge-Token"
+
+#: Fetch Metadata request header. Sent by the browser on *every* request,
+#: including the same-origin GETs that carry no ``Origin`` -- which is the
+#: entire reason it is consulted. A forbidden header name: page JavaScript
+#: cannot set or override it through ``fetch`` or ``EventSource``.
+SEC_FETCH_SITE_HEADER = "Sec-Fetch-Site"
 
 #: Bytes of entropy in the token and in each stream ticket. 32 bytes is far
 #: beyond guessing and cheap to generate; the value is per-process, so the
@@ -133,12 +200,43 @@ def allowed_origins(port: int) -> frozenset[str]:
 def check_origin(origin: str | None, expected: Iterable[str]) -> bool:
     """Whether ``origin`` is exactly one of ``expected``.
 
-    A missing header is a refusal. See the module docstring: absence is the
-    shape a header-stripping forger produces, so it cannot mean "allowed".
+    The state-changing check. A missing header is a refusal: a browser always
+    sends ``Origin`` on a POST, so absence is not the shape of a legitimate
+    request. See the module docstring.
     """
     if not origin:
         return False
     return origin in frozenset(expected)
+
+
+def check_same_origin(
+    origin: str | None, sec_fetch_site: str | None, expected: Iterable[str]
+) -> bool:
+    """Whether a read-only request came from the page Forge served.
+
+    Two signals, because one is not always there:
+
+    *   An exact ``Origin`` match, when the browser sent one. A cross-origin
+        ``GET`` from ``evil.example`` arrives carrying that attacker origin, so
+        it is refused here on the same exact-match rule as a POST.
+    *   ``Sec-Fetch-Site: same-origin`` when ``Origin`` is **absent**, which is
+        what a same-origin ``fetch`` GET and an ``EventSource`` GET actually
+        look like. The browser sets it and page JavaScript cannot forge it.
+
+    A *present but wrong* ``Origin`` is refused outright and never falls
+    through to the second signal. Both headers are ordinary strings to a
+    non-browser client, so a client that can write both can satisfy either
+    one; the rule that makes the pair worth anything is that disagreeing with
+    an explicit ``Origin`` ends the question. A browser never produces that
+    combination -- it sends ``Sec-Fetch-Site: cross-site`` alongside a foreign
+    ``Origin`` -- so refusing it costs the real page nothing.
+
+    Both absent is a refusal, so this fails closed against a forger who strips
+    headers rather than forging them.
+    """
+    if origin:
+        return check_origin(origin, expected)
+    return sec_fetch_site == "same-origin"
 
 
 class StreamTicketStore:

@@ -33,7 +33,7 @@ from forge.models.scripted import ScriptedGateway, ScriptedTurn
 from forge.tools.workspace import Workspace
 from forge.ui.broker import SseBroker
 from forge.ui.runner import runtime_factory
-from forge.ui.security import TOKEN_HEADER, UiToken
+from forge.ui.security import SEC_FETCH_SITE_HEADER, TOKEN_HEADER, UiToken
 from forge.ui.server import create_app
 from forge.ui.session import UiSessionState, WorkbenchSession
 
@@ -226,12 +226,115 @@ def test_status_requires_an_exact_origin(harness: Harness) -> None:
 
 
 def test_a_missing_origin_is_refused(harness: Harness) -> None:
-    """Absence is the shape a header-stripping forger produces."""
+    """Absence of *both* signals is a refusal.
+
+    A browser always sends ``Origin`` on a POST and ``Sec-Fetch-Site`` on
+    everything, so a request carrying neither is not a browser.
+    """
     assert harness.status(origin=None).status_code == 403
+
+
+def test_a_same_origin_get_with_no_origin_header_is_served(harness: Harness) -> None:
+    """The regression: what a real Chrome actually sends on ``GET /api/status``.
+
+    Measured on the wire against Chrome 154 serving this page -- a same-origin
+    ``fetch`` GET arrives with **no** ``Origin`` header. The previous guard
+    required an exact ``Origin`` here, so it refused the page's own request
+    with a 403 that looked like a security event and was a browser-compat bug.
+
+    The header set below is copied from that capture rather than invented.
+    """
+    response = harness.client.get(
+        "/api/status",
+        headers={
+            SEC_FETCH_SITE_HEADER: "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Referer": f"http://127.0.0.1:{PORT}/",
+            TOKEN_HEADER: harness.token.value,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["state"] == "idle"
+
+
+def test_a_same_origin_get_still_needs_the_token(harness: Harness) -> None:
+    """``Sec-Fetch-Site`` answers "which page", not "allowed to do this"."""
+    response = harness.client.get(
+        "/api/status",
+        headers={SEC_FETCH_SITE_HEADER: "same-origin", TOKEN_HEADER: "wrong"},
+    )
+    assert response.status_code == 403
+
+
+def test_a_cross_site_get_is_refused_with_a_realistic_header_set(
+    harness: Harness,
+) -> None:
+    """A page on ``evil.example`` reaching for the status, as a browser sends it.
+
+    The browser attaches the attacker's ``Origin`` and labels the request
+    ``cross-site``. Both are refused; the guard does not depend on the page
+    failing to send one of them.
+    """
+    for origin, site in (
+        ("http://evil.example", "cross-site"),
+        ("http://evil.example", "same-origin"),  # cannot happen, must not help
+        (None, "cross-site"),
+    ):
+        headers = {SEC_FETCH_SITE_HEADER: site, TOKEN_HEADER: harness.token.value}
+        if origin is not None:
+            headers["Origin"] = origin
+        assert harness.client.get("/api/status", headers=headers).status_code == 403, (
+            origin,
+            site,
+        )
+
+
+def test_a_get_with_neither_signal_is_refused(harness: Harness) -> None:
+    """A header-stripping forger gains nothing on the read path either."""
+    response = harness.client.get(
+        "/api/status", headers={TOKEN_HEADER: harness.token.value}
+    )
+    assert response.status_code == 403
 
 
 def test_localhost_is_accepted_as_an_exact_alternative(harness: Harness) -> None:
     assert harness.status(origin=f"http://localhost:{PORT}").status_code == 200
+
+
+def test_a_post_still_refuses_fetch_metadata_instead_of_an_origin(
+    harness: Harness,
+) -> None:
+    """The strict POST rule is unchanged.
+
+    ``POST /api/run`` with a correct token, no ``Origin``, and
+    ``Sec-Fetch-Site: same-origin`` must still be refused. This is the line
+    that must not be "fixed" the same way: a POST is state-changing, a browser
+    always sends ``Origin`` for one, so there is nothing to accommodate.
+    """
+    response = harness.client.post(
+        "/api/run",
+        json={"task": "should not start"},
+        headers={SEC_FETCH_SITE_HEADER: "same-origin", TOKEN_HEADER: harness.token.value},
+    )
+    assert response.status_code == 403
+    assert harness.session.state is UiSessionState.IDLE
+
+
+def test_a_post_ticket_request_still_refuses_a_missing_origin(
+    harness: Harness,
+) -> None:
+    """Minting a stream ticket is state-changing, so it keeps the strict rule."""
+    assert (
+        harness.client.post(
+            "/api/events-ticket",
+            headers={
+                SEC_FETCH_SITE_HEADER: "same-origin",
+                TOKEN_HEADER: harness.token.value,
+            },
+        ).status_code
+        == 403
+    )
 
 
 def test_running_a_task_requires_a_token(harness: Harness) -> None:
@@ -331,6 +434,105 @@ def test_a_spent_ticket_cannot_open_a_second_stream(harness: Harness) -> None:
 def test_a_missing_ticket_is_refused(harness: Harness) -> None:
     response = harness.client.get("/api/events", headers=harness.headers(token=None))
     assert response.status_code == 403
+
+
+def test_a_real_eventsource_handshake_passes_the_origin_check(harness: Harness) -> None:
+    """The regression for the stream, using ``EventSource``'s real header set.
+
+    ``EventSource`` cannot set headers, so the request carries no
+    ``X-Forge-Token`` -- and, measured on the wire, no ``Origin`` either. It
+    sends ``Accept: text/event-stream``, ``Sec-Fetch-Site: same-origin`` and a
+    ``Referer``. The old guard required an exact ``Origin`` and refused this.
+
+    Asserted by *which* 403 comes back. Omitting the ticket makes the request
+    fail for a reason that is measurable, and the body says which guard stopped
+    it: a stream request that got past the origin check is refused for its
+    ticket, not for its origin. That distinction is the whole defect, and it is
+    observable without opening a body that never ends -- ``TestClient`` runs
+    the ASGI app to completion, so an open-ended SSE response would hang the
+    suite rather than fail it.
+    """
+    response = harness.client.get(
+        "/api/events",
+        headers={
+            "Accept": "text/event-stream",
+            SEC_FETCH_SITE_HEADER: "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "Referer": f"http://127.0.0.1:{PORT}/",
+        },
+    )
+    assert response.status_code == 403
+    assert "origin" not in response.json()["detail"]
+    assert "ticket" in response.json()["detail"]
+
+
+def test_a_cross_origin_eventsource_is_refused_by_the_origin_check(
+    harness: Harness,
+) -> None:
+    """A page on ``evil.example`` cannot open the stream, ticket or not.
+
+    ``EventSource`` from another origin is a CORS request, so the browser
+    attaches that origin and labels it ``cross-site``. The origin guard runs
+    first, so this stops before the ticket is looked at.
+    """
+    ticket = harness.ticket().json()["ticket"]
+    response = harness.client.get(
+        f"/api/events?ticket={ticket}",
+        headers={
+            "Accept": "text/event-stream",
+            "Origin": "http://evil.example",
+            SEC_FETCH_SITE_HEADER: "cross-site",
+        },
+    )
+    assert response.status_code == 403
+    assert "origin" in response.json()["detail"]
+    # Refused before the ticket was touched, so it is still spendable by the
+    # real page -- an attacker cannot burn the operator's stream.
+    assert harness.app.state.stream_tickets.redeem(ticket) is True
+
+
+def test_the_stream_refuses_when_neither_signal_is_present(harness: Harness) -> None:
+    """No ``Origin`` and no ``Sec-Fetch-Site`` is not a browser."""
+    ticket = harness.ticket().json()["ticket"]
+    response = harness.client.get(
+        f"/api/events?ticket={ticket}", headers={"Accept": "text/event-stream"}
+    )
+    assert response.status_code == 403
+    assert "origin" in response.json()["detail"]
+    assert harness.app.state.stream_tickets.redeem(ticket) is True
+
+
+def test_a_valid_ticket_and_a_real_handshake_reach_the_stream(
+    harness: Harness,
+) -> None:
+    """The accepting path, driven as far as ``TestClient`` safely allows.
+
+    ``_stream`` is pulled one frame rather than read to completion, for the
+    reason above: the generator is open-ended by design. What this adds over
+    the existing generator test is the pairing -- a ticket minted through the
+    route, spent exactly once, against the store the routes actually use.
+    """
+    import asyncio as _asyncio
+
+    from forge.ui.server import _stream
+
+    ticket = harness.ticket().json()["ticket"]
+    store = harness.app.state.stream_tickets
+
+    # The guard accepts a browser-shaped request, so redemption is what is left
+    # to prove -- and the ticket is single-use, spent by exactly one handshake.
+    assert store.redeem(ticket) is True
+    assert store.redeem(ticket) is False
+
+    async def drive():
+        harness.broker.bind_loop(_asyncio.get_running_loop())
+        subscriber = harness.broker.subscribe()
+        opening = await _stream(harness.broker, subscriber, 0).__anext__()
+        harness.broker.unsubscribe(subscriber)
+        return opening
+
+    assert _asyncio.run(drive()).startswith(": ")
 
 
 def test_a_stream_ticket_cannot_start_a_run(harness: Harness) -> None:

@@ -2,11 +2,18 @@
  *
  * Four endpoints and one stream:
  *
- *   GET  /api/status           token + origin   -> current state, pending approval
- *   POST /api/run              token + origin   -> 202, run id
- *   POST /api/events-ticket    token + origin   -> one-shot stream ticket
- *   GET  /api/events?ticket=   origin           -> SSE activity stream
- *   POST /api/approvals/{id}   token + origin   -> the decision
+ *   GET  /api/status           token + same-origin -> current state, approval
+ *   POST /api/run              token + origin      -> 202, run id
+ *   POST /api/events-ticket    token + origin      -> one-shot stream ticket
+ *   GET  /api/events?ticket=   ticket + same-origin -> SSE activity stream
+ *   POST /api/approvals/{id}   token + origin      -> the decision
+ *
+ * "origin" and "same-origin" are different server-side checks, and the split
+ * follows what a browser actually sends. A browser attaches `Origin` to a
+ * POST and attaches **nothing** to a same-origin GET — so the two GETs are
+ * authorized on `Sec-Fetch-Site: same-origin`, which it always sends. This
+ * file does not need to do anything about that: it is the browser attaching
+ * the header, and no fetch option here can add or override it.
  *
  * The rules this file keeps, and why they are not just style choices:
  *

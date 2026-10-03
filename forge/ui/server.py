@@ -3,9 +3,12 @@
 Four routes, and the split between them is the design:
 
 ``GET  /api/status``
-    Everything true right now, including any pending approval. Token and Origin
-    required -- it is the endpoint a refresh depends on, so it carries the same
-    capability as the pages that read it.
+    Everything true right now, including any pending approval. Token plus the
+    read-only same-origin check -- it is the endpoint a refresh depends on, so
+    it carries the same capability as the pages that read it. The read-only
+    check is a *pair*: exact ``Origin`` when the browser sent one, else
+    ``Sec-Fetch-Site: same-origin``, because a same-origin GET carries no
+    ``Origin`` at all. See :mod:`forge.ui.security` for the measurement.
 
 ``GET  /api/events``
     The activity stream. Read-only, and gated by a short-lived single-use
@@ -57,7 +60,15 @@ from ..models.base import ModelGateway
 from ..tools.workspace import Workspace
 from .broker import HEARTBEAT_SECONDS, SseBroker, Subscriber
 from .channel import StaleApproval, UnknownApproval, WebApprovalChannel
-from .security import TOKEN_HEADER, StreamTicketStore, UiToken, allowed_origins, check_origin
+from .security import (
+    SEC_FETCH_SITE_HEADER,
+    TOKEN_HEADER,
+    StreamTicketStore,
+    UiToken,
+    allowed_origins,
+    check_origin,
+    check_same_origin,
+)
 from .session import SessionBusy, UiSessionState, WorkbenchSession
 
 __all__ = ["create_app", "STATIC_DIR", "TOKEN_PLACEHOLDER"]
@@ -175,14 +186,37 @@ def create_app(
     # -- guards ---------------------------------------------------------
 
     def require_browser(request: Request) -> None:
-        """Exact-Origin check, on every capability-bearing route.
+        """Exact-Origin check, on every state-changing route.
 
         A page served from ``evil.example`` can make the browser issue a
         request to ``http://127.0.0.1:8765``, and the browser will attach the
         *attacker's* Origin. Comparing it to an exact expected value is the
         whole defence; a missing header fails closed.
+
+        Only for POSTs. A browser does not send ``Origin`` on a same-origin
+        GET, so requiring it there would refuse the Workbench's own page; the
+        read-only routes use :func:`require_same_origin` instead.
         """
         if not check_origin(request.headers.get("origin"), origins):
+            raise HTTPException(
+                status_code=403,
+                detail="origin not allowed; this surface serves one page only",
+            )
+
+    def require_same_origin(request: Request) -> None:
+        """The read-only check: exact ``Origin``, else browser-attested same-origin.
+
+        A same-origin ``fetch`` GET and an ``EventSource`` GET arrive with no
+        ``Origin`` header, so ``Origin`` alone cannot answer this. An exact
+        match still wins when present (refusing a cross-origin GET carrying an
+        attacker ``Origin``); otherwise ``Sec-Fetch-Site: same-origin`` is
+        required. Both absent is a refusal.
+        """
+        if not check_same_origin(
+            request.headers.get("origin"),
+            request.headers.get(SEC_FETCH_SITE_HEADER),
+            origins,
+        ):
             raise HTTPException(
                 status_code=403,
                 detail="origin not allowed; this surface serves one page only",
@@ -194,7 +228,19 @@ def create_app(
             raise HTTPException(status_code=403, detail="invalid UI token")
 
     async def guarded(request: Request) -> None:
+        """Origin + token, for state-changing requests."""
         await asyncio.to_thread(require_browser, request)
+        await asyncio.to_thread(require_token, request)
+
+    async def guarded_read(request: Request) -> None:
+        """Same-origin + token, for read-only requests.
+
+        The token is still required. ``Sec-Fetch-Site`` answers "was this the
+        page I served", not "is this caller allowed" -- dropping the token here
+        would let any same-origin script read the workspace and any pending
+        approval, which is exactly the data the token exists to gate.
+        """
+        await asyncio.to_thread(require_same_origin, request)
         await asyncio.to_thread(require_token, request)
 
     # -- page -----------------------------------------------------------
@@ -233,7 +279,7 @@ def create_app(
 
     @app.get("/api/status")
     async def api_status(
-        request: Request, _: None = Depends(guarded)
+        request: Request, _: None = Depends(guarded_read)
     ) -> JSONResponse:
         """Current state, including any pending approval."""
         return JSONResponse(session.status())
@@ -301,16 +347,21 @@ def create_app(
     ) -> Response:
         """The SSE stream.
 
-        Gated by a stream ticket plus an exact Origin. The ticket opens a
-        read-only stream; it cannot start a run and cannot answer an approval,
-        which is why it is safe to carry in a URL.
+        Gated by a stream ticket plus the read-only same-origin check. The
+        ticket opens a read-only stream; it cannot start a run and cannot
+        answer an approval, which is why it is safe to carry in a URL.
+
+        The order is load-bearing: the same-origin check runs *before*
+        ``redeem``, so a cross-origin request is refused without spending a
+        ticket. Otherwise any page on the machine could burn an operator's
+        ticket before the operator's own ``EventSource`` ever connected.
 
         ``Last-Event-ID`` is honoured by header or query so a reconnecting
         browser gets the tail it missed. When the ring has moved past the gap,
         the stream says so rather than presenting a partial history as a whole
         one.
         """
-        await asyncio.to_thread(require_browser, request)
+        await asyncio.to_thread(require_same_origin, request)
         if not tickets.redeem(ticket):
             raise HTTPException(
                 status_code=403,
