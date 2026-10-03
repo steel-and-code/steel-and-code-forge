@@ -75,6 +75,11 @@ WORKSPACE_ENV = "FORGE_WORKSPACE"
 DEFAULT_MODEL_ENV = "FORGE_MODEL"
 DEFAULT_MODEL = "anthropic/claude-sonnet-4"
 
+#: Model provider. OpenRouter remains the default, while local selects the
+#: llama.cpp gateway running on this machine.
+MODEL_PROVIDER_ENV = "FORGE_MODEL_PROVIDER"
+DEFAULT_MODEL_PROVIDER = "openrouter"
+
 #: Where `forge byte` reads a long task from. A file rather than stdin, because a
 #: piped prompt collides awkwardly with `--workspace` and with a future chat mode.
 TASK_FILE_FLAG = "--task-file"
@@ -695,6 +700,31 @@ def _read_task(args: argparse.Namespace, err: TextIO) -> str | None:
     )
     return None
 
+def _build_model_gateway(
+    environ: dict[str, str],
+):
+    """Construct the configured model gateway."""
+
+    from ..models.base import GatewayError
+    from ..models.local import LocalLlamaGateway
+    from ..models.openrouter import OpenRouterGateway
+
+    provider = (
+        environ.get(MODEL_PROVIDER_ENV, DEFAULT_MODEL_PROVIDER)
+        .strip()
+        .lower()
+    )
+
+    if provider == "local":
+        return LocalLlamaGateway()
+
+    if provider == "openrouter":
+        return OpenRouterGateway(environ=environ)
+
+    raise GatewayError(
+        f"unknown model provider {provider!r}; "
+        "expected 'openrouter' or 'local'"
+    )
 
 def _run_byte(
     args: argparse.Namespace,
@@ -715,7 +745,6 @@ def _run_byte(
     from ..agents.byte import BYTE, assemble_system_prompt
     from ..agents.runtime import AgentRuntime, MaxTurnsExceeded, summarise
     from ..models.base import GatewayError
-    from ..models.openrouter import OpenRouterGateway
     from ..tools.dispatcher import ToolDispatcher
     from ..tools.execution import Executor
 
@@ -733,7 +762,7 @@ def _run_byte(
     # mapping. It is never threaded through the profile, the state, or a tool
     # result, and the runtime is constructed before anything can reach it.
     try:
-        gateway = OpenRouterGateway(environ=environ)
+        gateway = _build_model_gateway(environ)
     except GatewayError as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_USAGE
@@ -810,7 +839,6 @@ def _run_workbench(
     """
     from ..agents.byte import BYTE
     from ..models.base import GatewayError
-    from ..models.openrouter import OpenRouterGateway
     from ..ui import UiUnavailable
     from ..ui.broker import SseBroker
     from ..ui.runner import runtime_factory
@@ -834,7 +862,7 @@ def _run_workbench(
     # body -- a page that can read the provider key is a page that can spend the
     # operator's money.
     try:
-        gateway = OpenRouterGateway(environ=environ)
+        gateway = _build_model_gateway(environ)
     except GatewayError as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_USAGE
