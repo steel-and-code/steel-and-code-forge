@@ -475,6 +475,145 @@ def test_grounding_survives_the_contract_comparison() -> None:
 
 
 # --------------------------------------------------------------------------
+# Persistence: keep gathering evidence until it is sufficient
+# --------------------------------------------------------------------------
+
+#: The opening words of the persistence paragraph. Located by text rather than
+#: by index so a future paragraph inserted into Block B does not silently
+#: repoint these assertions at the wrong one.
+PERSISTENCE_PHRASE = "One successful read or search is not sufficient"
+
+#: The move the persistence rule exists to prohibit. Grounding's closing
+#: instruction -- "say what you did read and name what you would read next" --
+#: is legitimate for code Byte cannot reach, so the two cannot be separated by
+#: the general instruction alone; the persistence rule has to name this move.
+WOULD_NEED_MOVE = "Do not end the run by listing what you would need to read next"
+
+
+def _persistence_paragraph() -> str:
+    block = _block_b()
+    assert PERSISTENCE_PHRASE in block, "Block B has no persistence paragraph"
+    start = block.index(PERSISTENCE_PHRASE)
+    rest = block[start:]
+    # Paragraphs are separated by a blank line inside the block.
+    end = rest.find("\n\n")
+    return rest if end == -1 else rest[:end]
+
+
+def test_persistence_is_instructed_for_inspect_explain_and_summarize() -> None:
+    """A single successful read is not on its own a reason to answer.
+
+    Block B's second paragraph states the destination -- enough evidence to
+    answer the question -- but not what to do while still travelling toward it.
+    The gap this closes is specific: Byte reads one file, correctly judges the
+    architecture is larger, and then reports what it read and stops. That run
+    is wrong in the way that is hardest to notice, because the tool calls it did
+    make all succeeded and the report is internally consistent.
+    """
+    block = _block_b()
+
+    # The condition is Byte's own judgement, not a count: a quota fails in both
+    # directions at once.
+    assert PERSISTENCE_PHRASE in block
+    # ...and it is conditioned on being able to name what is still missing.
+    assert "If you can name" in _persistence_paragraph()
+    # The named action is continued tool use, not a longer report.
+    assert "keep calling tools" in _persistence_paragraph()
+    # And the exit that would otherwise look correct is closed explicitly.
+    assert WOULD_NEED_MOVE in _persistence_paragraph()
+
+
+def test_persistence_does_not_license_a_read_everything_run() -> None:
+    """The rule is about sufficiency, and says so in both directions.
+
+    A persistence instruction with no stopping condition turns Byte into an
+    agent that cannot finish an investigation, which is a different failure with
+    the same shape: the operator never gets an answer. So the legitimate stop
+    must be stated -- the evidence answering the question actually asked -- and
+    the bound must be explicit rather than left to the model's mood.
+    """
+    paragraph = _persistence_paragraph()
+
+    # A real stopping condition, tied to the question that was asked.
+    assert "sufficient to answer the question" in paragraph
+    # Blocked is a legitimate end, and each blocker is named.
+    for blocker in ("ambiguous", "refused", "does not exist"):
+        assert blocker in paragraph, f"persistence rule lost a stopping case: {blocker}"
+    # The bound against totality is stated outright, not implied.
+    assert "sufficiency, not" in paragraph
+    assert "reading everything" in paragraph
+    assert "not expected to traverse the whole" in paragraph
+    # No quota language crept in.
+    for banned in ("at least", "minimum of", "every file", "all files"):
+        assert banned not in paragraph, f"persistence rule became a quota: {banned}"
+
+
+def test_persistence_is_not_a_route_around_a_refusal_or_a_guess() -> None:
+    """A continuation rule can be misread as a retry rule, so it is bounded.
+
+    "Keep calling tools until you have" and Block D's denial rule share a
+    subject. Read carelessly, persistence would tell Byte to keep going after a
+    refusal -- which is exactly the circumvention the denial rule closes. The
+    persistence paragraph therefore has to treat a refused read as a stopping
+    condition rather than a thing to route around, and it must not become a
+    licence to state an inference it has not read.
+    """
+    paragraph = _persistence_paragraph()
+
+    # A refusal ends the investigation; it is not retried under another name.
+    assert "a read is refused" in paragraph
+    for banned_route in ("alias", "wrapper script", "different tool", "again"):
+        assert banned_route not in paragraph, f"persistence opened a route: {banned_route}"
+    # And it does not license a guess, the way the grounding rule would if it
+    # were loosened.
+    for banned in ("likely", "probably", "assume", "inferred", "guess"):
+        assert banned not in paragraph, f"persistence rule licenses a guess: {banned}"
+    # The grounding rule itself is untouched and still downstream of it.
+    assert GROUNDING_PHRASE in _block_b()
+    assert BLOCK_D_DENIAL_PHRASE in next(
+        b for b in BLOCKS if b.startswith("Call tools with the exact")
+    )
+
+
+def test_persistence_survives_the_contract_comparison() -> None:
+    """The rule lives in the contract, so a prompt-only edit cannot introduce it.
+
+    The same reason as the grounding and recoverable-error rules: the contract
+    is the record, and the verbatim sync test then carries the wording into the
+    prompt. Without this, the paragraph could be added to ``byte.py`` alone and
+    never reviewed as an instruction.
+    """
+    contract = parse_contract_blocks(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    assert PERSISTENCE_PHRASE in contract["B"]
+    assert WOULD_NEED_MOVE in contract["B"]
+    # Grounding was preserved rather than traded away for it.
+    assert GROUNDING_PHRASE in contract["B"]
+
+
+def test_persistence_is_a_separate_paragraph_from_grounding() -> None:
+    """Two rules, two paragraphs -- they are not allowed to blur.
+
+    They are neighbours and they pull in opposite directions: grounding says
+    describe only what you read, persistence says stop answering and go read
+    more. Held in one paragraph the model can satisfy either at the expense of
+    the other, and the cheapest reading of the pair is always "report early".
+    """
+    block = _block_b()
+
+    # Persistence is not inside the grounding paragraph.
+    grounding_start = block.index(GROUNDING_PHRASE)
+    assert PERSISTENCE_PHRASE not in block[grounding_start:]
+    # ...and the grounding rule's own escape hatch is not inside persistence.
+    assert GROUNDING_PHRASE not in _persistence_paragraph()
+    # Investigation still comes first; persistence extends it rather than
+    # replacing it.
+    assert block.index("When you are asked to inspect") < block.index(
+        PERSISTENCE_PHRASE
+    )
+
+
+# --------------------------------------------------------------------------
 # Approval integration
 # --------------------------------------------------------------------------
 

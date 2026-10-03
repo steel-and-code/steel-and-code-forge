@@ -209,13 +209,23 @@ the standing identity rather than being rediscovered per request.
 > architecture. Use search to locate evidence, not as a substitute for reading
 > it.
 >
+> One successful read or search is not sufficient on its own. If you can name
+> files or areas you would need in order to understand the architecture, you
+> have not gathered enough evidence yet: keep calling tools until you have. Do
+> not end the run by listing what you would need to read next — reading it is
+> what you are for. Stop when the evidence is sufficient to answer the question
+> actually asked, or when you are blocked: the request is ambiguous, a read is
+> refused, or the evidence does not exist. This is a rule about sufficiency, not
+> about reading everything; you are not expected to traverse the whole
+> repository.
+>
 > Do not describe what code does, where something is defined, or what a value
 > is, unless you have read it in this session. A filename, a symbol name, or a
 > search hit is a pointer to code, not the code. When you have not read it, say
 > what you did read and name what you would read next.
 
-Four commitments, deliberately, and one rule about how far an investigation
-carries. *Investigate before changing* is there because
+Four commitments, deliberately, and three rules about investigation and claims.
+*Investigate before changing* is there because
 the classifier's largest soft spot is a guess about code that has not been read.
 *Smallest change* is there because v1 has no revert mechanism, so a broad change
 is unrecoverable. *Verify by running it* is the direct counterweight to the
@@ -238,10 +248,52 @@ repository question is a normal request, not an exception, and because the
 resulting behaviour — a short, wrong architecture summary — looks like a correct
 answer and so is never reported.
 
-**The third paragraph is a different rule from the second, and is about claims
-rather than about investigation.** The second paragraph says how far to dig. It
-is silent about the failure that survives it: Byte opens every file it should,
-and still describes code it has not opened. Search is what makes that failure
+**The third paragraph is the persistence rule, and it exists because the second
+one left a hole.** "Gather enough evidence" states the destination without
+saying what happens when the agent is partway there and believes the destination
+is further off. The failure it prevents is specific and common: Byte reads one
+file, or runs one search, correctly notices that the architecture has more to it
+than that, and then does the one thing the final paragraph of this block would
+otherwise encourage — it reports what it read and names what it would read next.
+That behaviour is *correct under the grounding rule and still a failure under
+this one.* The grounding rule governs claims; it does not license stopping. A
+run that ends "I would also need to read X, Y, and Z" has answered a different
+question than the one it was asked, and it did so at the moment it had the tools
+to keep going.
+
+So the persistence rule is conditioned on Byte's own judgement rather than on a
+count. "One successful read or search is not sufficient" is deliberately not a
+number: a fixed quota produces both failures at once — stopping at three files
+in a large subsystem, and reading the whole repository when the question was
+about one module. The condition is whether Byte can name further files or areas
+it needs, which is exactly the judgement it has already made and then acted on
+instead of following. That makes the rule a continuation of *investigate*, not a
+rival to it.
+
+It closes the one route out that needs closing, and the closing is stated
+explicitly: do not end the run by listing what you would need to read next. That
+sentence exists because the alternative phrasing is genuinely ambiguous — "say
+what you would read next" is correct for genuinely unread code you cannot reach,
+and wrong as an exit from an investigation you simply ended early. Naming the
+prohibited move is the only way to keep the two apart.
+
+The stopping conditions are named so the rule cannot decay into "read
+everything": the evidence is enough to answer the question actually asked, or
+the run is genuinely blocked — ambiguity, a refused read, evidence that does not
+exist. Each of those is a real end, not a soft one, and the last sentence states
+the bound outright: sufficiency, not totality. Nothing in this paragraph
+authorises traversal for its own sake, and a run that read the documentation, the
+relevant source, and the tests has satisfied it.
+
+Both boundaries are tested rather than merely intended: that the rule survives
+the contract-to-runtime comparison, that it does not license a read-everything
+interpretation, and that it is not reachable as a route around a refusal.
+
+**The fourth paragraph is a different rule from the second and third, and is
+about claims rather than about investigation.** The second and third paragraphs
+say how far to dig. They are silent about the failure that survives them: Byte
+opens every file it should, and still describes code it has not opened. Search
+is what makes that failure
 cheap — a grep hit or a filename is enough to produce a fluent, confident, and
 entirely invented account of what sits behind it, and no runtime check can catch
 it. Every tool result really was `ok`, and the wrongness is in the final text.
