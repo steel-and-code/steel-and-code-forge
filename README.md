@@ -16,7 +16,7 @@ forge/
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (610 passing)
+tests/        pytest suite (716 passing)
 docs/         architecture and design notes
 ```
 
@@ -57,23 +57,20 @@ fully specified — system instructions and memory included.
 The execution layer exists and runs approved operations; the CLI does not call
 it yet, so `forge check` still executes nothing. There is **no `forge exec` in
 v1** — that is a decision, not a gap; the reasoning is in
-[docs/byte-tools.md](docs/byte-tools.md). Next steps, in order:
+[docs/byte-tools.md](docs/byte-tools.md). The permission baseline is implemented
+in `forge/tools/commands.py`: explicit deny, approval, and allow rule tables with
+approval-required as the default for anything unrecognised. Next steps, in order:
 
-1. Implement the permission-model changes: an explicit ALLOW rule table,
-   approval-required as the default for unrecognised commands, and gating for
-   workspace-local executables and repository-code execution. The gap between
-   the spec and the code is tabulated in
-   [docs/byte-tools.md](docs/byte-tools.md).
-2. Define the model gateway contract in `forge/models/`.
-3. Implement the agent contract in `forge/agents/`, and wire the runtime to the
+1. Define the model gateway contract in `forge/models/`.
+2. Implement the agent contract in `forge/agents/`, and wire the runtime to the
    existing executor through the classify → secret checks → approval → execute
    pipeline.
-4. Implement session memory, the one memory scope v1 enables.
-5. Record execution and approval events somewhere reviewable. Nothing is
+3. Implement session memory, the one memory scope v1 enables.
+4. Record execution and approval events somewhere reviewable. Nothing is
    recorded durably yet, and this should exist before durable memory is enabled.
-6. Define the secondary HTTP surface n8n and the website will call.
-7. Wire n8n trigger handling.
-8. Write the remaining tools.
+5. Define the secondary HTTP surface n8n and the website will call.
+6. Wire n8n trigger handling.
+7. Write the remaining tools.
 
 ## Permission model
 
@@ -85,12 +82,17 @@ widen it.
 | --- | --- |
 | **Automatic** | Read-only inspection in the workspace (`ls`, `pwd`, `find` read forms, `grep`, `rg`, `cat`, `head`, `tail`, `wc`, `stat`, `file`, `diff`); `git status`, `diff`, `log`, `show`, `rev-parse`, `ls-files`, and the listing forms of `git branch`, `tag`, `stash`; structured `write_file` / `patch_file` edits. |
 | **Approval required** | Every git mutation including `add`, `commit`, `push`; general filesystem writes (`mkdir`, `touch`, `cp`, `mv`, `ln`, `chmod`, `rm`); executing repository code (`pytest`, `make`, `npm test`, `cargo`); any executable resolving inside the workspace (`./scripts/check.sh`); inline interpreter code; network egress; **any unrecognised command**. |
-| **Denied** | `sudo` and system-level changes; anything outside the workspace; credential access and environment dumps (`env`, `printenv`); dependency installation; force push and destructive git history; wildcard destructive deletes. |
+| **Denied** | `sudo` and system-level changes; anything outside the workspace; executables outside the workspace that are not in a trusted system root; credential access and environment dumps (`env`, `printenv`); dependency installation; force push and destructive git history; wildcard destructive deletes. |
 
 Automatic is an explicit rule, never a default, and the allowlist is
 deliberately small: an entry is added only when there is confidence it belongs
 there. An unrecognised command is approval-required, so a classifier miss
 produces a prompt rather than silent execution.
+
+Executables are classified by where they *resolve*, not by the shape of the
+token. Inside the workspace is repository code and is gated; in
+`/usr/local/bin`, `/usr/bin`, or `/bin` — the directories Forge's executor
+searches — it is classified normally; anywhere else it is denied.
 
 ## Terminal interface
 

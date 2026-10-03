@@ -39,6 +39,7 @@ __all__ = [
     "ProgramRule",
     "DENIED_PROGRAMS",
     "APPROVAL_PROGRAMS",
+    "ALLOWED_PROGRAMS",
     "WILDCARD_CHARACTERS",
 ]
 
@@ -228,6 +229,9 @@ DENIED_PROGRAMS: tuple[ProgramRule, ...] = (
     _deny("cmd.git_reset_hard", "history rewrite is irreversible for other clones", _GIT, subcommands=frozenset({"reset"}), flags=frozenset({"--hard"})),
     _deny("cmd.git_clean", "clean discards uncommitted work irrecoverably", _GIT, subcommands=frozenset({"clean"}), flags=frozenset({"-f", "--force"})),
     _deny("cmd.git_branch_delete", "branch deletion destroys work, sometimes other people's", _GIT, subcommands=frozenset({"branch"}), flags=frozenset({"-d", "-D"})),
+    # Tag deletion is the same operation as branch deletion under a different
+    # noun. Denying one and approving the other would be arbitrary.
+    _deny("cmd.git_tag_delete", "tag deletion destroys work", _GIT, subcommands=frozenset({"tag"}), flags=frozenset({"-d", "-D"})),
     _deny("cmd.git_update_ref_delete", "ref deletion destroys work", _GIT, subcommands=frozenset({"update-ref"}), flags=frozenset({"-d", "--delete"})),
     # `git push --delete origin x` and the older `git push origin :x` spelling
     # both delete a remote ref. Both forms are denied; a plain push stays gated.
@@ -283,7 +287,136 @@ APPROVAL_PROGRAMS: tuple[ProgramRule, ...] = (
     # `_classify_wildcard_delete`, which distinguishes wildcard targets (denied)
     # from explicit ones (gated).
     _gate("cmd.delete_file", "file deletion is irreversible", frozenset({"rm", "rmdir", "unlink"})),
+    # ------------------------------------------------------------------
+    # Repository-code execution.
+    #
+    # `pytest` executes `conftest.py`, loads installed plugins, imports
+    # fixtures, and runs arbitrary repository-supplied test code, so it is
+    # repository code executing under a familiar name. Gating it here keeps it
+    # in the same bucket as a workspace-local shell script; auto-approving
+    # `pytest` while gating `./scripts/check.sh` would be incoherent.
+    #
+    # These are explicit rules rather than a consequence of the unknown
+    # default, so the reason an operator sees names the actual cause instead of
+    # "unrecognised".
+    # ------------------------------------------------------------------
+    _gate("cmd.repo_runner", "test execution runs repository code", frozenset({"pytest"})),
+    _gate("cmd.repo_runner", "make executes repository build recipes", frozenset({"make"})),
+    _gate("cmd.repo_runner", "test execution runs repository code", frozenset({"tox", "nox"})),
+    _gate(
+        "cmd.repo_runner",
+        "npm runs repository scripts",
+        frozenset({"npm", "pnpm", "yarn"}),
+        subcommands=frozenset({"test", "run", "start", "rebuild"}),
+    ),
+    _gate(
+        "cmd.repo_runner",
+        "cargo runs repository build and test code",
+        frozenset({"cargo"}),
+        subcommands=frozenset({"test", "build", "run", "bench", "doc", "check", "clippy"}),
+    ),
+    _gate(
+        "cmd.repo_runner",
+        "go runs repository build and test code",
+        frozenset({"go"}),
+        subcommands=frozenset({"test", "build", "run", "generate", "vet"}),
+    ),
+    # `python -m pytest` is a test run by another spelling. The `-m` flag is
+    # required so this cannot match `python -m <unrelated-module>`, which the
+    # unknown default already gates.
+    _gate(
+        "cmd.repo_runner_module",
+        "python -m pytest runs repository test code",
+        frozenset({"python", "python3", "pypy"}),
+        flags=frozenset({"-m"}),
+        args_contain=frozenset({"pytest"}),
+    ),
+    # Git mutations with no prior rule. `git add` stages into the operator's
+    # index on the agent's judgement about what belongs in a commit; the
+    # operator reviewing that is the point of the gate. `git switch` moves the
+    # working tree.
+    #
+    # `git branch`, `git tag`, and `git stash` are deliberately absent here.
+    # Each has an automatic listing form and a gated mutating form, and a
+    # program-level rule cannot tell them apart -- `cmd.git_branch_mutate` would
+    # also match `git branch --list`, and strictest-wins would then gate the
+    # listing form. They are discriminated by operation in
+    # `_classify_git_inspection`.
+    _gate("cmd.git_add", "staging changes the operator's index", _GIT, subcommands=frozenset({"add"})),
+    _gate("cmd.git_switch", "switching branches moves the working tree", _GIT, subcommands=frozenset({"switch", "restore"})),
 )
+
+# --------------------------------------------------------------------------
+# Allowed. Automatic, with no prompt.
+#
+# This table exists because the classifier's default changed. Previously an
+# unmatched argv invocation classified ALLOW, so `ALLOW` was reachable only as
+# an absence -- and a miss landed as silent execution rather than as a prompt.
+# Now the default is APPROVAL_REQUIRED (see `_unknown_program`), which means
+# `ALLOW` has to be a rule that matches, or the model would deny itself.
+#
+# The list is deliberately small, per the ruling in
+# byte-security-classification.md "List 3":
+#
+#     if we are not confident it belongs in automatic,
+#     leave it at APPROVAL_REQUIRED
+#
+# It is not broadened to reduce prompt count. A missing row costs one prompt; a
+# wrongly-added row costs a silent execution, and that asymmetry sets the size
+# of the table. Coverage grows one reviewed row at a time.
+#
+# Two things are deliberately absent and their absence is a decision, not an
+# oversight:
+#
+# * `du` and `df` -- `df` reports mounted filesystems outside the workspace.
+# * `env`, `printenv`, `set` -- denied outright by `cmd.env_dump`. There is no
+#   name-only form here; the matcher cannot structurally distinguish a safe
+#   by-name read from a value dump, so the denied reading stands.
+#
+# Git inspection and the `find` read forms are not in this table because they
+# need operation-level or flag-level discrimination that `ProgramRule` cannot
+# express without also matching the mutating forms of the same program. They are
+# in `_classify_git_inspection` and `_classify_find_read`.
+# --------------------------------------------------------------------------
+
+_READ_ONLY_PROGRAMS = frozenset(
+    {"ls", "pwd", "cat", "head", "tail", "wc", "stat", "file", "diff",
+     "grep", "rg"}
+)
+
+
+def _allow(
+    rule_id: str, reason: str, programs: frozenset[str], **kw: object
+) -> ProgramRule:
+    return ProgramRule(rule_id, reason, Classification.ALLOW, programs, **kw)  # type: ignore[arg-type]
+
+
+ALLOWED_PROGRAMS: tuple[ProgramRule, ...] = (
+    _allow(
+        "allow.read_only",
+        "read-only inspection inside the workspace",
+        _READ_ONLY_PROGRAMS,
+    ),
+    _allow(
+        "allow.version_probe",
+        "version probe on a recognised program; cannot act on the workspace",
+        _ANY,
+        flags=frozenset({"--version", "-V"}),
+    ),
+)
+
+#: Directories whose executables Forge is willing to run directly.
+#:
+#: Derived from the Executor's fixed executable search path rather than being a
+#: second, independent list: a program Forge cannot launch is a program whose
+#: location it does not trust, and two lists would be free to disagree.
+#:
+#: The value is duplicated as text rather than imported from `execution.py`
+#: because that module imports the approval layer, which imports this one, so an
+#: import here would be circular. `tests/test_commands.py` asserts the two stay
+#: equal, which is the part that actually matters.
+TRUSTED_EXECUTABLE_ROOTS: tuple[str, ...] = ("/usr/local/bin", "/usr/bin", "/bin")
+
 
 # A destructive statement that names a target. Keyword presence, not parsing.
 # `update` is destructive only when it lacks a WHERE, which the negative
@@ -313,6 +446,24 @@ _NOT_DESTRUCTIVE = re.compile(
 _INTERPRETERS = frozenset(
     {"python", "python3", "pypy", "bash", "sh", "zsh", "dash", "node",
      "perl", "ruby", "php", "deno", "bun", "lua", "R", "awk", "gawk"}
+)
+
+# Git subcommands that only read repository state. Every form is automatic in
+# List 3: `git status`, `git diff`, `git log`, `git show`, `git rev-parse`,
+# `git ls-files`. A mutating git subcommand is not here and is gated.
+#
+# `git describe` and `git config --get` are deliberately absent: the spec omits
+# them from List 3, so they fall through to the unknown default. That is the
+# documented outcome, not an oversight.
+_GIT_INSPECT_SUBCOMMANDS = frozenset(
+    {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+)
+
+# `find` flags that write or delete. Without one of these, `find` only
+# enumerates paths and is automatic.
+_FIND_WRITE_FLAGS = frozenset(
+    {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint",
+     "-fprint0", "-fprintf"}
 )
 
 # Flags after which the remainder is inline source or a script path, so the
@@ -813,6 +964,216 @@ class CommandClassifier:
             "target is not a process this run started",
         )
 
+    def _classify_git_inspection(self, cmd: Command) -> tuple[Classification, str, str] | None:
+        """Automatic listing forms of git, gated mutating forms of the same.
+
+        `git branch`, `git tag`, and `git stash` are not one permission level
+        each. A program-level rule cannot express that -- any rule matching
+        `git branch` also matches `git branch --list` -- so the discrimination is
+        made here on the operation instead.
+
+        Only ALLOW is decided here. A mutating form returns None and is gated by
+        the unknown default or by an existing explicit rule, which keeps this
+        method from becoming a second place that git policy lives.
+        """
+        if cmd.normalized_program != "git":
+            return None
+
+        sub = self._subcommand(cmd.args)
+        if sub is None:
+            return None
+
+        # Drop the subcommand token itself before looking at operands. For
+        # `git branch`, the operands are what follow "branch"; counting
+        # "branch" as one would make every bare listing form look like a
+        # mutation.
+        operands = [
+            a.casefold() for a in cmd.args[1:] if not a.startswith("-")
+        ]
+        flags = self._flags(cmd.args)
+
+        # Inspection subcommands. Every form is a read: `git status`,
+        # `git diff`, `git log`, `git show`, `git rev-parse`, `git ls-files`.
+        if sub in _GIT_INSPECT_SUBCOMMANDS:
+            return (
+                Classification.ALLOW,
+                "allow.git_inspect",
+                f"git {sub} only reads repository state",
+            )
+
+        # `git branch` and `git tag`: automatic with no operand, gated when a
+        # name is given (create/rename) and denied when a delete flag is
+        # present. `cmd.git_branch_delete` / `cmd.git_tag_delete` own the
+        # denial, so this only has to recognise the listing form.
+        if sub in ("branch", "tag"):
+            if operands:
+                return None
+            # A flag that mutates means this is not a listing form.
+            if flags & {"-d", "-D", "-m", "-M", "-c", "-C", "--move", "--copy"}:
+                return None
+            return (
+                Classification.ALLOW,
+                f"allow.git_{sub}_list",
+                f"git {sub} with no operation lists {sub}es",
+            )
+
+        # `git stash list` is a read. `git stash` bare and `git stash push` are
+        # not: the bare form stashes the working tree, which mutates.
+        if sub == "stash":
+            if operands == ["list"]:
+                return (
+                    Classification.ALLOW,
+                    "allow.git_stash_list",
+                    "git stash list only reads the stash",
+                )
+            return (
+                Classification.APPROVAL_REQUIRED,
+                "cmd.git_stash_mutate",
+                "stash mutation changes or discards stashed work",
+            )
+
+        return None
+
+    def _classify_find_read(self, cmd: Command) -> tuple[Classification, str, str] | None:
+        """Automatic only for `find` read forms.
+
+        `find` is in List 3 for its read forms, but `-delete` and `-exec` make
+        it destructive and `-fprintf`/`-fls` write files. Those are gated here
+        rather than relying on the unknown default, so the reason an operator
+        sees names the destructive flag instead of saying "unrecognised".
+        """
+        if cmd.normalized_program != "find":
+            return None
+
+        if self._flags(cmd.args) & _FIND_WRITE_FLAGS:
+            return (
+                Classification.APPROVAL_REQUIRED,
+                "cmd.find_destructive",
+                "find writes or deletes; the read forms are automatic",
+            )
+
+        # A bare `find` with no expression lists everything, which is the read
+        # form and is bounded by the workspace.
+        return (
+            Classification.ALLOW,
+            "allow.find_read",
+            "find in a read form only enumerates paths",
+        )
+
+    def _classify_workspace_executable(
+        self, cmd: Command, cwd: Path
+    ) -> tuple[Classification, str, str] | None:
+        """Gate an executable that resolves inside the workspace.
+
+        The documented rule, from byte-security-classification.md "Workspace-local
+        executables": resolve the program token; if it lands inside the
+        workspace root it is approval-required.
+
+        The test is *where the resolved path lands*, not whether the token
+        contains a separator. `/usr/bin/git` contains a slash and is an
+        ordinary system program classified by its normal rules; `./tool` and
+        `/workspace/bin/lint` are gated.
+
+        Only an explicit path is considered. A bare name like `git` is resolved
+        by the executor against its fixed search path, which is never inside the
+        workspace, so there is nothing here to gate.
+
+        A *relative* token that escapes the workspace is denied here, rather than
+        left to fall through to the unknown default. Containment cannot catch it:
+        the program token is not a path argument, so `_extract_targets` never
+        sees it and `../tool` would otherwise be gated rather than denied.
+
+        An *absolute* token outside the workspace is only allowed to continue when
+        it lands in a trusted system executable root -- the same directories the
+        Executor would search. `/usr/bin/git` and `/usr/bin/python` are named in
+        the spec as ordinary system programs and classify normally. Anything else
+        is denied: `/tmp/evil-tool` and `/home/user/random-tool` are arbitrary
+        external files that an operator prompt would be asked to approve on no
+        useful information, which is the same "prompt without information"
+        failure the secret-source principle rejects.
+
+        Symlinks are resolved before the root check, so an apparent
+        `/usr/bin/tool` pointing at `/tmp/evil` fails closed on its real location
+        rather than passing on its apparent one.
+        """
+        token = cmd.program
+        if not token or "/" not in token:
+            return None
+
+        candidate = Path(token)
+        is_absolute = candidate.is_absolute()
+        if not is_absolute:
+            candidate = cwd / candidate
+
+        resolution = self.workspace.resolve(candidate)
+        if not resolution.allowed:
+            if is_absolute and self._in_trusted_executable_root(candidate):
+                # A system executable. Fall through to normal classification.
+                return None
+            return (
+                Classification.DENY,
+                "cmd.workspace_executable_outside",
+                (
+                    f"executable resolves outside the workspace: {token} -> "
+                    f"{resolution.reason}"
+                ),
+            )
+
+        return (
+            Classification.APPROVAL_REQUIRED,
+            "cmd.workspace_executable",
+            (
+                f"executable resolves inside the workspace ({token} -> "
+                f"{resolution.resolved}); repository code is approval-required"
+            ),
+        )
+
+    @staticmethod
+    def _in_trusted_executable_root(candidate: Path) -> bool:
+        """Whether ``candidate``'s real path lies in a trusted system root.
+
+        Resolved with ``realpath`` so a symlink planted inside a trusted root
+        cannot smuggle an arbitrary external executable past the check. A path
+        that cannot be resolved is not trusted -- this fails closed, consistent
+        with `Workspace.resolve`.
+        """
+        try:
+            real = Path(os.path.realpath(str(candidate)))
+        except (OSError, ValueError):
+            return False
+
+        for root in TRUSTED_EXECUTABLE_ROOTS:
+            root_real = Path(os.path.realpath(root))
+            if real == root_real or real.is_relative_to(root_real):
+                return True
+        return False
+
+    def _classify_unknown_program(
+        self, cmd: Command, matched: bool
+    ) -> tuple[Classification, str, str] | None:
+        """The default: an unrecognised argv invocation is approval-required.
+
+        This is the change that made `ALLOW` an explicit rule rather than an
+        absence. Previously anything unmatched fell through to automatic, so a
+        classifier miss produced silent execution -- which contradicted the
+        document's own claim that a miss degrades to a prompt.
+
+        Called only when ``matched`` is False, so it never overrides a real
+        decision. If it is skipped when a rule fired, strictest-wins cannot rank
+        it against that rule, and a gated command would be gated twice or an
+        automatic one silently re-gated.
+        """
+        if matched:
+            return None
+        return (
+            Classification.APPROVAL_REQUIRED,
+            "cmd.unknown",
+            (
+                f"unrecognised command '{cmd.program}': not on the automatic "
+                f"list, so operator approval is required"
+            ),
+        )
+
     # -- public API ------------------------------------------------------
 
     def classify(self, command: Command) -> CommandVerdict:
@@ -827,9 +1188,10 @@ class CommandClassifier:
         3. Workspace containment for every target.
         4. Wildcard deletes.
         5. Inline-code, SQL, and kill classification.
-        6. Program rule tables.
+        6. Program rule tables: DENIED, APPROVAL, then ALLOWED.
         7. ``shell=True`` floors the result at approval_required.
-        8. Anything unrecognised stays allow, unless a flag above raised it.
+        8. An operation no rule recognised is approval_required, never
+           automatic.
         """
         program = command.normalized_program
 
@@ -857,9 +1219,11 @@ class CommandClassifier:
         # 2. targets
         targets, resolved_targets = self._extract_targets(command, cwd)
 
+        # ALLOW is the starting candidate, but it is not the outcome: step 8
+        # replaces it when nothing matched, and any rule above can raise it.
         candidates: list[Classification] = [Classification.ALLOW]
         deciding: ProgramRule | None = None
-        reason = "no dangerous-command rule matched"
+        reason = "matched an explicit automatic rule"
         matched_ids: list[str] = []
 
         # 3. containment for each target
@@ -886,6 +1250,9 @@ class CommandClassifier:
             lambda: self._classify_checkout_discard(command),
             lambda: self._classify_file_overwrite(command),
             lambda: self._classify_push_refspec_delete(command),
+            lambda: self._classify_workspace_executable(command, cwd),
+            lambda: self._classify_find_read(command),
+            lambda: self._classify_git_inspection(command),
         ):
             outcome = classify_fn()
             if outcome is not None:
@@ -896,7 +1263,7 @@ class CommandClassifier:
                     deciding = ProgramRule(rule_id, why, classification, _ANY)
                     reason = why
 
-        for rule in (*DENIED_PROGRAMS, *APPROVAL_PROGRAMS):
+        for rule in (*DENIED_PROGRAMS, *APPROVAL_PROGRAMS, *ALLOWED_PROGRAMS):
             if self._match(rule, command):
                 candidates.append(rule.classification)
                 matched_ids.append(rule.rule_id)
@@ -917,7 +1284,33 @@ class CommandClassifier:
                 )
                 reason = "shell string is not parsed; approval required on sight"
 
+        # 8. Nothing recognised. Previously this fell through to ALLOW, which
+        # made a classifier miss mean silent execution. An unrecognised
+        # operation is approval-required instead, so the failure mode of a miss
+        # is a prompt.
+        unknown = self._classify_unknown_program(
+            command, matched=bool(matched_ids)
+        )
+        if unknown is not None:
+            classification, rule_id, why = unknown
+            candidates.append(classification)
+            matched_ids.append(rule_id)
+            deciding = ProgramRule(rule_id, why, classification, _ANY)
+            reason = why
+
         final = strictest(*candidates)
+
+        if deciding is None or deciding.classification is not final:
+            # No rule decided, or a stricter rule did. Name the decision so an
+            # operator is never asked to approve or denied something the
+            # verdict cannot explain.
+            deciding = ProgramRule(
+                final.value if final is not Classification.ALLOW else "allow.unmatched",
+                f"no rule classified this operation; resolved to {final.value}",
+                final,
+                _ANY,
+            )
+            reason = deciding.reason
 
         return CommandVerdict(
             classification=final,

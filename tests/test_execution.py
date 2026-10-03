@@ -52,9 +52,20 @@ from forge.tools.execution import (
 from forge.tools.workspace import Workspace
 
 # A program the classifier treats as ordinary and the executor can definitely
-# resolve. sys.executable is an absolute path, so this also exercises the
-# absolute-token case rather than a bare name.
-PY = sys.executable
+# resolve, *and* that lives in a trusted executable root.
+#
+# This used to be `sys.executable`, which is an absolute path so it also
+# exercised the absolute-token case. The permission model now denies an absolute
+# executable outside the workspace unless it is in a trusted system root, and a
+# virtualenv interpreter lives in neither -- so `sys.executable` is denied here
+# by `cmd.workspace_executable_outside`. That denial is correct: the Executor's
+# fixed PATH does not include a virtualenv, so it could not launch one either.
+#
+# `/usr/bin/python3` is the interpreter the Executor resolves on a search-path
+# hit, so the tests exercise the same launch the product performs. The
+# absolute-token case is still covered, in
+# `tests/test_commands.py::test_system_path_program_is_not_treated_as_workspace_executable`.
+PY = "/usr/bin/python3"
 
 
 # --------------------------------------------------------------------------
@@ -563,9 +574,12 @@ def test_launch_failure_still_spends_the_approval(
     moved -- must go back through approval, because the executor cannot know
     what changed.
     """
-    missing = "/nonexistent/forge-test-binary"
+    missing = "/usr/bin/forge-test-binary-does-not-exist"
     # Approve the program actually being requested, so the failure under test is
-    # the launch and not (correctly) a binding mismatch.
+    # the launch and not (correctly) a binding mismatch. The path is inside a
+    # trusted executable root so it classifies normally: an arbitrary external
+    # path would be denied by the permission model before reaching the
+    # executor, which is a different failure than the one under test.
     outcome = approve(classifier, program=missing)
     request = request_for(program=missing)
 

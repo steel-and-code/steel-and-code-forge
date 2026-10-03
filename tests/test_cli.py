@@ -197,10 +197,27 @@ def test_command_flags_are_not_parsed_as_forge_flags(
     """`-q` belongs to pytest, not to Forge.
 
     Without the -- separator this is the bug the separator exists to prevent.
+    `--classify-only` is used so the test measures parsing rather than the
+    approval step: pytest is now approval-required as repository-code
+    execution, so an interactive run would fail closed with exit 1 and the exit
+    code would say nothing about argument parsing.
     """
-    result = run(["check", "command", "--workspace", str(workspace_dir), "--json", "--", "pytest", "tests/", "-q"])
+    result = run(
+        [
+            "check",
+            "command",
+            "--workspace",
+            str(workspace_dir),
+            "--json",
+            "--classify-only",
+            "--",
+            "pytest",
+            "tests/",
+            "-q",
+        ]
+    )
 
-    assert result.code == 0
+    assert result.code == 3
     assert result.json()["command"] == "pytest tests/ -q"
 
 

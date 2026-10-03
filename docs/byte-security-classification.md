@@ -434,6 +434,14 @@ different operation, and the classifier has no rule shape capable of
 structurally distinguishing the two — so the safe reading is the denied one. No
 matcher capability will be added for this in the current implementation pass.
 
+**As implemented.** Two rules: `allow.read_only` for the programs in the table
+above, and `allow.version_probe` for `--version` / `-V` on any program. `find`
+is not in either — it needs flag-level discrimination between its read forms and
+`-delete`/`-exec`/`-fprint*`, so it is handled by `allow.find_read` and
+`cmd.find_destructive` in the classifier rather than by the table. Git is the
+same situation, handled by `allow.git_inspect`, `allow.git_branch_list`,
+`allow.git_tag_list`, and `allow.git_stash_list`.
+
 ### Git inspection
 
 Automatic forms only:
@@ -535,12 +543,16 @@ APPROVAL_REQUIRED.**
 
 ### The rule
 
-Resolve the program token to a real path. If that path is inside the workspace
-root, the operation is approval-required. If it resolves outside, containment
-denies it as any other out-of-workspace path.
+Resolve the program token to a real path. Then:
 
-This is a question about *where the code comes from*, not about the shape of the
-token:
+| Where the real path lands | Classification |
+| --- | --- |
+| **Inside the workspace root** | **Approval-required** — repository code |
+| **Outside, and in a trusted system executable root** | **Classified normally** by basename and operation |
+| **Outside, and not in a trusted root** | **Denied** |
+
+The three cases are distinct and each has a different reason, so it is worth
+stating them separately rather than as one rule:
 
 | Program token | Classification |
 | --- | --- |
@@ -551,11 +563,44 @@ token:
 | `../outside/tool` | **Denied** — resolves outside the workspace |
 | `/usr/bin/git` | Classified by its normal program and operation rules |
 | `/usr/bin/python` | Classified by its normal program and operation rules |
+| `/tmp/evil-tool` | **Denied** — outside the workspace and outside every trusted root |
+| `/home/user/random-tool` | **Denied** — same |
+| `/opt/random/tool` | **Denied** unless `/opt/...` is explicitly a trusted root |
+
+**Workspace-local versus trusted system versus arbitrary external.** These are
+three different trust questions and the model answers each differently:
+
+- A **workspace-local** executable is repository code. It is attacker-reachable
+  input, so it is approval-required: the operator can open the file and read it
+  before saying yes.
+- A **trusted system** executable is a named, reviewed piece of the host in a
+  directory Forge itself would search. It is classified normally, because there
+  is nothing to review — its behaviour is not the operator's to judge per call.
+- An **arbitrary external** executable is none of those: not repository code the
+  operator can inspect as project code, and not a reviewed system binary. It is
+  **denied** rather than gated, because a prompt here is a prompt without
+  information — the operator is shown a path to a file they have no reason to
+  trust and no basis to evaluate. That is the same failure the
+  [secret-source principle](#the-principle-for-classifying-secret-sources)
+  rejects when it declines to prompt about a structurally secret file.
+
+### Trusted executable roots
+
+**Decision: the trusted roots are exactly the Executor's fixed executable search
+path** — `/usr/local/bin`, `/usr/bin`, `/bin`.
+
+Deriving one from the other is the point rather than a convenience. Forge cannot
+launch a program outside its fixed search path, so a program outside it is a
+program Forge does not trust. Two independent lists would be free to disagree,
+and the disagreement would be silent.
+
+**Symlinks are resolved before the root check.** An apparent
+`/usr/bin/tool` whose real location is `/tmp` is **denied**: the check trusts
+the real path, not the apparent one. A path that cannot be resolved is not
+trusted either — this fails closed, consistently with `Workspace.resolve`.
 
 **A path separator in the token is not the test.** `/usr/bin/git` contains one
 and is an ordinary system program. The test is where the resolved path lands.
-A workspace-local executable is arbitrary code the agent chose to run; a system
-program is a named, reviewed piece of the host.
 
 ### Why this is not inconsistent with trusting `git`
 
@@ -893,8 +938,10 @@ Then:
    is worse than no parsing.
 2. Resolve every path argument. If any resolves outside the workspace →
    **denied**. Stop.
-3. Resolve the program token itself. If it resolves inside the workspace →
-   **approval-required** (see [Workspace-local executables](#workspace-local-executables)).
+3. Resolve the program token. Inside the workspace → **approval-required**.
+   Outside, and in a trusted system root → classify normally. Outside, and not in
+   a trusted root → **denied**. See [Workspace-local
+   executables](#workspace-local-executables).
 4. If any resolved path matches a secret-source pattern → **denied**. Stop.
 5. Match program and flags against the command tables. Take the strictest
    match: denied > approval-required > automatic.

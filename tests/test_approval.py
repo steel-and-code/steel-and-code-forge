@@ -217,16 +217,42 @@ def test_resolve_refuses_a_hand_built_denial(
 def test_allowed_command_approved_without_consulting_the_channel(
     classifier: CommandClassifier,
 ) -> None:
+    """An automatic operation is approved with no prompt at all.
+
+    Uses `git status`, which is on List 3. `pytest` would not do here: it is
+    approval-required as repository-code execution, so the channel is consulted
+    and this test would measure the wrong thing.
+    """
     channel = ScriptedApprovalChannel(["y"])
     approver = Approver(channel)
 
     outcome = approver.submit_command(
-        classifier.classify(_cmd("pytest", "tests/", "-q")), agent="byte"
+        classifier.classify(_cmd("git", "status")), agent="byte"
     )
 
     assert outcome.decision is ApprovalDecision.APPROVED
     assert outcome.approved
     assert channel.presented == []
+
+
+def test_unknown_command_is_gated_not_auto_approved(
+    classifier: CommandClassifier,
+) -> None:
+    """An unrecognised command reaches the channel rather than running.
+
+    The counterpart to the test above, and the property the default change
+    exists to provide: a classifier miss produces a prompt, not an approval.
+    """
+    channel = ScriptedApprovalChannel(["y"])
+    approver = Approver(channel)
+
+    outcome = approver.submit_command(
+        classifier.classify(_cmd("some-unknown-tool", "--check")), agent="byte"
+    )
+
+    assert outcome.decision is ApprovalDecision.APPROVED
+    assert len(channel.presented) == 1
+    assert "unrecognised" in channel.presented[0].reason
 
 
 def test_allow_records_no_operator_response(

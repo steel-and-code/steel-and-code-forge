@@ -817,27 +817,86 @@ and belongs to whoever has the actual need for it.
 
 ### What the permission-model pass changed
 
-The policy above is now the specification of record. The classifier in
-`forge/tools/commands.py` still implements the **previous** default — an
-unrecognised argv invocation classifies ALLOW — and has no ALLOW rule table yet.
-That gap is intentional and is the next code change, not a documentation defect.
-Concretely, the following documented rules are **specified but not yet
-implemented**:
+The policy above is now both the specification of record and the implemented
+behaviour. `forge/tools/commands.py` carries the three-table model:
 
-| Rule | Specified | Shipped |
-| --- | --- | --- |
-| Unrecognised argv → approval-required | Yes | **No** — still ALLOW |
-| Explicit ALLOW rule table (List 3) | Yes | **No** — table does not exist |
-| Workspace-local executable → approval-required | Yes | **No** |
-| `pytest` / `make` / `npm` / `cargo` → approval-required | Yes | **No** — falls to the old default |
-| `git branch`/`tag`/`stash` per-operation | Yes | **No** — no ALLOW rules, so all fall through |
-| `git add` → approval-required | Yes | **No** |
-| `git tag -d` → denied | Yes | **No** |
+```
+    explicit DENY rules      -> denied
+    explicit APPROVAL rules  -> approval_required
+    explicit ALLOW rules     -> automatic
+    nothing matched          -> approval_required  (rule id `cmd.unknown`)
+```
 
-Everything else in this document is implemented and tested. The implementation
-work is one focused change to `commands.py`: add `ALLOWED_PROGRAMS`, invert the
-fall-through, add the program-token resolution check, and add the missing git and
-runner rules. No new module and no second policy table.
+`ALLOWED_PROGRAMS` is the new table. Its presence is what makes the model
+possible: with the default at `APPROVAL_REQUIRED`, `ALLOW` has to be a rule that
+matches rather than an absence. It holds two rules -- `allow.read_only` for the
+documented read-only programs, and `allow.version_probe` for `--version` / `-V`
+on any program.
+
+Three classifiers carry rules a `ProgramRule` table cannot express, because each
+needs to tell an automatic form from a mutating form of the *same* program:
+
+| Classifier | Why not a table rule |
+| --- | --- |
+| `_classify_git_inspection` | Any rule matching `git branch` also matches `git branch --list`. Strictest-wins would then gate the listing form. `branch`/`tag`/`stash` are discriminated per operation. |
+| `_classify_find_read` | Automatic for read forms; `-delete`, `-exec`, `-fprint*` and friends write. Flag-level, not program-level. |
+| `_classify_workspace_executable` | Resolves the program token. A rule keyed on "contains a `/`" would gate `/usr/bin/git`, which the spec requires to classify normally. |
+
+`_classify_unknown_program` is the default. It fires only when no rule matched,
+so it never overrides a real decision.
+
+Rules added for the documented model, all in `commands.py`:
+
+| Rule | Treatment |
+| --- | --- |
+| `cmd.repo_runner` | approval — `pytest`, `make`, `tox`, `nox`, and the `npm`/`pnpm`/`yarn`/`cargo`/`go` runner forms |
+| `cmd.repo_runner_module` | approval — `python -m pytest` |
+| `cmd.git_add` | approval — `git add` |
+| `cmd.git_switch` | approval — `git switch`, `git restore` |
+| `cmd.git_stash_mutate` | approval — `git stash` and its mutating subcommands |
+| `cmd.git_tag_delete` | **deny** — `git tag -d`, joining `git branch -d` |
+| `cmd.find_destructive` | approval — `find` with a write or delete flag |
+| `cmd.workspace_executable` | approval — executable resolves inside the workspace |
+| `cmd.workspace_executable_outside` | **deny** — executable resolves outside the workspace and outside every trusted root |
+| `cmd.unknown` | approval — nothing matched |
+
+**Two executable-path rules are not in the spec, and adding them was
+necessary.** Both exist because containment only examines path *arguments*, and
+the program token is not one — so `_extract_targets` never sees it.
+
+Without the first, `../tool` fell through to the unknown default and was
+*gated*. An operator could then approve running an executable from outside the
+workspace root, which the workspace boundary forbids unconditionally. A prompt is
+not a boundary.
+
+The second closes the same gap for absolute paths. `/tmp/evil-tool` was
+reaching `cmd.unknown` and therefore becoming approvable, which puts a prompt in
+front of an operator shown a path to an arbitrary external file they have no
+basis to evaluate.
+
+The resolution is the Executor's own search path:
+
+```
+    inside workspace                     -> APPROVAL_REQUIRED (cmd.workspace_executable)
+    outside, in a trusted system root    -> classified normally
+    outside, not in a trusted root       -> DENY          (cmd.workspace_executable_outside)
+```
+
+`TRUSTED_EXECUTABLE_ROOTS` is `/usr/local/bin`, `/usr/bin`, `/bin` — the same
+directories as `execution.EXECUTABLE_SEARCH_PATH`. The value is duplicated as
+text rather than imported, because `execution.py` imports the approval layer
+which imports `commands.py` and an import would be circular;
+`tests/test_commands.py::test_trusted_executable_root_is_the_executor_search_path`
+asserts the two stay equal, which is the part that matters.
+
+Sharing one source is the reasoning, not just tidiness: Forge cannot launch a
+program outside its fixed search path, so a program outside it is a program Forge
+does not trust. Two independent lists would be free to disagree, silently.
+
+Symlinks are resolved before the root check, so an apparent `/usr/bin/tool`
+pointing at `/tmp` is denied on its real location. A path that cannot be
+resolved is not trusted either — it fails closed, consistently with
+`Workspace.resolve`.
 
 ### Existing implementation
 
@@ -856,8 +915,8 @@ built on top without re-running any of these checks. `approval.py` builds on
 exactly those fields and adds nothing of its own.
 
 Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
-`tests/test_commands.py` (261), `tests/test_approval.py` (101),
-`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 610 passing.
+`tests/test_commands.py` (366), `tests/test_approval.py` (102),
+`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 716 passing.
 
 Implemented: workspace containment, secret classification, command
 classification, terminal approval, the terminal interface, and command execution.

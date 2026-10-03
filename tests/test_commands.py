@@ -1,20 +1,26 @@
 """Tests for command classification.
 
 Covers every denied and approval-required category from
-``docs/byte-security-classification.md``, plus clean allow cases.
+``docs/byte-security-classification.md``, plus the explicit automatic set.
 
 The organising principle under test: a miss should produce a prompt, not silent
-execution. Where a rule is not recognised, the command is gated rather than
-allowed.
+execution. An operation is automatic only because a rule in ``ALLOWED_PROGRAMS``
+or a git/read inspector said so; anything unrecognised is gated.
 """
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
 
-from forge.tools.commands import Command, CommandClassifier
+from forge.tools.commands import (
+    ALLOWED_PROGRAMS,
+    TRUSTED_EXECUTABLE_ROOTS,
+    Command,
+    CommandClassifier,
+)
 from forge.tools.workspace import Classification, Workspace
 
 
@@ -281,11 +287,17 @@ def test_destructive_git_history_is_denied(
     assert verdict.rule == expected_rule
 
 
-def test_plain_gc_is_allowed(classifier: CommandClassifier) -> None:
-    """``git gc`` without aggressive flags is ordinary maintenance."""
+def test_plain_gc_requires_approval(classifier: CommandClassifier) -> None:
+    """`git gc` without aggressive flags is gated, not automatic.
+
+    `git gc --prune=now --aggressive` is denied outright by `cmd.git_gc`. Plain
+    `git gc` is not on List 3's git inspection list, so it falls to the unknown
+    default. It was automatic before only because nothing matched it.
+    """
     verdict = classifier.classify(_cmd("git", "gc"))
 
-    assert verdict.classification is Classification.ALLOW
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.unknown"
 
 
 # ==========================================================================
@@ -451,16 +463,41 @@ def test_inline_code_is_gated_on_form_not_content(
     assert harmless.classification is dangerous.classification
 
 
-def test_running_a_script_file_is_not_inline_code(classifier: CommandClassifier) -> None:
+def test_running_a_script_file_is_not_inline_code(
+    classifier: CommandClassifier,
+) -> None:
+    """A script path is not inline code, and is still gated.
+
+    `cmd.inline_code` fires on the *form* `--code`, and `python manage.py` is
+    not that form. The test asserts the rule that must not fire, rather than
+    asserting a classification, so it keeps testing what it was written to test
+    even though the verdict changed.
+    """
     verdict = classifier.classify(_cmd("python", "manage.py", "migrate"))
 
-    assert verdict.classification is not Classification.APPROVAL_REQUIRED
+    assert verdict.rule != "cmd.inline_code"
+    # Running a repository script is repository-code execution.
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
 
 
-def test_interpreter_with_module_is_allowed(classifier: CommandClassifier) -> None:
-    verdict = classifier.classify(_cmd("python", "-m", "pytest"))
+def test_interpreter_with_module_requires_approval(
+    classifier: CommandClassifier,
+) -> None:
+    """`python -m pytest` is a test run by another spelling.
 
-    assert verdict.classification is not Classification.APPROVAL_REQUIRED
+    Also the unknown-default case: `python -m <anything-else>` is gated for
+    being unrecognised, so the explicit rule exists to give the operator the
+    real reason rather than "unrecognised command".
+    """
+    pytest_verdict = classifier.classify(_cmd("python", "-m", "pytest"))
+
+    assert pytest_verdict.classification is Classification.APPROVAL_REQUIRED
+    assert pytest_verdict.rule == "cmd.repo_runner_module"
+
+    other_verdict = classifier.classify(_cmd("python", "-m", "http.server"))
+
+    assert other_verdict.classification is Classification.APPROVAL_REQUIRED
+    assert other_verdict.rule == "cmd.unknown"
 
 
 # ==========================================================================
@@ -642,12 +679,22 @@ def test_destructive_sql_is_approval_required(
         "INSERT INTO logs VALUES (1)",
     ],
 )
-def test_non_destructive_sql_is_allowed(
+def test_non_destructive_sql_is_not_flagged_as_destructive(
     classifier: CommandClassifier, statement: str
 ) -> None:
+    """A non-destructive statement is not gated *for being destructive*.
+
+    It is still gated, by `cmd.unknown`: database clients are not on List 3, so
+    every statement reaches the unknown default. What this test pins is the rule
+    that must not fire -- gating a `SELECT` as if it were a `DROP` would be
+    wrong regardless of the default, and would be invisible if the test only
+    asserted `requires_approval`.
+    """
     verdict = classifier.classify(_cmd("psql", "-c", statement))
 
-    assert verdict.classification is not Classification.APPROVAL_REQUIRED
+    assert verdict.rule not in {"cmd.sql_destructive", "cmd.sql_ambiguous"}
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.unknown"
 
 
 def test_ambiguous_sql_is_gated_not_allowed(classifier: CommandClassifier) -> None:
@@ -661,14 +708,20 @@ def test_ambiguous_sql_is_gated_not_allowed(classifier: CommandClassifier) -> No
 def test_database_client_help_is_allowed(classifier: CommandClassifier) -> None:
     verdict = classifier.classify(_cmd("psql", "--version"))
 
-    assert verdict.classification is not Classification.APPROVAL_REQUIRED
+    assert verdict.classification is Classification.ALLOW
+    assert verdict.rule == "allow.version_probe"
 
 
 def test_select_star_is_not_destructive(classifier: CommandClassifier) -> None:
-    """A read must not be gated as if it were a delete."""
+    """A read must not be gated as if it were a delete.
+
+    Gated for being unrecognised rather than for being destructive; the rule
+    assertion is what carries the meaning.
+    """
     verdict = classifier.classify(_cmd("psql", "-c", "SELECT * FROM t"))
 
-    assert verdict.classification is not Classification.APPROVAL_REQUIRED
+    assert verdict.rule not in {"cmd.sql_destructive", "cmd.sql_ambiguous"}
+    assert verdict.rule == "cmd.unknown"
 
 
 # ==========================================================================
@@ -741,31 +794,70 @@ def test_git_global_config_is_gated(classifier: CommandClassifier) -> None:
 
 
 @pytest.mark.parametrize(
-    ("program", "args"),
+    "program,args",
     [
         ("ls", ("-la",)),
         ("cat", ("README.md",)),
-        ("echo", ("hello",)),
         ("pwd", ()),
         ("wc", ("-l", "file.txt")),
         ("grep", ("-r", "pattern", "src/")),
         ("find", (".", "-name", "*.py")),
         ("head", ("-n", "10", "file.txt")),
-        ("sort", ("file.txt",)),
         ("diff", ("a.txt", "b.txt")),
-        ("tree", (".",)),
         ("stat", ("file.txt",)),
     ],
 )
-def test_ordinary_development_commands_are_allowed(
+def test_listed_read_only_commands_are_allowed(
     classifier: CommandClassifier, program: str, args: tuple[str, ...]
 ) -> None:
+    """Every read-only form in List 3 is automatic.
+
+    The list is the documented one and no longer than that. Commands that were
+    automatic only because nothing matched -- `echo`, `sort`, `tree` -- are
+    asserted as approval-required in
+    `test_commands_omitted_from_list_3_are_approval_required`.
+    """
     verdict = classifier.classify(
         _cmd(program, *args, cwd=classifier.workspace.root)
     )
 
     assert verdict.classification is Classification.ALLOW, (
         f"{program} should be allowed, got {verdict.rule}: {verdict.reason}"
+    )
+
+
+@pytest.mark.parametrize(
+    "program,args",
+    [
+        # Omitted from List 3 as inconsistent rather than dangerous.
+        ("tree", (".",)),
+        # Omitted from List 3; `df` would report filesystems outside the
+        # workspace, and `du` was left out with it.
+        ("du", ("-sh", ".")),
+        # Never in List 3: v1 has no use for them.
+        ("which", ("git",)),
+        # Never in List 3 either.
+        ("echo", ("hello",)),
+        ("sort", ("file.txt",)),
+    ],
+)
+def test_commands_omitted_from_list_3_are_approval_required(
+    classifier: CommandClassifier, program: str, args: tuple[str, ...]
+) -> None:
+    """A command missing from List 3 is gated, not automatic.
+
+    This is the ruling "if we are not confident it belongs in automatic, leave
+    it at APPROVAL_REQUIRED" made executable. Each of these is inspection-shaped
+    and none is dangerous, which is exactly why the test exists: they are the
+    cases a future broadener would reach for first.
+    """
+    verdict = classifier.classify(
+        _cmd(program, *args, cwd=classifier.workspace.root)
+    )
+
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.unknown", (
+        f"{program} should be gated as unrecognised, got {verdict.rule}"
     )
 
 
@@ -778,25 +870,42 @@ def test_ordinary_development_commands_are_allowed(
         ("tests/test_a.py",),
     ],
 )
-def test_pytest_is_allowed(classifier: CommandClassifier, args: tuple[str, ...]) -> None:
+def test_pytest_requires_approval(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Running the test suite is running repository code.
+
+    `pytest` executes `conftest.py`, loads installed plugins, imports fixtures,
+    and runs arbitrary repository-supplied test code. That is the same trust
+    proposition as `./scripts/check.sh`, so it is gated the same way.
+
+    Every argv shape is asserted, including `--version` and `--help`: the
+    program-level gate applies to the program, so a version probe on a
+    repository-code runner is still gated. That is deliberate -- the runner rule
+    is about what the program *is*, and the read-only rules in List 3 name their
+    programs individually rather than matching by category.
+    """
     verdict = classifier.classify(
         _cmd("pytest", *args, cwd=classifier.workspace.root)
     )
 
-    assert verdict.classification is Classification.ALLOW
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.repo_runner"
 
 
-def test_unknown_program_is_allowed_not_gated(
+def test_unknown_program_is_approval_required(
     classifier: CommandClassifier,
 ) -> None:
-    """Unrecognised but harmless programs stay automatic.
+    """An unrecognised argv invocation is gated, never automatic.
 
-    This is the convenience case, and the spec records it as the largest soft
-    spot in the design. It is correct for v1 and is a known trade.
+    This reverses the old convenience case, which classified anything unmatched
+    as ALLOW and was recorded as the largest soft spot in the design: a
+    classifier miss landed as silent execution rather than as a prompt.
     """
     verdict = classifier.classify(_cmd("some-unknown-tool", "--check"))
 
-    assert verdict.classification is Classification.ALLOW
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.unknown"
 
 
 def test_full_path_program_is_normalized(classifier: CommandClassifier) -> None:
@@ -1225,18 +1334,22 @@ def test_existing_credential_inspection_stays_denied(
 
 
 @pytest.mark.parametrize("args", [("docker", "ps"), ("docker", "images")])
-def test_read_only_docker_commands_are_not_gated(
+def test_read_only_docker_commands_require_approval(
     classifier: CommandClassifier, args: tuple[str, ...]
 ) -> None:
-    """Listing containers is inspection, and the spec gates only the
-    host-mounting forms (`run`, `exec`, `stop`, `rm`, `kill`).
+    """Listing containers is gated, but not as a host-mounting form.
 
-    Added as a negative case so that widening `cmd.credential_inspect` to
-    include `login` cannot quietly widen anything else.
+    `cmd.container` gates `run`, `exec`, `stop`, `rm`, and `kill`. `ps` and
+    `images` match none of the rules and reach the unknown default. The negative
+    assertion is the point: it proves widening `cmd.credential_inspect` to
+    include `login` cannot quietly widen anything else, and that these are not
+    being treated as dangerous.
     """
     verdict = _classify_one(classifier, *args)
 
-    assert verdict.classification is Classification.ALLOW, args
+    assert verdict.rule not in {"cmd.container", "cmd.docker_system"}
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.unknown", args
 
 
 # --------------------------------------------------------------------------
@@ -1278,13 +1391,20 @@ def test_dd_writing_a_device_is_still_denied(
     assert verdict.rule == "cmd.device_write"
 
 
-def test_dd_without_an_output_target_is_not_gated(
+def test_dd_without_an_output_target_is_not_gated_as_a_write(
     classifier: CommandClassifier, workspace: Workspace
 ) -> None:
-    """`dd if=x` alone writes nowhere, so there is nothing to gate."""
+    """`dd if=x` alone writes nowhere, so the file-write gate must not fire.
+
+    It is still gated, by `cmd.unknown`: `dd` is not on List 3. The assertion is
+    on the rule rather than the verdict, because "not gated as a write" is the
+    property being tested and it survives the default changing.
+    """
     verdict = _classify_one(classifier, "dd", "if=notes.txt")
 
-    assert not verdict.requires_approval
+    assert verdict.rule != "cmd.dd_file_write"
+    assert verdict.classification is Classification.APPROVAL_REQUIRED
+    assert verdict.rule == "cmd.unknown"
 
 
 def test_umask_is_approval_required(
@@ -1383,4 +1503,622 @@ def test_docker_system_prune_remains_denied_not_downgraded(
     verdict = _classify_one(classifier, "docker", "system", "prune")
 
     assert verdict.denied
+
+
+# ==========================================================================
+# Workspace-local executables
+#
+# Implemented rule: an executable that *resolves* inside the workspace is
+# approval-required. The test is where the resolved path lands, not whether the
+# token contains a separator -- `/usr/bin/git` contains one and is ordinary.
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "program",
+    ["./configure", "./tool", "./scripts/check.sh", "./build"],
+)
+def test_relative_workspace_executable_is_approval_required(
+    classifier: CommandClassifier, program: str
+) -> None:
+    """`./configure` and `./scripts/check.sh` are repository code by another name.
+
+    A repository is attacker-reachable input, so living inside the workspace is
+    not evidence of safety. This is the same argument that gates
+    `cmd.inline_code`, kept consistent on purpose.
+    """
+    verdict = _classify_one(classifier, program)
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.workspace_executable"
+
+
+def test_absolute_workspace_executable_is_approval_required(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    """An absolute path into the workspace is gated the same way."""
+    inside = workspace.root / "bin" / "lint"
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    inside.write_text("#!/bin/sh\n")
+
+    verdict = _classify_one(classifier, str(inside))
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.workspace_executable"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("/usr/bin/git", "status"),
+        ("/usr/bin/python", "--version"),
+        ("/usr/bin/ls", "-la"),
+        ("/bin/cat", "README.md"),
+    ],
+)
+def test_system_path_program_is_not_treated_as_workspace_executable(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """A system path contains a "/" and is not a workspace-local executable.
+
+    The negative case that matters most: a rule keyed on "the token contains a
+    slash" would gate all four of these, and `/usr/bin/git status` would stop
+    being the automatic inspection the spec says it is.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.rule != "cmd.workspace_executable", args
+
+
+def test_absolute_workspace_path_behaves_like_the_relative_one(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    """`/usr/bin/git status` classifies identically to `git status`.
+
+    Path normalisation for classification, proven end to end: the same
+    inspection operation is automatic whichever spelling is used.
+    """
+    bare = classifier.classify(_cmd("git", "status"))
+    full = classifier.classify(_cmd("/usr/bin/git", "status"))
+
+    assert bare.classification is Classification.ALLOW
+    assert full.classification is Classification.ALLOW
+    assert full.classification is bare.classification
+
+
+def test_relative_workspace_executable_outside_workspace_is_denied(
+    classifier: CommandClassifier, tmp_path: Path
+) -> None:
+    """A relative token escaping the workspace is denied, not gated.
+
+    Containment cannot catch this on its own: the program token is not a path
+    argument, so `_extract_targets` never sees it. Without an explicit check
+    here `../tool` would reach the unknown default and be *gated* -- an operator
+    could approve running an executable outside the workspace root, which the
+    spec forbids unconditionally.
+    """
+    outside = tmp_path / "tool"
+    outside.write_text("#!/bin/sh\n")
+    relative = f"../{outside.parent.name}/{outside.name}"
+
+    verdict = _classify_one(classifier, relative)
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.workspace_executable_outside"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "/tmp/evil-tool",
+        "/home/user/random-tool",
+        "/opt/random/tool",
+        "/var/tmp/tool",
+    ],
+)
+def test_absolute_executable_outside_trusted_roots_is_denied(
+    classifier: CommandClassifier, token: str
+) -> None:
+    """An arbitrary external executable is denied, not gated.
+
+    These are absolute paths outside the workspace and outside every trusted
+    system root. Gating them would put a prompt in front of an operator who can
+    be shown nothing useful: the file is arbitrary, external, and not something
+    Forge's fixed PATH could launch either. A prompt with nothing to evaluate is
+    the "prompt without information" failure the secret-source principle
+    rejects.
+    """
+    verdict = _classify_one(classifier, token)
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.workspace_executable_outside"
+
+
+def test_trusted_executable_root_is_the_executor_search_path(
+    classifier: CommandClassifier,
+) -> None:
+    """The trusted roots and the Executor's search path must not drift apart.
+
+    `TRUSTED_EXECUTABLE_ROOTS` is duplicated as text in `commands.py` rather
+    than imported, because `execution.py` imports the approval layer which
+    imports `commands.py` and an import would be circular. This test is what
+    makes the duplication safe: if someone changes the Executor's PATH without
+    changing the roots, this fails.
+
+    The reasoning behind sharing one source: Forge cannot launch a program
+    outside its fixed search path, so a program outside it is a program Forge
+    does not trust. Two independent lists would be free to disagree.
+    """
+    from forge.tools.execution import EXECUTABLE_SEARCH_PATH
+
+    search_roots = tuple(EXECUTABLE_SEARCH_PATH.split(":"))
+
+    assert TRUSTED_EXECUTABLE_ROOTS == search_roots
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "/usr/bin/git",
+        "/usr/bin/ls",
+        "/usr/bin/python3",
+        "/bin/cat",
+        "/bin/sh",
+        "/usr/local/bin/tool",
+    ],
+)
+def test_trusted_system_executable_is_not_denied_by_the_root_check(
+    classifier: CommandClassifier, token: str
+) -> None:
+    """A system executable keeps normal classification.
+
+    Denying `/usr/bin/git` would make every absolute system invocation
+    unusable, and the spec names `/usr/bin/git` and `/usr/bin/python` as
+    ordinary system programs.
+    """
+    verdict = _classify_one(classifier, token)
+
+    assert verdict.rule != "cmd.workspace_executable_outside", token
+
+
+def test_symlink_escape_from_a_trusted_root_fails_closed(
+    classifier: CommandClassifier, tmp_path: Path
+) -> None:
+    """An apparent `/usr/bin/...` symlink pointing outside is denied.
+
+    Without realpath resolution the check would pass on the *apparent*
+    location and an operator could approve an arbitrary external executable
+    wearing a trusted path. The check resolves first and trusts the real
+    location, so this denies.
+    """
+    outside = tmp_path / "evil-tool"
+    outside.write_text("#!/bin/sh\n")
+
+    # A symlink in the workspace, pointing at an external file. The workspace
+    # check runs first and denies it on the real location; the trusted-root
+    # check is not reached and must not be relied on to save us.
+    link = classifier.workspace.root / "tool"
+    link.symlink_to(outside)
+
+    verdict = _classify_one(classifier, str(link))
+
+    assert verdict.denied
+
+
+def test_symlink_in_a_trusted_root_pointing_outside_is_denied(
+    classifier: CommandClassifier, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink planted in a trusted root cannot smuggle a file out of it.
+
+    This is the case the realpath resolution exists for: the token's apparent
+    location is inside a trusted root, so a *lexical* check would classify it
+    normally, but its real location is outside every root. The check trusts the
+    real path.
+
+    The trusted root is a temporary directory rather than `/usr/local/bin`, so
+    the test needs no root, mutates no host path, and cannot skip. The module
+    constant is monkeypatched for this test only; the product behaviour is
+    unchanged, and `_in_trusted_executable_root` reads the constant at call time.
+    """
+    trusted_root = tmp_path / "trusted-bin"
+    trusted_root.mkdir()
+
+    outside = tmp_path / "evil-tool"
+    outside.write_text("#!/bin/sh\n")
+
+    link = trusted_root / "tool"
+    link.symlink_to(outside)
+
+    monkeypatch.setattr(
+        "forge.tools.commands.TRUSTED_EXECUTABLE_ROOTS", (str(trusted_root),)
+    )
+
+    verdict = _classify_one(classifier, str(link))
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.workspace_executable_outside"
+
+
+def test_real_executable_in_a_temporary_trusted_root_is_not_denied(
+    classifier: CommandClassifier, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control for the test above.
+
+    Without this, the symlink test could pass for the wrong reason -- the file
+    being denied as a path rather than as a symlink escape. A real executable
+    that genuinely lives in the trusted root must classify normally.
+    """
+    trusted_root = tmp_path / "trusted-bin"
+    trusted_root.mkdir()
+
+    tool = trusted_root / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+
+    monkeypatch.setattr(
+        "forge.tools.commands.TRUSTED_EXECUTABLE_ROOTS", (str(trusted_root),)
+    )
+
+    verdict = _classify_one(classifier, str(tool))
+
+    assert verdict.rule != "cmd.workspace_executable_outside"
+
+
+def test_unresolvable_path_is_not_treated_as_trusted(
+    classifier: CommandClassifier, tmp_path: Path
+) -> None:
+    """A path that cannot be resolved is not trusted; the check fails closed.
+
+    Consistent with `Workspace.resolve`, which denies rather than allows on
+    every resolution failure. An unresolvable absolute path outside the
+    workspace must not be granted the trusted-root exemption.
+    """
+    verdict = _classify_one(
+        classifier, str(tmp_path / "no" / "such" / "dir" / "tool")
+    )
+
+    assert verdict.denied
+
+
+def test_project_local_venv_interpreter_is_approval_required(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    """`<workspace>/.venv/bin/python` is repository-local, so it is gated.
+
+    This is the case that makes the three interpreter categories distinct. A
+    project venv lives inside the workspace, so it is repository code by the
+    workspace-trust argument -- approval-required, exactly like
+    `./scripts/check.sh`. It is emphatically not denied, and not treated as a
+    trusted system binary either.
+    """
+    interpreter = workspace.root / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text("#!/bin/sh\n")
+    interpreter.chmod(0o755)
+
+    verdict = _classify_one(classifier, str(interpreter))
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.workspace_executable"
+
+
+def test_the_three_interpreter_categories_are_distinguished(
+    classifier: CommandClassifier, workspace: Workspace, tmp_path: Path
+) -> None:
+    """Project-local, trusted system, and arbitrary external differ.
+
+    All three end at a *different* place, which is the property worth pinning:
+
+    | Interpreter | Lands in | Verdict |
+    | --- | --- | --- |
+    | `<workspace>/.venv/bin/python` | inside the workspace | `cmd.workspace_executable` (approval) |
+    | `/usr/bin/python3` | a trusted system root | normal program rules |
+    | `<tmp>/elsewhere/python` | neither | `cmd.workspace_executable_outside` (deny) |
+
+    Pinning them in one test makes the contrast explicit and stops a future
+    change from collapsing two categories into one.
+    """
+    project_interpreter = workspace.root / "venv" / "bin" / "python"
+    project_interpreter.parent.mkdir(parents=True, exist_ok=True)
+    project_interpreter.write_text("#!/bin/sh\n")
+    project_interpreter.chmod(0o755)
+
+    external = tmp_path / "elsewhere" / "python"
+    external.parent.mkdir(parents=True, exist_ok=True)
+    external.write_text("#!/bin/sh\n")
+    external.chmod(0o755)
+
+    local_verdict = _classify_one(classifier, str(project_interpreter))
+    system_verdict = _classify_one(classifier, "/usr/bin/python3")
+    external_verdict = _classify_one(classifier, str(external))
+
+    assert local_verdict.rule == "cmd.workspace_executable"
+    assert system_verdict.rule != "cmd.workspace_executable"
+    assert system_verdict.rule != "cmd.workspace_executable_outside"
+    assert external_verdict.rule == "cmd.workspace_executable_outside"
+    assert external_verdict.denied
+
+
+def test_nested_workspace_executable_is_approval_required(
+    classifier: CommandClassifier,
+) -> None:
+    """A `./`-prefixed token deeper in the tree is gated too."""
+    verdict = _classify_one(classifier, "./scripts/nested/run-checks")
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.workspace_executable"
+
+
+# ==========================================================================
+# Git operation granularity
+#
+# `git branch`, `git tag`, and `git stash` are not one permission level each.
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("git", "status"),
+        ("git", "status", "--short"),
+        ("git", "diff"),
+        ("git", "diff", "--cached"),
+        ("git", "diff", "--stat"),
+        ("git", "log"),
+        ("git", "log", "--oneline", "-5"),
+        ("git", "show"),
+        ("git", "show", "HEAD"),
+        ("git", "rev-parse", "HEAD"),
+        ("git", "ls-files"),
+    ],
+)
+def test_git_inspection_is_automatic(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Every List 3 git inspection form is automatic."""
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.classification is Classification.ALLOW, (
+        f"{' '.join(args)} should be automatic, got {verdict.rule}"
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("git", "branch"),
+        ("git", "branch", "--list"),
+        ("git", "branch", "-a", "-v"),
+        ("git", "tag"),
+        ("git", "tag", "--list"),
+        ("git", "tag", "-l"),
+        ("git", "stash", "list"),
+    ],
+)
+def test_git_listing_forms_are_automatic(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """The listing form of each family is automatic.
+
+    Each of these shares a program with a gated mutating form. The pairing with
+    `test_git_mutation_forms_are_approval_required` is the point: neither half
+    of the test would catch a rule that collapsed the two.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.classification is Classification.ALLOW, (
+        f"{' '.join(args)} should be automatic, got {verdict.rule}"
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("git", "add", "."),
+        ("git", "add", "-A"),
+        ("git", "add", "src/"),
+        ("git", "branch", "feature"),
+        ("git", "branch", "-c", "feature"),
+        ("git", "switch", "main"),
+        ("git", "switch", "-c", "feature"),
+        ("git", "tag", "v1.0.0"),
+        ("git", "tag", "-a", "v1.0.0", "-m", "release"),
+        ("git", "stash"),
+        ("git", "stash", "push"),
+        ("git", "stash", "pop"),
+        ("git", "stash", "drop"),
+        ("git", "stash", "clear"),
+        ("git", "commit", "-m", "x"),
+        ("git", "merge", "main"),
+        ("git", "push"),
+        ("git", "push", "origin", "main"),
+        ("git", "fetch"),
+        ("git", "pull"),
+        ("git", "clone", "url"),
+        ("git", "rebase", "main"),
+    ],
+)
+def test_git_mutation_forms_are_approval_required(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Every mutating git form is gated, none of them denied.
+
+    `git add` is the one write that never touches the network, so its gate is
+    about the operator reviewing what belongs in a commit rather than about
+    publication. `git branch`/`tag`/`stash` are here as the mutating half of
+    their automatic listing forms.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.requires_approval, f"{' '.join(args)}: {verdict.rule}"
+    assert not verdict.denied, f"{' '.join(args)} must not be denied"
+
+
+@pytest.mark.parametrize(
+    "args,expected_rule",
+    [
+        (("git", "branch", "-d", "feature"), "cmd.git_branch_delete"),
+        (("git", "branch", "-D", "feature"), "cmd.git_branch_delete"),
+        (("git", "tag", "-d", "v1.0.0"), "cmd.git_tag_delete"),
+    ],
+)
+def test_git_branch_and_tag_deletion_are_denied(
+    classifier: CommandClassifier, args: tuple[str, ...], expected_rule: str
+) -> None:
+    """Deleting a branch or a tag is the same operation under two nouns.
+
+    Denying one while approving the other would be arbitrary, so `git tag -d`
+    joins `git branch -d` in the denied set.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.denied
+    assert verdict.rule == expected_rule
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("git", "describe"),
+        ("git", "config", "--get", "user.name"),
+        ("git", "remote", "-v"),
+        ("git", "gc"),
+        ("git", "gc", "--prune=now", "--aggressive"),
+    ],
+)
+def test_git_forms_omitted_from_list_3_are_gated_or_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Git commands left out of List 3 are gated, or denied where already denied.
+
+    `git describe`, `git config --get`, and `git remote -v` are reads the spec
+    chose not to list, so each one costs a prompt. That is the ruling applied
+    literally: no entry means approval-required, not automatic.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert not verdict.classification is Classification.ALLOW, args
+
+
+# ==========================================================================
+# Repository-code runners
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("pytest",),
+        ("pytest", "-q"),
+        ("pytest", "tests/", "-q"),
+        ("pytest", "tests/test_a.py::test_x"),
+        ("python", "-m", "pytest"),
+        ("python3", "-m", "pytest"),
+        ("make",),
+        ("make", "test"),
+        ("make", "build"),
+        ("npm", "test"),
+        ("npm", "run", "build"),
+        ("npm", "run", "test:unit"),
+        ("pnpm", "test"),
+        ("yarn", "test"),
+        ("cargo", "test"),
+        ("cargo", "build"),
+        ("cargo", "run"),
+        ("go", "test"),
+        ("go", "test", "./..."),
+        ("go", "build", "./..."),
+        ("tox",),
+        ("nox",),
+    ],
+)
+def test_repository_code_runners_require_approval(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Running repository code is approval-required.
+
+    `pytest` executes `conftest.py`, loads plugins, and runs arbitrary
+    repository-supplied test code. Auto-approving it while gating
+    `./scripts/check.sh` would be incoherent, so every documented runner is
+    gated here explicitly rather than by falling through to the default.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.requires_approval, (
+        f"{' '.join(args)} should require approval, got {verdict.rule}"
+    )
+    assert not verdict.denied, f"{' '.join(args)} must not be denied"
+
+
+def test_reading_a_test_file_is_not_running_repository_code(
+    classifier: CommandClassifier,
+) -> None:
+    """The gate is on executing repository code, not on looking at it.
+
+    Without this, a future reader could reasonably conclude that test files
+    became sensitive, which they are not.
+    """
+    verdict = _classify_one(classifier, "cat", "tests/test_commands.py")
+
+    assert verdict.classification is Classification.ALLOW
+
+
+# ==========================================================================
+# Architecture guard: the default must never become ALLOW again
+# ==========================================================================
+
+
+def test_unmatched_fallback_is_not_allow() -> None:
+    """The unmatched fallback is APPROVAL_REQUIRED, and that must not regress.
+
+    This is the guard against default-allow returning. It exists because that
+    was the previous behaviour, the spec recorded it as the largest soft spot in
+    the design, and a future refactor of `classify` could reintroduce it
+    silently: every other test in this file would still pass, because they
+    assert specific commands rather than the shape of the fallback.
+
+    It checks the fallback structurally rather than by classifying one program,
+    so it holds even if `cmd.unknown` is later given a different rule id.
+    """
+    source = inspect.getsource(CommandClassifier.classify)
+
+    assert "_classify_unknown_program" in source, (
+        "classify() must apply the unknown-command default"
+    )
+    # The default is applied by _classify_unknown_program, which returns
+    # APPROVAL_REQUIRED. Guard the helper too, so inlining the logic back into
+    # classify() without changing the classification cannot pass this test.
+    helper = inspect.getsource(CommandClassifier._classify_unknown_program)
+    assert "Classification.APPROVAL_REQUIRED" in helper
+    assert "Classification.ALLOW" not in helper
+
+
+def test_every_allow_rule_is_explicitly_classified_allow() -> None:
+    """No entry in ALLOWED_PROGRAMS can quietly claim a non-automatic result.
+
+    Guards the table itself: a rule added with the wrong classification would
+    raise an operation's severity silently rather than failing here.
+    """
+    for rule in ALLOWED_PROGRAMS:
+        assert rule.classification is Classification.ALLOW, rule.rule_id
+        assert rule.reason, f"{rule.rule_id} has no reason"
+
+
+def test_allowed_table_is_small_and_deliberate() -> None:
+    """The automatic table stays small on purpose.
+
+    The ruling was "if we are not confident it belongs in automatic, leave it
+    at APPROVAL_REQUIRED", and it explicitly forbids broadening the list to
+    reduce prompt count. A guard on the *count* is the only thing that makes
+    that stick: individual rows are each defensible, and without a ceiling the
+    table grows one "obviously safe" addition at a time until it is the
+    blocklist the design replaced.
+
+    Raise this deliberately, with a review, if a genuinely new read-only form
+    needs covering.
+    """
+    assert len(ALLOWED_PROGRAMS) <= 3, (
+        "ALLOWED_PROGRAMS grew past the reviewed size; widening it needs an "
+        "explicit decision, not a convenience"
+    )
 
