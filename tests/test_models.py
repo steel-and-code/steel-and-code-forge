@@ -908,6 +908,267 @@ def test_local_gateway_leaves_ordinary_json_fence_as_text() -> None:
 
 
 # --------------------------------------------------------------------------
+# Local gateway <tools> block compatibility
+# --------------------------------------------------------------------------
+
+
+def test_local_gateway_promotes_a_call_in_a_tools_block() -> None:
+    """One object inside a <tools> wrapper reaches the runtime as a call."""
+    content = (
+        "Reading the project manifest.\n"
+        "<tools>"
+        '{"name":"read_file","arguments":{"path":"pyproject.toml"}}'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert response.wants_tools
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].name == "read_file"
+    assert json.loads(response.tool_calls[0].arguments) == {
+        "path": "pyproject.toml"
+    }
+    assert "Reading the project manifest." in response.text
+    assert "<tools>" not in response.text
+
+
+def test_local_gateway_promotes_every_call_in_a_tools_block() -> None:
+    """Every call in one block is promoted, in the order written.
+
+    A block carries one JSON value, so several calls arrive as an array. Objects
+    simply stacked side by side are not a JSON value at all and are not
+    recovered from -- unlike a fence body, a block is a declared envelope.
+    """
+    content = (
+        "<tools>\n"
+        "[\n"
+        '  {"name": "search_files", "arguments": {"pattern": "README.md"}},\n'
+        '  {"name": "search_files", "arguments": {"pattern": "LICENSE"}},\n'
+        '  {"name": "read_file", "arguments": {"path": "README.md"}}\n'
+        "]\n"
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"search_files", "read_file"})
+
+    assert len(response.tool_calls) == 3
+    assert [call.name for call in response.tool_calls] == [
+        "search_files",
+        "search_files",
+        "read_file",
+    ]
+    assert [
+        json.loads(call.arguments)["pattern"] for call in response.tool_calls[:2]
+    ] == ["README.md", "LICENSE"]
+    assert response.text == ""
+
+
+def test_local_gateway_promotes_the_array_form_in_a_tools_block() -> None:
+    """The array form is a recognised call shape, members and all."""
+    content = (
+        "<tools>\n"
+        "[\n"
+        '  {"name": "read_file", "arguments": {"path": "a.txt"}},\n'
+        '  {"name": "read_file", "arguments": {"path": "b.txt"}}\n'
+        "]\n"
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert len(response.tool_calls) == 2
+    assert [
+        json.loads(call.arguments)["path"] for call in response.tool_calls
+    ] == ["a.txt", "b.txt"]
+    assert response.text == ""
+
+
+def test_local_gateway_keeps_prose_around_a_tools_block() -> None:
+    """Text before and after the block survives; the block itself is consumed."""
+    content = (
+        "I will check two files.\n"
+        "<tools>"
+        '{"name":"read_file","arguments":{"path":"a.txt"}}'
+        "</tools>\n"
+        "Then I will report what I found."
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert len(response.tool_calls) == 1
+    assert "I will check two files." in response.text
+    assert "Then I will report what I found." in response.text
+    assert "<tools>" not in response.text
+    assert "read_file" not in response.text
+
+
+def test_local_gateway_rejects_an_unknown_tool_in_a_tools_block() -> None:
+    """An unoffered name is not promoted, and the block is left readable."""
+    content = (
+        "<tools>"
+        '{"name":"delete_everything","arguments":{"path":"/repo"}}'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_promotes_only_allowed_names_in_a_tools_block() -> None:
+    """A good call survives an unoffered neighbour; the unoffered one does not."""
+    content = (
+        "<tools>"
+        "[\n"
+        '{"name": "delete_everything", "arguments": {"path": "/repo"}},\n'
+        '{"name": "read_file", "arguments": {"path": "a.txt"}}\n'
+        "]"
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert [call.name for call in response.tool_calls] == ["read_file"]
+
+
+def test_local_gateway_leaves_a_malformed_tools_block_as_text() -> None:
+    """JSON that does not decode is not scanned for a call that almost fits."""
+    content = (
+        "Here is what I would run.\n"
+        "<tools>\n"
+        '{"name": "read_file", oops\n'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_leaves_a_non_call_json_tools_block_as_text() -> None:
+    """Arbitrary JSON in a block is prose, not something to execute."""
+    content = (
+        "<tools>"
+        '{"database": {"host": "localhost"}, "retries": 3}'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"search_files"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_rejects_a_tools_block_with_non_dict_arguments() -> None:
+    """arguments must be an object; a shell string is not a promotion."""
+    content = (
+        "<tools>"
+        '{"name": "exec_command", "arguments": "ls -la"}'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"exec_command"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_rejects_a_tools_block_missing_arguments() -> None:
+    """A block that omits arguments does not get an empty object invented."""
+    content = '<tools>{"name": "search_files"}</tools>'
+
+    response = _bare_response(content, {"search_files"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_ignores_a_tool_shaped_object_outside_a_tools_block() -> None:
+    """Only block contents are read; prose JSON elsewhere is never promoted."""
+    content = (
+        "The call would be "
+        '{"name":"read_file","arguments":{"path":"a.txt"}}\n'
+        "but I did not run it."
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_rejects_objects_stacked_without_an_array() -> None:
+    """A block holds one JSON value; stacked objects are not one value."""
+    content = (
+        "<tools>"
+        '{"name":"read_file","arguments":{"path":"a.txt"}}\n'
+        '{"name":"read_file","arguments":{"path":"b.txt"}}'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file"})
+
+    assert not response.wants_tools
+    assert response.text == content
+
+
+def test_local_gateway_does_not_double_promote_a_tools_block_call() -> None:
+    """Native tool_calls win outright; the block adds nothing and stays text."""
+    content = "<tools>{\"name\":\"search_files\",\"arguments\":{}}</tools>"
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": "call_native",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path": "README.md"}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+
+    from forge.models.local import LocalLlamaGateway
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"read_file", "search_files"},
+    )
+
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].name == "read_file"
+
+
+def test_local_gateway_does_not_double_promote_after_a_fenced_call() -> None:
+    """A fenced call already recognised means the block is never read."""
+    content = (
+        "```json\n"
+        '{"name":"read_file","arguments":{"path":"a.txt"}}\n'
+        "```\n"
+        "<tools>"
+        '{"name":"search_files","arguments":{"pattern":"b"}}'
+        "</tools>"
+    )
+
+    response = _bare_response(content, {"read_file", "search_files"})
+
+    assert [call.name for call in response.tool_calls] == ["read_file"]
+    assert "<tools>" in response.text
+
+
+# --------------------------------------------------------------------------
 # Local gateway timeout configuration
 # --------------------------------------------------------------------------
 

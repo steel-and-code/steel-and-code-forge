@@ -393,6 +393,18 @@ class LocalLlamaGateway:
         text, fenced_calls = LocalLlamaGateway._fenced_json_calls(text, allowed_tools)
         calls.extend(fenced_calls)
 
+        # A <tools> wrapper is a compatibility fallback for models that emit
+        # the tag but not a shape any other path here understands. It runs
+        # after the fence pass and before the bare pass, and only when nothing
+        # has been recognised yet, so it can never double-promote a call an
+        # earlier parser already claimed.
+        if not calls:
+            text, block_calls = LocalLlamaGateway._tools_block_calls(
+                text,
+                allowed_tools,
+            )
+            calls.extend(block_calls)
+
         # Bare JSON is last resort, so it runs last and only on what the
         # fenced pass left behind.
         if not calls:
@@ -490,6 +502,108 @@ class LocalLlamaGateway:
             text = text.strip()
 
         return text, calls
+
+    @classmethod
+    def _tools_block_calls(
+        cls,
+        text: str,
+        allowed_tools: set[str] | None,
+    ) -> tuple[str, list[ToolCall]]:
+        """Promote tool calls wrapped in a ``<tools>`` block.
+
+        Some local models emit their calls inside a ``<tools>...</tools>``
+        wrapper rather than in a fence, in ``<tool_call>`` tags, or as trailing
+        bare JSON. This path exists so that shape still reaches the runtime
+        instead of being read to the operator as prose.
+
+        It is a compatibility fallback, so it is deliberately narrow:
+
+        *   Only the contents of the block are read. Prose outside the block is
+            never inspected, so a tool-shaped object sitting in ordinary text
+            stays text.
+        *   The body must decode as a JSON object, or as an array of JSON
+            objects. Anything else is not a call shape this path recognises.
+        *   A call is promoted only when ``name`` names a tool Forge actually
+            offered and ``arguments`` is an object. Naming a tool is not a
+            grant to run it, and no other JSON is executed or executed-by-proxy
+            on the way through.
+        *   A block that is malformed, or that yields no allowed call, leaves
+            the message completely untouched. There is no partial promotion:
+            a wrapper the model got wrong is text the operator should see.
+        """
+        calls: list[ToolCall] = []
+
+        if not text or not allowed_tools:
+            return text, calls
+
+        block_pattern = re.compile(
+            r"<tools\b[^>]*>(.*?)</tools\s*>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        matched_spans: list[tuple[int, int]] = []
+
+        for match in block_pattern.finditer(text):
+            promoted = 0
+
+            for candidate in cls._block_candidates(match.group(1)):
+                name = candidate.get("name")
+                arguments = candidate.get("arguments")
+
+                if not isinstance(name, str) or name not in allowed_tools:
+                    continue
+
+                if not isinstance(arguments, dict):
+                    continue
+
+                calls.append(
+                    ToolCall(
+                        id=f"call_{len(calls) + 1}",
+                        name=name,
+                        arguments=json.dumps(
+                            arguments,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+                promoted += 1
+
+            if promoted:
+                matched_spans.append(match.span())
+
+        if calls and matched_spans:
+            for start, end in reversed(matched_spans):
+                text = text[:start] + text[end:]
+
+            text = text.strip()
+
+        return text, calls
+
+    @classmethod
+    def _block_candidates(cls, body: str) -> list[dict[str, Any]]:
+        """The call-shaped objects inside a ``<tools>`` block body.
+
+        A body that decodes as one object yields one candidate; a body that
+        decodes as an array yields the dictionaries in it, skipping any
+        non-object members. A body that decodes as neither, or not at all,
+        yields nothing -- there is no scanning for objects buried in a string.
+        """
+        stripped = body.strip()
+
+        if not stripped:
+            return []
+
+        try:
+            value = json.loads(stripped)
+        except (TypeError, ValueError):
+            return []
+
+        if isinstance(value, dict):
+            return [value]
+
+        if isinstance(value, list):
+            return [entry for entry in value if isinstance(entry, dict)]
+
+        return []
 
     @classmethod
     def _bare_json_calls(
