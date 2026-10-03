@@ -655,3 +655,136 @@ def test_local_gateway_parses_fenced_json_only_for_allowed_tool() -> None:
     )
 
     assert not blocked.wants_tools
+
+
+def test_local_gateway_parses_multiple_calls_in_one_json_fence() -> None:
+    """A local model stacks several objects in one fence; all are promoted."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        "Checking the repo.\n"
+                        "```json\n"
+                        '{"name":"search_files","arguments":'
+                        '{"pattern":"README.md","path":"/repo"}}\n'
+                        '{"name":"search_files","arguments":'
+                        '{"pattern":"LICENSE","path":"/repo"}}\n'
+                        '{"name":"search_files","arguments":'
+                        '{"pattern":"*config*","path":"/repo"}}\n'
+                        "```\n"
+                        "Done."
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"search_files"},
+    )
+
+    assert len(response.tool_calls) == 3
+    assert [json.loads(call.arguments)["pattern"] for call in response.tool_calls] == [
+        "README.md",
+        "LICENSE",
+        "*config*",
+    ]
+    assert all(call.name == "search_files" for call in response.tool_calls)
+    # Prose outside the fence survives; the fence itself is consumed.
+    assert "Checking the repo." in response.text
+    assert "```" not in response.text
+
+
+def test_local_gateway_promotes_only_allowed_names_in_one_fence() -> None:
+    """An unoffered name inside an otherwise valid fence is not a tool call."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        "```json\n"
+                        '{"name":"search_files","arguments":{"pattern":"a"}}\n'
+                        '{"name":"delete_everything","arguments":{"path":"/repo"}}\n'
+                        '{"name":"read_file","arguments":{"path":"README.md"}}\n'
+                        "```"
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"search_files"},
+    )
+
+    assert [call.name for call in response.tool_calls] == ["search_files"]
+    assert json.loads(response.tool_calls[0].arguments) == {"pattern": "a"}
+
+
+def test_local_gateway_skips_malformed_object_between_valid_calls() -> None:
+    """One bad object does not swallow the valid ones stacked around it."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        "```json\n"
+                        '{"name":"read_file","arguments":{"path":"a.txt"}}\n'
+                        '{"name":"read_file", oops\n'
+                        '{"name":"read_file","arguments":{"path":"b.txt"}}\n'
+                        "```"
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"read_file"},
+    )
+
+    assert [
+        json.loads(call.arguments)["path"] for call in response.tool_calls
+    ] == ["a.txt", "b.txt"]
+
+
+def test_local_gateway_leaves_ordinary_json_fence_as_text() -> None:
+    """A code fence is not a grant: non-tool JSON stays prose."""
+    from forge.models.local import LocalLlamaGateway
+
+    content = (
+        "Here is the config I would write.\n"
+        "```json\n"
+        '{"database": {"host": "localhost"}, "retries": 3}\n'
+        "```"
+    )
+
+    payload = {
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"search_files"},
+    )
+
+    assert not response.wants_tools
+    assert response.text == content.strip()

@@ -313,52 +313,10 @@ class LocalLlamaGateway:
                     text = text[:start] + text[end:]
 
                 text = text.strip()
-                # Some local Qwen responses emit a tool call as a fenced JSON block.
-        if not calls and text and allowed_tools:
-            fenced_json_pattern = re.compile(
-                r"```json\s*(\{.*?\})\s*```",
-                re.DOTALL | re.IGNORECASE,
-            )
 
-            matched_spans: list[tuple[int, int]] = []
+        text, fenced_calls = LocalLlamaGateway._fenced_json_calls(text, allowed_tools)
+        calls.extend(fenced_calls)
 
-            for match in fenced_json_pattern.finditer(text):
-                try:
-                    decoded = json.loads(match.group(1))
-                except (TypeError, ValueError):
-                    continue
-
-                if not isinstance(decoded, dict):
-                    continue
-
-                name = decoded.get("name")
-                arguments = decoded.get("arguments", {})
-
-                if not isinstance(name, str) or name not in allowed_tools:
-                    continue
-
-                if not isinstance(arguments, dict):
-                    continue
-
-                calls.append(
-                    ToolCall(
-                        id=f"call_{len(calls) + 1}",
-                        name=name,
-                        arguments=json.dumps(
-                            arguments,
-                            separators=(",", ":"),
-                        ),
-                    )
-                )
-
-                matched_spans.append(match.span())
-
-            if calls and matched_spans:
-                for start, end in reversed(matched_spans):
-                    text = text[:start] + text[end:]
-
-                text = text.strip()
-                
         usage_payload = payload.get("usage")
         usage = Usage()
 
@@ -385,3 +343,97 @@ class LocalLlamaGateway:
             usage=usage,
             stop_reason=first.get("finish_reason"),
         )
+
+    @classmethod
+    def _fenced_json_calls(
+        cls,
+        text: str,
+        allowed_tools: set[str] | None,
+    ) -> tuple[str, list[ToolCall]]:
+        """Lift tool calls out of ``json`` code fences in the model text.
+
+        A local model asked for several tool calls at once frequently answers
+        with several JSON objects stacked inside one fence rather than an array
+        or several fences, so the fence body is scanned value by value instead of
+        being read as a single object.
+
+        Only objects naming a tool Forge actually offered are promoted; anything
+        else stays prose. A fence that yields no allowed call is left untouched,
+        because a code fence is not a grant to run whatever it contains.
+        """
+        calls: list[ToolCall] = []
+
+        if not text or not allowed_tools:
+            return text, calls
+
+        fence_pattern = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+        matched_spans: list[tuple[int, int]] = []
+
+        for match in fence_pattern.finditer(text):
+            promoted = 0
+
+            for value in cls._scan_json_values(match.group(1)):
+                for candidate in value if isinstance(value, list) else (value,):
+                    if not isinstance(candidate, dict):
+                        continue
+
+                    name = candidate.get("name")
+                    arguments = candidate.get("arguments", {})
+
+                    if not isinstance(name, str) or name not in allowed_tools:
+                        continue
+
+                    if not isinstance(arguments, dict):
+                        continue
+
+                    calls.append(
+                        ToolCall(
+                            id=f"call_{len(calls) + 1}",
+                            name=name,
+                            arguments=json.dumps(
+                                arguments,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
+                    promoted += 1
+
+            if promoted:
+                matched_spans.append(match.span())
+
+        if calls and matched_spans:
+            for start, end in reversed(matched_spans):
+                text = text[:start] + text[end:]
+
+            text = text.strip()
+
+        return text, calls
+
+    @staticmethod
+    def _scan_json_values(body: str) -> list[Any]:
+        """Decode every top-level JSON value in ``body``, ignoring the rest.
+
+        Rescanning past a decode error is what keeps one malformed object from
+        swallowing the valid ones stacked around it.
+        """
+        decoder = json.JSONDecoder()
+        found: list[Any] = []
+        index = 0
+        length = len(body)
+
+        while index < length:
+            char = body[index]
+
+            if char.isspace() or char in ",":
+                index += 1
+                continue
+
+            try:
+                value, index = decoder.raw_decode(body, index)
+            except ValueError:
+                index += 1
+                continue
+
+            found.append(value)
+
+        return found
