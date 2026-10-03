@@ -512,3 +512,146 @@ def test_openrouter_detects_an_oversized_context(monkeypatch) -> None:
 
     with pytest.raises(ContextTooLarge):
         gateway.complete(CompletionRequest(system="s", messages=(), model="m"))
+
+
+# --------------------------------------------------------------------------
+# Local llama.cpp gateway
+# --------------------------------------------------------------------------
+
+
+def test_local_gateway_parses_native_tool_call() -> None:
+    """Native OpenAI-style tool_calls remain the preferred path."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_native",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"README.md"}',
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"read_file"},
+    )
+
+    assert response.wants_tools
+    assert response.tool_calls[0].name == "read_file"
+    assert json.loads(response.tool_calls[0].arguments) == {
+        "path": "README.md"
+    }
+
+
+def test_local_gateway_parses_qwen_tool_call_markup() -> None:
+    """Qwen <tool_call> JSON is normalised into a Forge ToolCall."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        '<tool_call>\n'
+                        '{"name":"read_file","arguments":{"path":"README.md"}}\n'
+                        '</tool_call>'
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"read_file"},
+    )
+
+    assert response.wants_tools
+    assert response.tool_calls[0].name == "read_file"
+    assert json.loads(response.tool_calls[0].arguments) == {
+        "path": "README.md"
+    }
+
+
+def test_local_gateway_parses_qwen_xml_style_tool_call() -> None:
+    """Qwen XML-style self-closing tool calls are normalised."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        '<search_files pattern="*.md" '
+                        'path="/workspace"/>'
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"search_files"},
+    )
+
+    assert response.wants_tools
+    assert response.tool_calls[0].name == "search_files"
+    assert json.loads(response.tool_calls[0].arguments) == {
+        "pattern": "*.md",
+        "path": "/workspace",
+    }
+
+
+def test_local_gateway_parses_fenced_json_only_for_allowed_tool() -> None:
+    """Fenced JSON becomes a tool call only for an offered Forge tool."""
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": (
+                        '```json\n'
+                        '{"name":"read_file",'
+                        '"arguments":{"path":"README.md"}}\n'
+                        '```'
+                    )
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"read_file"},
+    )
+
+    assert response.wants_tools
+    assert response.tool_calls[0].name == "read_file"
+    assert json.loads(response.tool_calls[0].arguments) == {
+        "path": "README.md"
+    }
+
+    blocked = LocalLlamaGateway._parse_response(
+        payload,
+        allowed_tools={"search_files"},
+    )
+
+    assert not blocked.wants_tools

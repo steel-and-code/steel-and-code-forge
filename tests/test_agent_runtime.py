@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 
 import pytest
 
@@ -205,6 +206,126 @@ def test_byte_instructions_match_the_contract_blocks() -> None:
 
     assert joined.index("You are Byte") < joined.index("Investigate before")
     assert joined.index("Investigate before") < joined.index("You operate inside")
+
+
+#: The quoted blocks in the contract, in document order.
+CONTRACT_PATH = pathlib.Path(__file__).resolve().parent.parent / "docs" / "agent-contract.md"
+
+#: ``#### Block B -- Responsibilities`` and friends. The letter is captured so
+#: a renamed or reordered block fails rather than silently re-pairing.
+BLOCK_HEADING = re.compile(r"^#### Block ([A-G])\b")
+
+#: Dashes that mean the same punctuation in both representations. The contract
+#: is prose and uses a real em dash; ``byte.py`` is source and uses ``--``
+#: because the em dash is not ASCII and the module is read by people as well as
+#: imported. This is the only wording difference the two copies are allowed.
+DASHES = str.maketrans({"—": "--", "–": "--", "―": "--"})
+
+
+def parse_contract_blocks(text: str) -> dict[str, str]:
+    """Pull the quoted Block A-G text out of the contract, keyed by letter.
+
+    The contract holds two kinds of prose per block: the block itself, in a
+    Markdown blockquote, and commentary underneath explaining why the block
+    says what it says. Only the blockquote is the instruction, so parsing stops
+    at the first line that is not a quote. This is what lets the test compare
+    against the contract instead of holding a second copy of the wording --
+    a second copy is precisely the thing that drifts.
+    """
+    blocks: dict[str, list[str]] = {}
+    current: str | None = None
+    after_break = False
+
+    for line in text.splitlines():
+        heading = BLOCK_HEADING.match(line)
+        if heading:
+            letter = heading.group(1)
+            assert letter is not None
+            current = letter
+            blocks[letter] = []
+            continue
+        if current is None:
+            continue
+        if not line.strip():
+            # A blank line between the heading and the quote. Markdown needs it;
+            # it does not end the block.
+            continue
+        if not line.startswith(">"):
+            # Prose between blocks. The block ended.
+            current = None
+            continue
+        quoted = line[1:].strip()
+        if not quoted:
+            # A bare ``>``: a paragraph break. Recorded now and dropped if the
+            # quote ends here, so a trailing break cannot invent a paragraph.
+            after_break = True
+            continue
+        if blocks[current] and after_break:
+            blocks[current].append("")
+        after_break = False
+        blocks[current].append(quoted)
+
+    assert sorted(blocks) == list("ABCDEFG"), f"contract blocks found: {sorted(blocks)}"
+    # One entry per line, with an empty string standing in for a paragraph
+    # break, so joining with a single newline yields the paragraph structure
+    # ``normalise`` then re-reads.
+    return {letter: normalise("\n".join(paragraphs))
+            for letter, paragraphs in blocks.items()}
+
+
+def normalise(block: str) -> str:
+    """Reduce a block to comparable form, touching formatting only.
+
+    Whitespace inside a paragraph is collapsed and dash punctuation is unified.
+    Nothing else is touched: case, punctuation, word choice, word order, and
+    paragraph structure all survive, so substantive wording drift still fails
+    the comparison. Collapsing whitespace is safe because neither file has
+    meaningful indentation or alignment in a block.
+    """
+    paragraphs = [" ".join(p.split()) for p in block.split("\n\n")]
+    return "\n\n".join(paragraphs).translate(DASHES).strip()
+
+
+def test_byte_blocks_are_verbatim_copies_of_the_contract() -> None:
+    """Each runtime block is the contract's quoted text, wording included.
+
+    ``test_byte_instructions_match_the_contract_blocks`` above only proves the
+    blocks are internally consistent: it compares the constants to the profile
+    they are joined into, so all seven could drift from the contract together
+    and it would still pass. This is the test that reads the contract.
+    """
+    contract = parse_contract_blocks(CONTRACT_PATH.read_text(encoding="utf-8"))
+    runtime = {letter: normalise(block) for letter, block in zip("ABCDEFG", BLOCKS)}
+
+    for letter, expected in contract.items():
+        actual = runtime[letter]
+        assert actual == expected, (
+            f"Block {letter} has drifted from {CONTRACT_PATH.name}.\n"
+            f"contract: {expected!r}\nruntime:  {actual!r}"
+        )
+
+
+def test_the_contract_comparison_would_catch_wording_drift() -> None:
+    """The comparison is strict enough to be worth having.
+
+    A synchronisation test that normalises away too much is a test that always
+    passes, which is worse than no test: it certifies a guarantee it never
+    checked. This asserts the check itself -- a changed word, a changed
+    paragraph break, and a dropped sentence each have to be visible.
+    """
+    contract = parse_contract_blocks(CONTRACT_PATH.read_text(encoding="utf-8"))
+
+    baseline = contract["B"]
+
+    # A substituted word must fail.
+    assert normalise(baseline.replace("summarize", "paraphrase")) != normalise(baseline)
+    # So must a dropped clause -- the failure this whole test exists for.
+    assert normalise(baseline.replace("; do not stop", "")) != normalise(baseline)
+    # So must a collapsed paragraph break, which changes what the block claims
+    # to be one commitment versus two.
+    assert normalise(baseline.replace("\n\n", " ")) != normalise(baseline)
+    # And a case change.
+    assert normalise(baseline).lower() != normalise(baseline)
 
 
 # --------------------------------------------------------------------------

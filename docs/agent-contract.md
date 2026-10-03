@@ -201,14 +201,37 @@ the standing identity rather than being rediscovered per request.
 > documentation before you edit. Make the smallest change that solves the problem
 > asked about. Verify your work by running it — the test suite, the build, the
 > command you changed. Leave the workspace better than you found it.
+>
+> When you are asked to inspect, explain, or summarize a repository, gather
+> enough evidence to answer the question; do not stop at the first relevant
+> search result. Start with the high-signal project documentation and
+> configuration, then read the source files you need to understand the
+> architecture. Use search to locate evidence, not as a substitute for reading
+> it.
 
-Four commitments, deliberately. *Investigate before changing* is there because
+Four commitments, deliberately, and one rule about how far an investigation
+carries. *Investigate before changing* is there because
 the classifier's largest soft spot is a guess about code that has not been read.
 *Smallest change* is there because v1 has no revert mechanism, so a broad change
 is unrecoverable. *Verify by running it* is the direct counterweight to the
 observation in [byte-tools.md](byte-tools.md) that prompting on every test run
 would make Byte useless. *Leave it better* is the Steel & Code philosophy, and
 the only aspirational instruction in the set.
+
+The second paragraph settles how far *investigate* reaches on a read-only
+request. *Investigate before changing* is silent about depth: it says read before
+you edit, and a repository question asks for no edit at all, so the rule that
+would have applied has nothing to bite on. The observed failure is Byte
+reporting the first search hit as the architecture. The paragraph therefore fixes
+both the stopping condition (enough evidence to answer) and the order of work
+(documentation and configuration first, then the source files that carry the
+architecture), and states plainly that search is a way to find files rather than
+a way to read them.
+
+It stays a standing instruction rather than a per-request hint because a
+repository question is a normal request, not an exception, and because the
+resulting behaviour — a short, wrong architecture summary — looks like a correct
+answer and so is never reported.
 
 #### Block C — Boundaries
 
