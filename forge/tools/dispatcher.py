@@ -28,6 +28,11 @@ it:
     does not read the existing content and classify afterwards -- that ordering
     would make the approval prompt unable to show what was about to change.
 
+*   **Observation is not a decision.** An optional ``events`` sink learns which
+    tools ran and how they ended. It is never consulted before a call, and
+    nothing it can do reaches a classifier, an ``Approver`` or an ``Executor``
+    -- see :mod:`forge.events`.
+
 On process output, one honest statement rather than a reassuring one: **process
 output is untrusted and may contain sensitive data, and Forge v1 provides no
 general output-redaction guarantee.** Bounded stdout and stderr are returned to
@@ -49,6 +54,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from ..events import EventSink, emit
 from ..models.base import ToolCall
 from .approval import (
     ApprovalChannel,
@@ -186,6 +192,10 @@ class ToolDispatcher:
             ``Approver.submit_command`` and only with an approved outcome.
         agent_name: Whose request this is, reported in the approval prompt.
         owned_pids: PIDs this run started, for the kill-provenance rule.
+        events: Optional observational sink. Emits bounded metadata about each
+            call -- tool name, status, byte counts -- and never the call's
+            payload, its file contents, or its subprocess output. ``None``
+            changes nothing.
     """
 
     def __init__(
@@ -198,6 +208,7 @@ class ToolDispatcher:
         allowed_tools: Sequence[str] = (),
         owned_pids: frozenset[int] = frozenset(),
         system_prompt: str = "",
+        events: EventSink | None = None,
     ) -> None:
         self.workspace = workspace
         self.approver = approver
@@ -207,6 +218,9 @@ class ToolDispatcher:
         #: Assembled by the caller from the agent profile. Held here because the
         #: dispatcher already owns the workspace root, and the prompt needs it.
         self.system_prompt = system_prompt
+        #: Observation only. A sink learns which tools ran and how they ended;
+        #: it is not consulted before, during, or after any of them.
+        self.events = events
         self._denials: dict[str, ToolResult] = {}
         self._classifier = CommandClassifier(workspace, owned_pids=owned_pids)
         self._secrets = SecretClassifier(workspace)
@@ -334,7 +348,48 @@ class ToolDispatcher:
         Never raises for a model-facing failure. Every branch returns a
         ``ToolResult`` whose status tells the model -- and the operator, since
         these results are rendered -- exactly what happened.
+
+        Wraps the decision in observation. What is emitted is metadata only:
+        the tool name, the status, byte counts, and the classifier's own
+        operator-safe detail. The call's *arguments* are never emitted, because
+        a model may legitimately put file contents or a command line in them,
+        and an activity log that echoes them would be a second, unreviewed
+        surface for sensitive data to escape through.
         """
+        emit(self.events, "tool.call", tool=call.name, call_id=call.id)
+        result = self._dispatch_unobserved(call)
+        emit(self.events, "tool.result", **self._observed_fields(result))
+        return result
+
+    @staticmethod
+    def _observed_fields(result: ToolResult) -> dict[str, str]:
+        """Bounded, safe metadata for one result.
+
+        Only counts and the classifier's own ``detail`` string. Content values
+        are read exclusively for their length, so nothing a subprocess printed
+        or a file contained can reach an observer.
+        """
+        fields: dict[str, str] = {
+            "tool": result.tool,
+            "status": result.status.value,
+        }
+        content = result.content
+        exit_code = content.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            fields["exit_code"] = str(exit_code)
+        for key in ("stdout", "stderr"):
+            value = content.get(key)
+            if isinstance(value, str):
+                fields[f"{key}_bytes"] = str(len(value.encode("utf-8")))
+        for key in ("truncated", "stdout_truncated", "stderr_truncated"):
+            if isinstance(content.get(key), bool):
+                fields[key] = str(content[key])
+        if result.detail:
+            fields["detail"] = result.detail
+        return fields
+
+    def _dispatch_unobserved(self, call: ToolCall) -> ToolResult:
+        """The decision itself. See :meth:`dispatch` for the observation around it."""
         canonical = call.canonical()
 
         # A cached refusal. Returns before any classifier or channel work, and

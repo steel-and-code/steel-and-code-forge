@@ -79,6 +79,15 @@ DEFAULT_MODEL = "anthropic/claude-sonnet-4"
 #: piped prompt collides awkwardly with `--workspace` and with a future chat mode.
 TASK_FILE_FLAG = "--task-file"
 
+#: The Workbench bind address is fixed, and not configurable. Stated as a
+#: constant rather than merely omitted from the parser so that a future edit
+#: adding a `--host` flag has to delete a named safety property rather than
+#: just supply a new argument.
+WORKBENCH_BIND_HOST = "127.0.0.1"
+
+#: Default loopback port for `forge workbench`.
+DEFAULT_WORKBENCH_PORT = 8765
+
 DESCRIPTION = """\
 Forge — orchestration layer for Steel & Code agents.
 
@@ -105,12 +114,14 @@ Forge terminal interface — current state
 
 `forge check` classifies and asks; it executes nothing.
 `forge byte` runs an agent and does execute -- through the same pipeline.
+`forge workbench` serves a local browser view of one Byte run on loopback.
 
 Usage:
   forge check command --workspace DIR [-- PROGRAM [ARG...]]
   forge check path --workspace DIR PATH [PATH...]
   forge byte --workspace DIR [--model ID] [--max-turns N] "task"
   forge byte --workspace DIR --task-file PATH
+  forge workbench --workspace DIR [--model ID] [--port 8765]
 """
 
 
@@ -301,6 +312,59 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="TASK",
         help="the task, as one argument",
+    )
+
+    workbench_parser = sub.add_parser(
+        "workbench",
+        help="serve a local browser surface for one Byte run",
+        description=(
+            "Serve the Forge Workbench on this machine: a single-page view of "
+            "one Byte run, its tool activity, and any approval it needs. A "
+            "human is present, so an approval-required operation prompts and "
+            "waits -- this is the same question the terminal asks, asked "
+            "through a browser.\n\n"
+            "Binds 127.0.0.1 only, with no option to widen it. Every request "
+            "carrying a capability requires an exact Origin match and a "
+            "per-process token. There is no flag for a public host in v1, and "
+            "an approval-required operation with no browser attached still "
+            "fails closed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  forge workbench --workspace .\n"
+            "  forge workbench --workspace . --model anthropic/claude-sonnet-4\n"
+            "  forge workbench --workspace . --port 9000\n"
+        ),
+    )
+    workbench_parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        default=None,
+        help=(
+            "explicit workspace root (required; may also be set via "
+            f"{WORKSPACE_ENV}). Not inferred from the current directory."
+        ),
+    )
+    workbench_parser.add_argument(
+        "--model",
+        metavar="ID",
+        default=None,
+        help=(
+            f"provider model id (default: ${DEFAULT_MODEL_ENV}, else "
+            f"{DEFAULT_MODEL})"
+        ),
+    )
+    workbench_parser.add_argument(
+        "--port",
+        metavar="N",
+        type=int,
+        default=DEFAULT_WORKBENCH_PORT,
+        help=(
+            "loopback port to bind (default: %(default)s). This is not a host "
+            "setting: the bind address is fixed at 127.0.0.1 and there is no "
+            "flag to change it."
+        ),
     )
 
     return parser
@@ -717,6 +781,108 @@ def _run_byte(
 
 
 # --------------------------------------------------------------------------
+# forge workbench
+# --------------------------------------------------------------------------
+
+
+def _run_workbench(
+    args: argparse.Namespace,
+    workspace: Workspace,
+    *,
+    out: TextIO,
+    err: TextIO,
+    environ: dict[str, str],
+) -> int:
+    """Serve the Workbench on loopback.
+
+    Like `_run_byte`, this assembles a pipeline and decides nothing: the model
+    id is resolved from configuration, the gateway is built from the injected
+    environment, and every permission decision stays in ``forge/tools``.
+
+    Two things are deliberately absent. There is no ``--host``, because a
+    browser surface that can be bound to a public interface is a different
+    product with a different threat model. And there is no automatic browser
+    launch, because spawning a browser is a side effect of starting a server
+    that nobody asked for, and the operator who typed the command is already
+    at a terminal with the URL in front of them.
+    """
+    from ..agents.byte import BYTE
+    from ..models.base import GatewayError
+    from ..models.openrouter import OpenRouterGateway
+    from ..ui import UiUnavailable
+    from ..ui.broker import SseBroker
+    from ..ui.runner import runtime_factory
+    from ..ui.security import UiToken
+    from ..ui.server import create_app
+    from ..ui.session import WorkbenchSession
+
+    port = getattr(args, "port", DEFAULT_WORKBENCH_PORT)
+    if not (1 <= int(port) <= 65535):
+        print(f"forge: port must be between 1 and 65535, not {port}", file=err)
+        return EXIT_USAGE
+
+    model_id = (
+        getattr(args, "model", None)
+        or environ.get(DEFAULT_MODEL_ENV)
+        or DEFAULT_MODEL
+    )
+
+    # The credential is read here, in this process, from the injected mapping.
+    # It is never threaded into the session, the broker, the app, or a response
+    # body -- a page that can read the provider key is a page that can spend the
+    # operator's money.
+    try:
+        gateway = OpenRouterGateway(environ=environ)
+    except GatewayError as exc:
+        print(f"forge: {exc}", file=err)
+        return EXIT_USAGE
+
+    try:
+        import uvicorn  # noqa: PLC0415 - optional dependency, checked at use
+    except ImportError:
+        print(
+            "forge: the Workbench needs its optional dependencies.\n"
+            "  pip install 'forge[workbench]'",
+            file=err,
+        )
+        return EXIT_USAGE
+
+    broker = SseBroker()
+    session = WorkbenchSession(
+        workspace=workspace,
+        profile=BYTE,
+        model_id=model_id,
+        runtime_factory=runtime_factory(
+            workspace,
+            profile=BYTE,
+            gateway=gateway,
+            model_id=model_id,
+        ),
+        broker=broker,
+    )
+
+    token = UiToken()
+    try:
+        app = create_app(
+            workspace=workspace,
+            session=session,
+            gateway=gateway,
+            token=token,
+            port=int(port),
+        )
+    except ImportError as exc:  # pragma: no cover - guarded above
+        raise UiUnavailable(str(exc)) from exc
+
+    print(f"forge: workbench on http://{WORKBENCH_BIND_HOST}:{port}", file=out)
+    print(f"forge: workspace {workspace.root}", file=out)
+    print(f"forge: model {model_id}", file=out)
+    print("forge: bound to loopback; approval-required operations need you", file=out)
+
+    uvicorn.run(app, host=WORKBENCH_BIND_HOST, port=int(port), log_level="warning")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -820,6 +986,22 @@ def main(
                 err=err_stream,
                 environ=env,
                 channel=channel,
+            )
+
+        if args.subcommand == "workbench":
+            workspace, problem = _resolve_workspace(
+                getattr(args, "workspace", None), env
+            )
+            if workspace is None:
+                print(f"forge: {problem}", file=err_stream)
+                return EXIT_USAGE
+
+            return _run_workbench(
+                args,
+                workspace,
+                out=out_stream,
+                err=err_stream,
+                environ=env,
             )
 
         print(f"forge: unknown command: {args.subcommand!r}", file=err_stream)

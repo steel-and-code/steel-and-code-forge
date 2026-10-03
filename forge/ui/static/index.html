@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="workbench">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    No localStorage, no sessionStorage, no IndexedDB.
+
+    A browser-side copy of approval state is a browser-side claim about what
+    Forge has decided, and Forge is the only thing that knows that. A refresh
+    therefore asks GET /api/status and renders whatever the server says --
+    including a pending approval it has not seen before.
+
+    The token below is substituted by the server at request time. It is
+    per-process, lives only in this page's memory, and is never written
+    anywhere. It is not the provider key: the model gateway is constructed in
+    the server process and no credential is ever sent to a browser.
+  -->
+  <title>Forge Workbench</title>
+  <meta name="forge-ui-token" content="__FORGE_UI_TOKEN__">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <h1>Forge Workbench</h1>
+    </div>
+    <dl class="facts">
+      <div class="fact">
+        <dt>Workspace</dt>
+        <dd id="workspace" class="mono">&mdash;</dd>
+      </div>
+      <div class="fact">
+        <dt>Agent</dt>
+        <dd id="agent" class="mono">&mdash;</dd>
+      </div>
+      <div class="fact">
+        <dt>Model</dt>
+        <dd id="model" class="mono">&mdash;</dd>
+      </div>
+    </dl>
+    <div class="state" id="state-chip" data-state="idle" role="status" aria-live="polite">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="state-label">connecting</span>
+    </div>
+  </header>
+
+  <main class="split">
+    <section class="pane conversation" aria-label="Byte conversation">
+      <div class="pane-head">
+        <h2>Conversation</h2>
+        <span class="hint" id="stream-hint">stream: connecting</span>
+      </div>
+      <ol class="thread" id="thread" aria-live="polite"></ol>
+      <form class="composer" id="composer" autocomplete="off">
+        <label class="sr-only" for="task">Task for Byte</label>
+        <textarea id="task" name="task" rows="3" placeholder="Give Byte a task. It will classify every operation it attempts; some will need your approval."></textarea>
+        <div class="composer-actions">
+          <button type="submit" id="send">Send to Byte</button>
+          <p class="note">
+            No stop button in v1: cancellation is not implemented through the
+            runtime and executor, and a control that cannot reliably stop a run
+            is worse than none.
+          </p>
+        </div>
+      </form>
+    </section>
+
+    <section class="pane activity" aria-label="Activity">
+      <div class="pane-head">
+        <h2>Activity</h2>
+        <span class="hint">metadata only &mdash; no file contents, no process output</span>
+      </div>
+      <ol class="feed" id="feed" aria-live="polite"></ol>
+    </section>
+  </main>
+
+  <!--
+    The approval card. Present in the DOM, hidden until the server reports a
+    pending approval. It holds no state of its own: `approval_id` arrives from
+    GET /api/status or from the approval.required event, and a refreshed page
+    recovers the same id from the same place.
+  -->
+  <div class="overlay" id="approval-overlay" hidden>
+    <section class="card" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+      <p class="eyebrow" id="approval-title">Approval required</p>
+      <p class="lede">This operation has not run. Review it, then decide.</p>
+      <dl class="approval-fields" id="approval-fields"></dl>
+      <p class="approval-id mono" id="approval-id"></p>
+      <div class="card-actions">
+        <button type="button" class="approve" id="approve">Approve</button>
+        <button type="button" class="reject" id="reject">Reject</button>
+      </div>
+      <p class="approval-note" id="approval-note" hidden></p>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -12,7 +12,24 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# Everything needed to run the whole test suite, including the Workbench UI and
+# security tests. Kept complete on purpose: a UI test that needs a package the
+# dev extra does not provide is a UI test that gets skipped, and a skipped
+# approval or CSRF test is one that has quietly stopped protecting anything.
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+
+# The Workbench UI server and nothing else. `forge` core stays dependency-free,
+# so this extra is only for operators who want the browser surface; an install
+# without it runs the full safety stack on the standard library alone.
+workbench = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
 
 # The terminal entry point. Forge is terminal-first, so `forge` is the command
 # an operator actually types; the package is installed rather than run as a
@@ -23,6 +40,14 @@ forge = "forge.cli.main:main"
 
 [tool.setuptools.packages.find]
 include = ["forge*"]
+
+# The Workbench page, its script, and its stylesheet are served from the
+# installed package, not from the source tree. Without this, an editable
+# install works and a real wheel silently ships a page with no CSS or JS --
+# because `[tool.setuptools.packages.find]` collects modules, and a bare
+# `static/` directory is not one.
+[tool.setuptools.package-data]
+"forge.ui" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

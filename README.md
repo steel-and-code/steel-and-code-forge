@@ -2,9 +2,9 @@
 
 Forge is the orchestration layer for Steel & Code's agent platform.
 
-This repository holds the **orchestration layer and its safety stack**, plus the
-first agent runtime. There is no n8n wiring, no UI, no database, and no HTTP API
-yet.
+This repository holds the **orchestration layer and its safety stack**, the
+first agent runtime, and the local Workbench browser surface. There is no n8n
+wiring, no database, and no public HTTP API yet.
 
 ## What lives here
 
@@ -14,9 +14,11 @@ forge/
   models/     model client abstractions (OpenRouter gateway)
   cli/        terminal entry point (the `forge` command)
   tools/      tools an agent is allowed to call
+  events/     the observational event contract (bounded payloads)
+  ui/         Workbench: loopback server, SSE broker, approval bridge
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (847 passing)
+tests/        pytest suite (985 passing)
 docs/         architecture and design notes
 ```
 
@@ -58,6 +60,10 @@ with approval-required as the default, the terminal approval step, and command
 execution. The model gateway is provider-neutral, with an offline scripted
 implementation used by every test and OpenRouter as the live provider.
 
+The Workbench browser surface is implemented: `forge workbench` serves one Byte
+run on loopback, with live SSE tool activity, browser approvals over the same
+policy layer, and no second path from the UI to a process.
+
 Next steps, in order:
 
 1. Define the secondary HTTP surface n8n and the website will call.
@@ -65,8 +71,8 @@ Next steps, in order:
 3. Record execution and approval events somewhere reviewable. Nothing is
    recorded durably yet, and this should exist before durable memory is enabled.
 4. Implement durable project memory — designed, still disabled.
-5. Decide whether an interactive chat session is worth building over the
-   one-shot runtime.
+5. Decide whether a multi-run or chat-style session is worth building over the
+   one-run-at-a-time Workbench.
 
 ## Permission model
 
@@ -96,6 +102,7 @@ searches — it is classified normally; anywhere else it is denied.
 forge                                          status and exit code
 forge check command --workspace DIR [-- PROG ARG...]
 forge check path    --workspace DIR PATH [PATH...]
+forge workbench --workspace DIR [--model ID] [--port 8765]
 ```
 
 Shared options go after the leaf subcommand: `--workspace`, `--agent`, `--json`,
@@ -126,6 +133,65 @@ forge byte --workspace . "fix the failing tests"
 forge byte --workspace . --task-file task.md
 ```
 
+## Workbench (local browser surface)
+
+`forge workbench` serves a single-page view of one Byte run on loopback: the
+task, the model's turns, live tool activity, and any approval the run needs. It
+is the same runtime, the same safety stack, and the same approval decision as
+`forge byte` — only the surface differs. An approval-required operation asks
+the same question, through a browser instead of a terminal.
+
+```bash
+forge workbench --workspace .
+forge workbench --workspace . --model anthropic/claude-sonnet-4
+forge workbench --workspace . --port 9000
+```
+
+It needs `FORGE_OPENROUTER_API_KEY`, exactly as `forge byte` does, and its
+optional dependencies:
+
+```bash
+pip install -e '.[workbench]'    # or '.[dev]', which includes them
+```
+
+Open the printed URL (`http://127.0.0.1:8765` by default). Nothing is launched
+for you: starting a browser is a side effect nobody asked for, and you are
+already at a terminal with the URL in front of you.
+
+What it is, precisely:
+
+- **Loopback only.** The bind address is fixed at `127.0.0.1` and there is no
+  `--host` flag. Adding one would delete a named safety property rather than
+  supply an argument, so it is absent rather than discouraged. `--port` is a
+  port, not a host.
+- **One run at a time.** A second task submitted while a run is in flight is a
+  `409` conflict, not a queue. Queueing would imply the second task eventually
+  runs.
+- **Approvals are single-use capabilities.** Each prompt gets an unguessable
+  id; the first valid answer claims it and any second answer is told it is
+  stale. A refresh recovers the same pending approval, so the page keeps no
+  approval state of its own.
+- **Per-process token, exact Origin.** Every capability-bearing request must
+  present the token minted by this process *and* match `Origin` exactly. The
+  SSE stream uses a separate single-use ticket rather than the main token, and
+  a refused request does not spend it.
+- **No Stop button.** Nothing in the runtime or the executor supports
+  cooperative cancellation, and a Stop button that cannot reliably stop is worse
+  than no button. An unanswered prompt at shutdown is a rejection, not a hang.
+- **Observations are bounded.** Events carry metadata and sizes, never file
+  contents or process output. A slow client drops events and is told it dropped
+  them, rather than being shown a stream with a silent hole in it.
+
+The provider credential is read in the server process and is never threaded
+into the session, the app, or a response body. A page that could read the
+provider key would be a page that could spend your money.
+
+The Workbench is a **local operator surface, not an API**. It is not the
+integration surface n8n or the website will call, and it is not authenticated
+for anything beyond the one loopback tab that minted its token. See
+[docs/architecture.md](docs/architecture.md) for where it sits relative to the
+surfaces still to come.
+
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — layers, surfaces, data flow.
@@ -145,10 +211,14 @@ pip install -e '.[dev]'
 pytest
 ```
 
-This works. There is no HTTP surface, no n8n wiring, no durable memory, and no
-model gateway *client* beyond OpenRouter. What exists is the security
+This works. There is no n8n wiring, no public HTTP API, no durable memory, and
+no model gateway *client* beyond OpenRouter. What exists is the security
 classification layer, the approval step that consumes it, the command execution
-layer, the agent runtime, the model gateway, the `forge` CLI, and their tests.
+layer, the agent runtime, the model gateway, the `forge` CLI, the loopback
+Workbench, and their tests.
+
+The suite makes no network calls. Every test that drives a run uses the offline
+`ScriptedGateway`, so `pytest` needs no credential and spends nothing.
 
 ## Configuration
 

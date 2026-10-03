@@ -40,6 +40,13 @@ Three properties that are decisions rather than defaults:
 
 No internal error is ever converted into a success. A gateway failure raises; a
 refusal becomes a tool result the model can read.
+
+One seam exists for surfaces that need to watch a run: an optional
+:class:`~forge.events.EventSink` passed as ``events``. It receives lifecycle
+events and nothing else, it cannot influence the loop, and ``None`` -- which is
+what every existing caller passes -- changes nothing about behaviour. The
+runtime still holds no opinion about permissions; an observer that could grant
+one would be the same second opinion, wearing a different hat.
 """
 
 from __future__ import annotations
@@ -48,7 +55,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..models.base import CompletionRequest, Message, ModelGateway
+from ..events import EventSink, emit
+from ..models.base import (
+    CompletionRequest,
+    GatewayError,
+    Message,
+    ModelGateway,
+)
 from ..tools.dispatcher import ToolDispatcher, ToolResult, ToolStatus
 from .profile import AgentProfile
 from .state import ConversationState
@@ -121,6 +134,9 @@ class AgentRuntime:
         max_turns: Round-trip ceiling. Clamped to the profile's value and to
             ``MAX_TOOL_TURNS``; it can lower the bound but never raise it.
         max_output_tokens: Per-request output bound.
+        events: Optional observational sink. Emits run and turn lifecycle only;
+            it cannot influence the run in any way. ``None`` -- the default --
+            means nothing is observed and nothing else changes.
     """
 
     def __init__(
@@ -132,11 +148,15 @@ class AgentRuntime:
         model_id: str,
         max_turns: int | None = None,
         max_output_tokens: int | None = None,
+        events: EventSink | None = None,
     ) -> None:
         self.profile = profile
         self.gateway = gateway
         self.dispatcher = dispatcher
         self.model_id = model_id
+        #: Held for observation only. A surface reads what the run did; it has
+        #: no way to say what the run should do.
+        self.events = events
 
         ceiling = MAX_TOOL_TURNS
         if profile.max_tool_turns is not None:
@@ -171,40 +191,78 @@ class AgentRuntime:
         tool_call_count = 0
         denied: list[tuple[str, str]] = []
 
-        for turn in range(self.max_turns):
-            state.turns = turn + 1
+        sink = self.events
+        emit(
+            sink,
+            "run.started",
+            agent=self.profile.name,
+            model=self.model_id,
+            max_turns=str(self.max_turns),
+        )
 
-            response = self.gateway.complete(
-                CompletionRequest(
-                    system=system,
-                    messages=tuple(state.messages),
-                    tools=tool_specs,
-                    model=self.model_id,
-                    max_output_tokens=self.max_output_tokens,
+        try:
+            for turn in range(self.max_turns):
+                state.turns = turn + 1
+
+                response = self.gateway.complete(
+                    CompletionRequest(
+                        system=system,
+                        messages=tuple(state.messages),
+                        tools=tool_specs,
+                        model=self.model_id,
+                        max_output_tokens=self.max_output_tokens,
+                    )
                 )
-            )
 
-            state.add_assistant(response.text, response.tool_calls)
+                state.add_assistant(response.text, response.tool_calls)
 
-            if not response.wants_tools:
-                return RunResult(
+                emit(
+                    sink,
+                    "model.reply",
+                    turn=str(turn + 1),
                     text=response.text,
-                    turns=turn + 1,
-                    tool_calls=tool_call_count,
-                    state=state,
-                    denied=tuple(denied),
+                    tool_calls=str(len(response.tool_calls)),
                 )
 
-            # Sequential, never concurrent: each call gets its own approval
-            # prompt, and two prompts on one terminal at once is not a thing.
-            for call in response.tool_calls:
-                result = self.dispatcher.dispatch(call)
-                tool_call_count += 1
-                state.add_tool_result(call.id, result.to_json(), result.tool)
+                if not response.wants_tools:
+                    emit(
+                        sink,
+                        "run.completed",
+                        turns=str(turn + 1),
+                        tool_calls=str(tool_call_count),
+                        denied=str(len(denied)),
+                    )
+                    return RunResult(
+                        text=response.text,
+                        turns=turn + 1,
+                        tool_calls=tool_call_count,
+                        state=state,
+                        denied=tuple(denied),
+                    )
 
-                if result.status.is_permission_refusal:
-                    denied.append((result.tool, result.detail))
+                # Sequential, never concurrent: each call gets its own approval
+                # prompt, and two prompts on one terminal at once is not a thing.
+                for call in response.tool_calls:
+                    result = self.dispatcher.dispatch(call)
+                    tool_call_count += 1
+                    state.add_tool_result(call.id, result.to_json(), result.tool)
 
+                    if result.status.is_permission_refusal:
+                        denied.append((result.tool, result.detail))
+        except GatewayError as exc:
+            # Observed, then re-raised unchanged. A provider failure still
+            # propagates to the caller; what is added is that a surface watching
+            # learns the run ended rather than simply stopping emitting.
+            emit(sink, "run.failed", reason="gateway_error", detail=str(exc))
+            raise
+
+        emit(
+            sink,
+            "run.failed",
+            reason="max_turns",
+            turns=str(self.max_turns),
+            tool_calls=str(tool_call_count),
+        )
         raise MaxTurnsExceeded(self.max_turns, tool_call_count)
 
 
