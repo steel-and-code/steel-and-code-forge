@@ -16,7 +16,7 @@ forge/
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (522 passing)
+tests/        pytest suite (609 passing)
 docs/         architecture and design notes
 ```
 

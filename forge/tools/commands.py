@@ -169,7 +169,11 @@ DENIED_PROGRAMS: tuple[ProgramRule, ...] = (
     _deny("cmd.sudo", "privilege escalation is denied: an agent that can become root has no permission model", frozenset({"sudo", "su", "doas", "pkexec", "runuser"})),
     # Raw devices and filesystem destruction
     _deny("cmd.disk_table", "disk partitioning and erasure is system-level and can render a host unbootable", frozenset({"fdisk", "parted", "sgdisk", "partprobe", "wipefs", "hdparm", "blkdiscard"})),
-    _deny("cmd.mkfs", "filesystem formatting, irreversible", frozenset({"mkfs", "mke2fs", "newfs", "diskutil", "mkswap"})),
+    # `mkfs` on Linux is a family dispatcher: the real binaries are `mkfs.ext4`,
+    # `mkfs.xfs`, `mkfs.btrfs`, `mkfs.ntfs` and so on, and matching only the bare
+    # name missed every one of them. The `mkfs.*` entry is matched as a literal
+    # dot-prefix, NOT as a general prefix -- `mkfsext4` must not match.
+    _deny("cmd.mkfs", "filesystem formatting, irreversible", frozenset({"mkfs", "mkfs.*", "mke2fs", "newfs", "diskutil", "mkswap"})),
     _deny("cmd.device_format", "device formatting or erasure", frozenset({"nvme"})),
     # System service and power state
     _deny("cmd.systemctl", "system service modification is outside the workspace", frozenset({"systemctl"})),
@@ -187,11 +191,10 @@ DENIED_PROGRAMS: tuple[ProgramRule, ...] = (
     _deny("cmd.user_pkg", "package installation is denied", frozenset({"brew", "gem", "cargo", "conda", "go"}), subcommands=frozenset({"install", "add", "get"})),
     # Credential inspection: the agent would see a secret
     _deny("cmd.env_dump", "environment dump would expose credential values", frozenset({"env", "printenv", "set", "export"})),
-    _deny("cmd.credential_inspect", "credential inspection is denied", frozenset({"aws", "gcloud", "gh", "docker", "vault"}), subcommands=frozenset({"configure", "auth"})),
+    _deny("cmd.credential_inspect", "credential inspection is denied", frozenset({"aws", "gcloud", "gh", "docker", "vault"}), subcommands=frozenset({"configure", "auth", "login"})),
     # Resource exhaustion
     _deny("cmd.fork_bomb", "fork bomb", _ANY, flags=frozenset({":(){", ":|:&"})),
     # Kernel, network, user management
-    _deny("cmd.kernel", "kernel and device module management is system-level", frozenset({"modprobe", "insmod", "rmmod"})),
     _deny("cmd.firewall", "network configuration changes are system-level", frozenset({"iptables", "nft", "ufw", "firewall-cmd"})),
     _deny("cmd.user_mgmt", "user and group management is system-level", frozenset({"useradd", "usermod", "groupadd", "passwd", "chpasswd", "visudo"})),
     # Git: history rewrite and force push
@@ -200,9 +203,36 @@ DENIED_PROGRAMS: tuple[ProgramRule, ...] = (
     _deny("cmd.git_destructive", "destructive git state change", _GIT, subcommands=frozenset({"reflog"}), args_contain=frozenset({"expire"})),
     _deny("cmd.git_gc", "aggressive gc is irreversible", _GIT, subcommands=frozenset({"gc"}), flags=frozenset({"--prune=now", "--aggressive"})),
     # Filesystem repair tools that can corrupt
-    _deny("cmd.fs_repair", "filesystem repair or attribute manipulation", frozenset({"debugfs", "tune2fs", "resize2fs", "e2fsck", "xfs_repair", "chattr", "lsattr"})),
+    _deny("cmd.fs_repair", "filesystem repair or attribute manipulation", frozenset({"debugfs", "tune2fs", "resize2fs", "e2fsck", "xfs_repair", "chattr", "lsattr", "setfattr"})),
     # Containers that can mount the host
     _deny("cmd.docker_system", "container system pruning is destructive", frozenset({"docker", "podman"}), subcommands=frozenset({"system"})),
+    # Sysctl writes change kernel parameters. `sysctl -a` is a read and stays
+    # allowed; only the write form is denied.
+    _deny("cmd.kernel", "kernel and device module management is system-level", frozenset({"modprobe", "insmod", "rmmod"})),
+    # Only the write forms. `-w` sets a parameter directly and `-p` applies a
+    # config file, so both change the host and are denied. Reading kernel
+    # parameters (`sysctl -a`, or a bare name) is harmless and stays allowed.
+    #
+    # This cannot simply join cmd.kernel: a rule's flag requirement applies to
+    # every program in its set, and modprobe/insmod/rmmod take no such flag.
+    _deny(
+        "cmd.sysctl_write",
+        "writing a kernel parameter is a host configuration change",
+        frozenset({"sysctl"}),
+        flags=frozenset({"-w", "-p"}),
+    ),
+    # `sc` reaches the same service state as `systemctl`/`service`. Named
+    # separately because `sc` is a short, ambiguous program name.
+    _deny("cmd.service_sc", "system service modification is outside the workspace", frozenset({"sc"})),
+    # Destructive git operations the spec lists but no shipped rule covered.
+    _deny("cmd.git_reset_hard", "history rewrite is irreversible for other clones", _GIT, subcommands=frozenset({"reset"}), flags=frozenset({"--hard"})),
+    _deny("cmd.git_clean", "clean discards uncommitted work irrecoverably", _GIT, subcommands=frozenset({"clean"}), flags=frozenset({"-f", "--force"})),
+    _deny("cmd.git_branch_delete", "branch deletion destroys work, sometimes other people's", _GIT, subcommands=frozenset({"branch"}), flags=frozenset({"-d", "-D"})),
+    _deny("cmd.git_update_ref_delete", "ref deletion destroys work", _GIT, subcommands=frozenset({"update-ref"}), flags=frozenset({"-d", "--delete"})),
+    # `git push --delete origin x` and the older `git push origin :x` spelling
+    # both delete a remote ref. Both forms are denied; a plain push stays gated.
+    _deny("cmd.git_push_delete", "pushing a deletion destroys the remote ref", _GIT, subcommands=frozenset({"push"}), flags=frozenset({"--delete"})),
+    _deny("cmd.git_push_refspec_delete", "pushing a deletion destroys the remote ref", _GIT, subcommands=frozenset({"push"}), args_contain=frozenset({":", ":refs/heads/"})),
 )
 
 # --------------------------------------------------------------------------
@@ -219,7 +249,20 @@ APPROVAL_PROGRAMS: tuple[ProgramRule, ...] = (
     _gate("cmd.git_ref_write", "ref manipulation is powerful and rarely benign", _GIT, subcommands=frozenset({"update-ref", "symbolic-ref", "replace"})),
     _gate("cmd.git_config_global", "changes machine-wide git behaviour", _GIT, subcommands=frozenset({"config"}), flags=frozenset({"--global", "--system"})),
     # Permission changes inside the workspace
-    _gate("cmd.chmod", "permission change", frozenset({"chmod", "chown", "chgrp", "setfacl"})),
+    _gate("cmd.chmod", "permission change", frozenset({"chmod", "chown", "chgrp", "setfacl", "umask"})),
+    # Arbitrary filesystem moves. `write_file` and `patch_file` are automatic
+    # inside the workspace, but a `cp`/`mv`/`ln` invocation is a command, and
+    # v1 gates them rather than reasoning about whether a given copy is safe.
+    # Containment still denies any target outside the workspace.
+    _gate("cmd.file_move", "copy, move, and link operations are approval-required in v1", frozenset({"cp", "mv", "ln"})),
+    # `git rebase` rewrites history. The spec distinguishes rewriting published
+    # history (denied) from ordinary development (approval), and a static
+    # classifier cannot tell whether a ref is published, so approval is the
+    # conservative v1 answer.
+    _gate("cmd.git_rebase", "rebase rewrites history; approval is the conservative v1 answer", _GIT, subcommands=frozenset({"rebase"})),
+    # `shred` and a file-targeting `dd` overwrite are destructive but scoped and
+    # knowable. Device targets are still denied outright by the device check.
+    _gate("cmd.shred", "overwrite is destructive and irreversible", frozenset({"shred"})),
     # Network egress. Not an implicit web interface.
     _gate("cmd.net_egress", "network egress is approval-required; arbitrary shell access is not a web interface", frozenset({"curl", "wget", "http", "httpie", "nc", "ncat", "netcat", "telnet", "ftp", "sftp", "scp", "ssh", "rsync", "socat"})),
     # Process control by pattern: cannot be resolved to an owned PID
@@ -390,8 +433,32 @@ class CommandClassifier:
                 found.update(f"-{ch}" for ch in arg[1:])
         return frozenset(found)
 
+    @staticmethod
+    def _program_matches(rule: ProgramRule, cmd: Command) -> bool:
+        """Whether the rule's program set covers this command's program.
+
+        `"*"` in the set means any program. Otherwise the normalised basename
+        must be a member -- with one exception: an entry of the form `mkfs.*`
+        matches the `mkfs.<fstype>` family of dispatchers.
+
+        The wildcard is deliberately a *dot-prefix*, not a bare prefix. The
+        difference is not cosmetic: `mkfsext4` is an unrelated program and must
+        not be denied as filesystem formatting, while `mkfs.ext4` is the very
+        binary the spec names. A general `mkfs` prefix would over-deny on a
+        name that shares characters.
+        """
+        if "*" in rule.programs:
+            return True
+        program = cmd.normalized_program
+        if program in rule.programs:
+            return True
+        return any(
+            entry.endswith(".*") and program.startswith(entry[:-1])
+            for entry in rule.programs
+        )
+
     def _match(self, rule: ProgramRule, cmd: Command) -> bool:
-        if "*" not in rule.programs and cmd.normalized_program not in rule.programs:
+        if not self._program_matches(rule, cmd):
             return False
         if rule.subcommands is not None:
             non_flag = [a.casefold() for a in cmd.args if not a.startswith("-")]
@@ -479,6 +546,39 @@ class CommandClassifier:
                     )
         return None
 
+    def _classify_file_overwrite(self, cmd: Command) -> tuple[Classification, str, str] | None:
+        """Gate `dd` when it writes a regular file rather than a device.
+
+        The spec treats these as two different operations: `dd of=/dev/...` is
+        raw device erasure and denied outright, while `dd of=<file>` is
+        "destructive but scoped and knowable" and approval-required.
+
+        This is the device check read from the other side. Rather than
+        duplicating the device pattern, it asks whether *any* operand names a
+        device; if none does, and an `of=` operand is present, the write is a
+        file write and is gated. The earlier device classifier has already had its
+        chance to deny by this point, so a genuine device write never reaches
+        here.
+        """
+        if cmd.normalized_program != "dd":
+            return None
+
+        writes_file = False
+        for arg in cmd.args:
+            candidate = arg.split("=", 1)[1] if "=" in arg else arg
+            if _DEVICE_PATH.match(candidate.strip()):
+                # A device target. The device classifier owns this case.
+                return None
+            if arg.startswith("of="):
+                writes_file = True
+        if not writes_file:
+            return None
+        return (
+            Classification.APPROVAL_REQUIRED,
+            "cmd.dd_file_write",
+            "dd overwrites its output file; the operation is destructive but scoped and knowable",
+        )
+
     def _classify_wildcard_delete(self, cmd: Command, targets: tuple[Path, ...]) -> tuple[Classification, str, str] | None:
         """Deny destructive deletes whose targets cannot be enumerated.
 
@@ -525,6 +625,54 @@ class CommandClassifier:
                 "recursive delete; targets could not be enumerated",
             )
 
+        return None
+
+    @staticmethod
+    def _is_checkout_discard(cmd: Command) -> bool:
+        """Whether this is the documented destructive `git checkout -- .` form.
+
+        The spec names `git checkout -- .` specifically. The `--` here is a
+        separator that tells git to treat what follows as paths, so it is not a
+        flag and cannot be matched by the flag table. Matching is therefore on
+        the shape: a `--` separator followed by a path that names the whole
+        working tree.
+
+        Deliberately narrow. A plain `git checkout main` or `git checkout -- file`
+        is ordinary development and stays allowed; only the tree-wide discard is
+        denied, because only that form silently destroys uncommitted work.
+        """
+        sub = CommandClassifier._subcommand(cmd.args)
+        if sub != "checkout":
+            return False
+        if "--" not in cmd.args:
+            return False
+        after = cmd.args[cmd.args.index("--") + 1 :]
+        if not after:
+            return False
+        # Paths are the only thing that can follow the separator here, so the
+        # last non-flag token decides.
+        paths = [a for a in after if not a.startswith("-")]
+        return bool(paths) and all(p in {".", "./"} for p in paths)
+
+    def _classify_push_refspec_delete(self, cmd: Command) -> tuple[Classification, str, str] | None:
+        """Deny `git push origin :branch`, the older spelling of a ref deletion.
+
+        `git push --delete origin x` is caught by the flag-based rule. This form
+        has no flag: a refspec beginning with a colon is a delete, and it is a
+        conventional enough spelling that matching only `--delete` would leave a
+        documented destructive operation approved.
+        """
+        if cmd.normalized_program != "git":
+            return None
+        if CommandClassifier._subcommand(cmd.args) != "push":
+            return None
+        for arg in cmd.args[1:]:
+            if arg.startswith(":") or arg.startswith(":refs/"):
+                return (
+                    Classification.DENY,
+                    "cmd.git_push_refspec_delete",
+                    "pushing an empty refspec deletes the remote ref",
+                )
         return None
 
     def _classify_inline_code(self, cmd: Command) -> tuple[Classification, str, str] | None:
@@ -590,6 +738,22 @@ class CommandClassifier:
             Classification.APPROVAL_REQUIRED,
             "cmd.sql_ambiguous",
             "SQL statement could not be classified as non-destructive",
+        )
+
+    def _classify_checkout_discard(self, cmd: Command) -> tuple[Classification, str, str] | None:
+        """Deny the tree-wide `git checkout -- .` discard form.
+
+        The generic ``cmd.git_checkout_discard`` rule exists only so the deny
+        appears in ``matched_rules`` with a stable id; the actual decision is made
+        here, because the documented form is a specific argument shape rather
+        than a flag or subcommand.
+        """
+        if not self._is_checkout_discard(cmd):
+            return None
+        return (
+            Classification.DENY,
+            "cmd.git_checkout_discard",
+            "git checkout -- . discards every uncommitted change in the working tree",
         )
 
     def _classify_kill(self, cmd: Command, targets: tuple[Path, ...]) -> tuple[Classification, str, str] | None:
@@ -719,6 +883,9 @@ class CommandClassifier:
             lambda: self._classify_inline_code(command),
             lambda: self._classify_sql(command),
             lambda: self._classify_kill(command, targets),
+            lambda: self._classify_checkout_discard(command),
+            lambda: self._classify_file_overwrite(command),
+            lambda: self._classify_push_refspec_delete(command),
         ):
             outcome = classify_fn()
             if outcome is not None:

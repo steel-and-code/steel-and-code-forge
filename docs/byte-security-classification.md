@@ -308,7 +308,14 @@ required** where a human might legitimately want it.
 | Operation | Pattern | Why denied rather than approved |
 | --- | --- | --- |
 | Force push | `git push --force`, `git push -f`, `git push --force-with-lease`, `git send-pack --force` | Destroys other people's commits. No legitimate need in v1. `--force-with-lease` is still a force push. |
-| Destructive git history | `git reset --hard` on a shared ref, `git rebase` rewriting published history, `git filter-branch`, `git filter-repo`, `git push --delete`, `git push origin :branch`, `git reflog expire`, `git gc --prune=now --aggressive`, `git checkout -- .`, `git clean -fdx` | Irreversible for anyone else. Recovering is possible only with help and only sometimes. |
+| Destructive git history | `git reset --hard`, `git filter-branch`, `git filter-repo`, `git push --delete`, `git push origin :branch`, `git reflog expire`, `git gc --prune=now --aggressive`, `git checkout -- .`, `git clean -fdx` | Irreversible for anyone else. Recovering is possible only with help and only sometimes. |
+> **`git rebase` is classified here as approval-required, not denied.** The
+> original text denied it conditionally — "rewriting published history" — but
+> whether a ref is published depends on the remote's state, which a static
+> classifier cannot query. An unevaluable condition must not be treated as
+> satisfied, so v1 gates every `git rebase` and leaves the judgement to the
+> operator. See the rebase ruling in [byte-tools.md](byte-tools.md).
+
 | Branch deletion | `git branch -D`, `git branch -d` on main/master, `git update-ref -d` | Deletes work, sometimes other people's. |
 | sudo / su | `sudo`, `su`, `doas`, `pkexec`, `runuser` | System-level by definition. An agent that can become root has no meaningful permission model. |
 | System service modification | `systemctl start/stop/restart/disable/enable/mask`, `service ...`, `launchctl load/unload`, `sc stop/start` | Changes machine state outside the workspace. Not recoverable by re-running an agent. |
@@ -336,7 +343,7 @@ required** where a human might legitimately want it.
 | Recursive deletion inside workspace | `rm -r`, `rm -rf`, `rm --recursive`, `find ... -delete`, `find ... -exec rm`, `shutil.rmtree` | `rm -rf` on a stale build directory is routine. The targets are known and inspectable. Approval with the resolved target list displayed makes this safe. |
 | Recursive deletion with a glob | `rm -rf *`, `rm -rf ./*`, `rm -rf build/*`, `rm -rf **/*.tmp`, any unresolved wildcard in a recursive delete | **Denied in v1.** See the wildcard section below. |
 | Explicit recursive deletion of known paths | `rm -rf build`, `rm -rf ./dist`, `rm -rf node_modules` — named targets inside the workspace | Approval-required. The targets are known and shown in the prompt. |
-| Overwrite / truncate | `> file`, `truncate`, `shred`, `dd of=<file>` | Destructive but scoped and knowable. |
+| Overwrite / truncate | `> file`, `truncate`, `shred`, `dd of=<file>` | Destructive but scoped and knowable. `shred` and `dd` appear in both tables; v1 splits them by target — a device target is denied as raw erasure, an ordinary file target is approval-required. |
 | Bulk rewrite in workspace | `sed -i`, `find -exec sed`, in-place rewrites across many files | Legitimate refactors. The diff is knowable. |
 | Git commit | `git commit`, `git commit -a`, `git merge` creating a commit | The point is human judgement of the message and intent. Already policy. |
 | Git push (non-force) | `git push` | Recoverable locally, but publishes. Already policy. |

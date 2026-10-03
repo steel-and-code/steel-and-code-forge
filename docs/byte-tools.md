@@ -614,8 +614,8 @@ built on top without re-running any of these checks. `approval.py` builds on
 exactly those fields and adds nothing of its own.
 
 Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
-`tests/test_commands.py` (174), `tests/test_approval.py` (100),
-`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 522 passing.
+`tests/test_commands.py` (261), `tests/test_approval.py` (100),
+`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 609 passing.
 
 Implemented: workspace containment, secret classification, command
 classification, terminal approval, the terminal interface, and command execution.
@@ -733,6 +733,104 @@ availability check and the same strict parse, so it is not a bypass.
 Two things this step deliberately does not do. It performs no git lookup, so
 git context is only what a caller supplies. And it executes nothing — an
 `ApprovalOutcome` is a handoff to a future execution layer.
+
+### Three policy rulings the classifier could not infer
+
+Closing the gaps between the shipped rule tables and
+[byte-security-classification.md](byte-security-classification.md) required
+three decisions the specification did not settle on its own. They are recorded
+here rather than left implicit in the rule tables.
+
+#### `cp`, `mv`, and `ln` are approval-required inside the workspace
+
+The permission model above says reads, edits, searches, tests, and git
+inspection are automatic inside the workspace, and separately that `write_file`
+and `patch_file` are automatic. That language covers the *structured tools*.
+
+It does not cover an arbitrary `cp`/`mv`/`ln` invocation, which is a command
+carrying whatever arguments the caller chose. v1 treats the three as
+approval-required without distinguishing a safe `cp` from an unsafe one.
+
+Containment is unaffected: any target resolving outside the workspace is still
+denied outright, and that denial is the stronger of the two.
+
+#### `git rebase` is approval-required, not denied
+
+**In v1, `git rebase` is APPROVAL_REQUIRED.** It is not denied.
+
+The classification spec denies `git rebase` conditionally — "rewriting published
+history" — while listing rebase under approval as "everyday development". The
+condition is about whether the history being rewritten has already been shared,
+and **a static classifier cannot determine whether a ref is published or
+shared**: that depends on the remote's state, which Forge does not query and
+v1 has no mechanism to query. So the denial condition cannot be evaluated, and
+an unevaluable condition must not be treated as satisfied.
+
+Approval is the conservative reading: it does not pretend to know, and it leaves
+the judgement with the operator, who can see the ref in the prompt. Denying all
+rebases would be stricter than the spec requires and would block ordinary work.
+
+#### `git checkout -- .` is denied by argument shape, not by rule
+
+The spec names this exact form. A rule-table entry cannot express it, because a
+rule matching "any `git checkout`" would deny everyday branch switching and a
+rule matching "any `--`" would match unrelated flags.
+
+It is therefore matched on shape in `_is_checkout_discard`: a `checkout`
+subcommand, a `--` separator, and only tree-wide paths (`.` or `./`) after it.
+`git checkout main`, `git checkout -b feature`, and `git checkout -- file.txt`
+all stay allowed.
+
+### Rules added to match the spec
+
+The following operations appear in the classification spec but had no entry in
+the shipped tables, so they fell through to the convenience case and classified
+ALLOW. Each is now covered:
+
+| Rule | Treatment | Form |
+| --- | --- | --- |
+| `cmd.mkfs` (`mkfs.<fstype>`) | denied | any `mkfs.` dispatcher, dot-prefixed so `mkfsext4` is unaffected |
+| `cmd.git_reset_hard` | denied | `git reset --hard` |
+| `cmd.git_clean` | denied | `git clean -f`/`--force`, with or without `-x`/`-d` |
+| `cmd.git_checkout_discard` | denied | `git checkout -- .` and `-- ./` only |
+| `cmd.git_branch_delete` | denied | `git branch -d`/`-D` |
+| `cmd.git_update_ref_delete` | denied | `git update-ref -d`/`--delete` |
+| `cmd.git_push_delete` | denied | `git push --delete` |
+| `cmd.git_push_refspec_delete` | denied | `git push origin :branch` |
+| `cmd.sysctl_write` | denied | `sysctl -w` and `sysctl -p`; reads stay allowed |
+| `cmd.service_sc` | denied | `sc` |
+| `cmd.fs_repair` | denied | extended to `setfattr` |
+| `cmd.credential_inspect` | denied | extended to `docker login` |
+| `cmd.git_rebase` | approval | `git rebase` |
+| `cmd.file_move` | approval | `cp`, `mv`, `ln` |
+| `cmd.shred` | approval | `shred` of a file; device targets stay denied |
+| `cmd.dd_file_write` | approval | `dd of=<file>`; device outputs stay denied |
+| `cmd.chmod` | approval | extended to `umask` |
+
+#### `shred` and `dd` are split by target, not by program
+
+The classification spec lists `shred` and `dd` in both its denied table and its
+approval-required table without stating how the two coexist. v1 resolves it by
+**where the bytes land**:
+
+| Form | Classification | Reasoning |
+| --- | --- | --- |
+| `shred /dev/sda`, `dd of=/dev/sda` | **DENY** | Raw device erasure. Irrecoverable, and no approval makes it safe. |
+| `shred notes.txt`, `dd if=a of=b.bin` | **APPROVAL_REQUIRED** | Destructive but scoped and knowable. The operator sees the exact target. |
+
+The device test runs first, so a device target is denied before the file-target
+gate is reached. The distinction is made by the `of=` operand for `dd` and by
+the target path for `shred`, not by the program name — the same program is
+gated or denied depending on what it is aimed at.
+
+Nothing was loosened. `docker system prune` remains denied even though the spec
+lists it under approval-required: that over-blocking predates this pass and a
+stricter existing denial is left alone rather than relaxed to match a table.
+
+**Still undecided:** arbitrary repository executables (`./configure`,
+`./scripts/check.sh`) classify ALLOW under the documented convenience case. That
+is byte-security-classification.md's own item 9 — the largest soft spot in the
+design — and narrowing it is a policy change rather than a defect fix.
 
 ### Command execution
 

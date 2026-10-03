@@ -905,3 +905,482 @@ def test_classification_helpers_agree(classifier: CommandClassifier) -> None:
     assert deny.denied and not deny.allowed and not deny.requires_approval
     assert gate.requires_approval and not gate.denied
     assert allow.allowed and not allow.denied and not allow.requires_approval
+
+# ==========================================================================
+# Rules added to close gaps between the shipped tables and the spec
+# ==========================================================================
+#
+# Each rule below existed in docs/byte-security-classification.md but had no
+# matching entry in DENIED_PROGRAMS or APPROVAL_PROGRAMS, so the command fell
+# through to the convenience case and classified ALLOW.
+#
+# The negative cases matter more than the positives here. Several of these rules
+# share a program with an existing rule or with ordinary development commands, so
+# a careless flag set would turn a normal command into a denial. Every addition
+# is paired with the case that must stay open.
+
+
+def _classify_one(
+    classifier: CommandClassifier, *args: str, workspace: Workspace | None = None
+):
+    """Classify a single command and return its verdict."""
+    return classifier.classify(Command(args[0], tuple(args[1:])))
+
+
+# --------------------------------------------------------------------------
+# Filesystem formatting: the mkfs.<fstype> family
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fstype", ["ext4", "xfs", "btrfs", "ntfs", "fat32"])
+def test_mkfs_compound_binary_is_denied(
+    classifier: CommandClassifier, fstype: str
+) -> None:
+    """The real binaries are mkfs.ext4 and friends; only bare `mkfs` was matched."""
+    verdict = _classify_one(classifier, f"mkfs.{fstype}", "/dev/sda")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.mkfs"
+
+
+def test_bare_mkfs_is_still_denied(classifier: CommandClassifier) -> None:
+    assert _classify_one(classifier, "mkfs", "/dev/sda").denied
+
+
+@pytest.mark.parametrize("name", ["mkfsext4", "mkfoo.bar", "mk", "notmkfs.ext4"])
+def test_mkfs_wildcard_does_not_over_match(
+    classifier: CommandClassifier, name: str
+) -> None:
+    """The wildcard is a dot-prefix, not a bare prefix.
+
+    `mkfsext4` is an unrelated program. A general `mkfs` prefix would deny it as
+    filesystem formatting, which is a false positive on a name that merely
+    shares leading characters.
+    """
+    verdict = _classify_one(classifier, name, "/dev/sda")
+
+    assert not verdict.denied
+
+
+def test_other_formatting_binaries_remain_denied(
+    classifier: CommandClassifier,
+) -> None:
+    for program in ("mke2fs", "mkswap", "newfs"):
+        assert _classify_one(classifier, program, "/dev/sda").denied, program
+
+
+# --------------------------------------------------------------------------
+# Destructive git history
+# --------------------------------------------------------------------------
+
+
+def test_git_reset_hard_is_denied(classifier: CommandClassifier) -> None:
+    verdict = _classify_one(classifier, "git", "reset", "--hard")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_reset_hard"
+
+
+def test_git_reset_hard_with_a_target_is_denied(
+    classifier: CommandClassifier,
+) -> None:
+    assert _classify_one(classifier, "git", "reset", "--hard", "HEAD~1").denied
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("git", "reset", "--soft", "HEAD~1"), ("git", "reset", "HEAD~1"), ("git", "reset")],
+)
+def test_non_hard_reset_is_not_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """A soft or mixed reset is not the spec's destructive operation."""
+    verdict = _classify_one(classifier, *args)
+
+    assert not verdict.denied
+
+
+@pytest.mark.parametrize("args", [("git", "clean", "-fdx"), ("git", "clean", "-fd"), ("git", "clean", "--force")])
+def test_git_clean_destructive_is_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_clean"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("git", "clean", "-n"), ("git", "clean", "--dry-run"), ("git", "clean")],
+)
+def test_git_clean_dry_run_is_not_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    verdict = _classify_one(classifier, *args)
+
+    assert not verdict.denied
+
+
+@pytest.mark.parametrize("path", [".", "./"])
+def test_git_checkout_discard_is_denied(
+    classifier: CommandClassifier, path: str
+) -> None:
+    """The spec names `git checkout -- .` specifically."""
+    verdict = _classify_one(classifier, "git", "checkout", "--", path)
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_checkout_discard"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("git", "checkout", "main"),
+        ("git", "checkout", "-b", "feature"),
+        ("git", "checkout", "--", "file.txt"),
+        ("git", "checkout"),
+    ],
+)
+def test_ordinary_git_checkout_is_not_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Only the tree-wide discard is denied.
+
+    A rule matching "any checkout" would deny everyday development, which is the
+    over-blocking the classifier is supposed to avoid.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert not verdict.denied
+
+
+@pytest.mark.parametrize("flag", ["-d", "-D"])
+def test_git_branch_deletion_is_denied(
+    classifier: CommandClassifier, flag: str
+) -> None:
+    verdict = _classify_one(classifier, "git", "branch", flag, "feature")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_branch_delete"
+
+
+@pytest.mark.parametrize(
+    "args", [("git", "branch"), ("git", "branch", "-a"), ("git", "branch", "new")]
+)
+def test_git_branch_without_deletion_is_not_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    verdict = _classify_one(classifier, *args)
+
+    assert not verdict.denied
+
+
+@pytest.mark.parametrize("flag", ["-d", "--delete"])
+def test_git_update_ref_delete_is_denied(
+    classifier: CommandClassifier, flag: str
+) -> None:
+    verdict = _classify_one(classifier, "git", "update-ref", flag, "refs/heads/x")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_update_ref_delete"
+
+
+def test_git_update_ref_write_stays_approval_required(
+    classifier: CommandClassifier,
+) -> None:
+    """Ref writes stay gated; only the delete form is denied."""
+    verdict = _classify_one(classifier, "git", "update-ref", "refs/heads/x", "abc123")
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.git_ref_write"
+
+
+def test_git_push_delete_flag_is_denied(classifier: CommandClassifier) -> None:
+    verdict = _classify_one(classifier, "git", "push", "--delete", "origin", "feature")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_push_delete"
+
+
+def test_git_push_empty_refspec_is_denied(classifier: CommandClassifier) -> None:
+    """`git push origin :branch` is the older spelling of the same deletion."""
+    verdict = _classify_one(classifier, "git", "push", "origin", ":feature")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.git_push_refspec_delete"
+
+
+@pytest.mark.parametrize(
+    "args", [("git", "push"), ("git", "push", "origin", "main"), ("git", "push", "origin")]
+)
+def test_ordinary_git_push_stays_approval_required(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.git_push"
+
+
+# --------------------------------------------------------------------------
+# System administration
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("sysctl", "-w", "net.ipv4.ip_forward=1"),
+        # `-p` applies a config file, which is the same host change by another
+        # route. It was the one write form the spec did not name.
+        ("sysctl", "-p"),
+        ("sysctl", "-p", "/etc/sysctl.conf"),
+        ("sysctl", "-p", "custom.conf"),
+    ],
+)
+def test_sysctl_write_forms_are_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.denied, args
+    assert verdict.rule == "cmd.sysctl_write"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("sysctl", "-a"),
+        ("sysctl", "net.ipv4.ip_forward"),
+        ("sysctl", "-n", "net.ipv4.ip_forward"),
+        ("sysctl"),
+    ],
+)
+def test_sysctl_read_forms_are_not_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Reading kernel parameters is harmless.
+
+    Every write form is denied and every read form stays open, which is what
+    makes the rule a write-only gate rather than a blanket `sysctl` denial.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert not verdict.denied, args
+
+
+def test_module_tools_remain_denied(classifier: CommandClassifier) -> None:
+    for program in ("modprobe", "insmod", "rmmod"):
+        assert _classify_one(classifier, program, "x").denied, program
+
+
+def test_setfattr_is_denied(classifier: CommandClassifier) -> None:
+    verdict = _classify_one(classifier, "setfattr", "-n", "user.x", "file")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.fs_repair"
+
+
+def test_sc_service_control_is_denied(classifier: CommandClassifier) -> None:
+    verdict = _classify_one(classifier, "sc", "stop", "nginx")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.service_sc"
+
+
+@pytest.mark.parametrize(
+    "program", ["systemctl", "service", "launchctl"]
+)
+def test_other_service_controls_remain_denied(
+    classifier: CommandClassifier, program: str
+) -> None:
+    assert _classify_one(classifier, program, "restart", "x").denied, program
+
+
+# --------------------------------------------------------------------------
+# Credential inspection
+# --------------------------------------------------------------------------
+
+
+def test_docker_login_is_denied(classifier: CommandClassifier) -> None:
+    verdict = _classify_one(
+        classifier, "docker", "login", "--password", "hunter2"
+    )
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.credential_inspect"
+
+
+@pytest.mark.parametrize(
+    "args", [("aws", "configure", "list"), ("gh", "auth", "token")]
+)
+def test_existing_credential_inspection_stays_denied(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """`docker login` joins the rule; the pre-existing forms are unaffected."""
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.denied, args
+
+
+@pytest.mark.parametrize("args", [("docker", "ps"), ("docker", "images")])
+def test_read_only_docker_commands_are_not_gated(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """Listing containers is inspection, and the spec gates only the
+    host-mounting forms (`run`, `exec`, `stop`, `rm`, `kill`).
+
+    Added as a negative case so that widening `cmd.credential_inspect` to
+    include `login` cannot quietly widen anything else.
+    """
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.classification is Classification.ALLOW, args
+
+
+# --------------------------------------------------------------------------
+# Destructive file operations
+# --------------------------------------------------------------------------
+
+
+def test_shred_of_a_file_is_approval_required(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    verdict = _classify_one(classifier, "shred", "notes.txt")
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.shred"
+
+
+def test_shred_of_a_device_is_still_denied(
+    classifier: CommandClassifier,
+) -> None:
+    """Device erasure was already denied and stays denied."""
+    assert _classify_one(classifier, "shred", "/dev/sda").denied
+
+
+def test_dd_writing_a_file_is_approval_required(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    verdict = _classify_one(classifier, "dd", "if=a", "of=b.bin")
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.dd_file_write"
+
+
+def test_dd_writing_a_device_is_still_denied(
+    classifier: CommandClassifier,
+) -> None:
+    verdict = _classify_one(classifier, "dd", "if=a", "of=/dev/sda")
+
+    assert verdict.denied
+    assert verdict.rule == "cmd.device_write"
+
+
+def test_dd_without_an_output_target_is_not_gated(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    """`dd if=x` alone writes nowhere, so there is nothing to gate."""
+    verdict = _classify_one(classifier, "dd", "if=notes.txt")
+
+    assert not verdict.requires_approval
+
+
+def test_umask_is_approval_required(
+    classifier: CommandClassifier, workspace: Workspace
+) -> None:
+    verdict = _classify_one(classifier, "umask", "077")
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.chmod"
+
+
+@pytest.mark.parametrize("program", ["cp", "mv", "ln"])
+def test_file_move_commands_are_approval_required(
+    classifier: CommandClassifier, workspace: Workspace, program: str
+) -> None:
+    """Arbitrary filesystem commands are gated even inside the workspace.
+
+    The automatic-write language covers the structured `write_file` and
+    `patch_file` tools, not arbitrary commands. v1 does not try to tell a safe
+    `cp` from an unsafe one.
+    """
+    verdict = _classify_one(classifier, program, "a", "b")
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.file_move"
+
+
+@pytest.mark.parametrize("program", ["cp", "mv", "ln"])
+def test_file_move_outside_workspace_is_still_denied_by_containment(
+    classifier: CommandClassifier, tmp_path: Path, program: str
+) -> None:
+    """Gating the in-workspace form must not weaken the boundary check."""
+    verdict = _classify_one(classifier, program, "a", str(tmp_path / "b"))
+
+    assert verdict.denied
+
+
+# --------------------------------------------------------------------------
+# git rebase
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args", [("git", "rebase", "main"), ("git", "rebase", "-i", "HEAD~3")]
+)
+def test_git_rebase_is_approval_required(
+    classifier: CommandClassifier, args: tuple[str, ...]
+) -> None:
+    """The spec's denial is conditional on a published ref, which a static
+    classifier cannot determine, so approval is the conservative answer."""
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.requires_approval
+    assert verdict.rule == "cmd.git_rebase"
+
+
+# --------------------------------------------------------------------------
+# Nothing was weakened
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (("sudo", "ls"), "deny"),
+        (("env",), "deny"),
+        (("systemctl", "restart", "x"), "deny"),
+        (("pip", "install", "x"), "deny"),
+        (("npm", "install",), "deny"),
+        (("docker", "system", "prune"), "deny"),
+        (("rm", "-rf", "*"), "deny"),
+        (("mkfs.ext4", "/dev/sda"), "deny"),
+        (("git", "push", "--force"), "deny"),
+        (("git", "filter-repo"), "deny"),
+        (("iptables", "-F"), "deny"),
+        (("useradd", "bob"), "deny"),
+    ],
+)
+def test_existing_denials_are_preserved(
+    classifier: CommandClassifier, args: tuple[str, ...], expected: str
+) -> None:
+    """This pass only ever added rules; nothing was loosened."""
+    verdict = _classify_one(classifier, *args)
+
+    assert verdict.classification.value == expected
+
+
+def test_docker_system_prune_remains_denied_not_downgraded(
+    classifier: CommandClassifier,
+) -> None:
+    """A stricter existing denial must not be weakened to match the spec table.
+
+    The spec lists `docker system prune` under approval-required, but the shipped
+    rule denies it. That over-blocking predates this pass and is left alone.
+    """
+    verdict = _classify_one(classifier, "docker", "system", "prune")
+
+    assert verdict.denied
+
