@@ -59,17 +59,25 @@ from .render import (
 
 __all__ = ["main", "build_parser"]
 
-# The requester identity this CLI reports. Deliberately *not* "byte": there is no
-# Byte runtime yet, so claiming Byte requested an operation would be a
-# fabrication an operator could reasonably act on. When ``forge byte`` exists it
-# passes "byte" explicitly, and that will be a true statement.
+#: The requester identity this CLI reports when the *operator* invokes a check.
+#: `forge byte` passes "byte" explicitly, because there the request genuinely is
+#: Byte's and claiming otherwise would make the approval prompt misleading.
 DEFAULT_AGENT = "forge-cli"
 
-# Workspace roots are explicit by settled decision -- not a default, not
-# inferred. The environment variable is an explicit statement of intent from
-# whoever set it; falling back to the current directory would not be, and over
-# SSH a wrong working directory is exactly the failure that matters.
+#: Workspace roots are explicit by settled decision -- not a default, not
+#: inferred. The environment variable is an explicit statement of intent from
+#: whoever set it; falling back to the current directory would not be, and over
+#: SSH a wrong working directory is exactly the failure that matters.
 WORKSPACE_ENV = "FORGE_WORKSPACE"
+
+#: Model configuration. Byte has no fixed model by settled decision, so this is a
+#: default to be overridden, never a baked-in choice.
+DEFAULT_MODEL_ENV = "FORGE_MODEL"
+DEFAULT_MODEL = "anthropic/claude-sonnet-4"
+
+#: Where `forge byte` reads a long task from. A file rather than stdin, because a
+#: piped prompt collides awkwardly with `--workspace` and with a future chat mode.
+TASK_FILE_FLAG = "--task-file"
 
 DESCRIPTION = """\
 Forge — orchestration layer for Steel & Code agents.
@@ -77,6 +85,10 @@ Forge — orchestration layer for Steel & Code agents.
 Classifies operations against the Forge safety stack and, where a decision
 needs one, asks for approval. Executes nothing: approving an operation records
 the decision, and says so.
+
+`forge byte` runs the agent: it sends a task to a model, routes every tool call
+through the same safety stack, and executes only what Forge decided was
+permitted.
 """
 
 STATUS = """\
@@ -86,18 +98,19 @@ Forge terminal interface — current state
   Secret classification    implemented
   Command classification   implemented
   Terminal approval        implemented
-  Command execution        NOT implemented — this CLI classifies and asks only
-  Agent runtime            NOT implemented
-  Model gateway            NOT implemented
-  Session memory           NOT implemented
-  Byte                     contract specified, not runnable
+  Command execution        implemented
+  Agent runtime            implemented
+  Model gateway            implemented (OpenRouter + offline ScriptedGateway)
+  Session memory           in-process, per run
 
-Byte cannot run yet. This CLI exercises the safety stack that will sit in front
-of it.
+`forge check` classifies and asks; it executes nothing.
+`forge byte` runs an agent and does execute -- through the same pipeline.
 
 Usage:
   forge check command --workspace DIR [-- PROGRAM [ARG...]]
   forge check path --workspace DIR PATH [PATH...]
+  forge byte --workspace DIR [--model ID] [--max-turns N] "task"
+  forge byte --workspace DIR --task-file PATH
 """
 
 
@@ -223,6 +236,72 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     path_parser.add_argument("paths", nargs="+", metavar="PATH", help="paths to classify")
+
+    byte_parser = sub.add_parser(
+        "byte",
+        help="run the Byte agent on a task",
+        description=(
+            "Run Byte on one task. Byte calls Forge tools, and every call is "
+            "classified by Forge: the model decides what to attempt, Forge "
+            "decides whether it is allowed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  forge byte --workspace . \"fix the failing tests\"\n"
+            "  forge byte --workspace . --task-file task.md\n"
+            "  forge byte --workspace . --max-turns 10 \"summarise this repo\"\n"
+        ),
+    )
+    byte_parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        default=None,
+        help=(
+            "explicit workspace root (required; may also be set via "
+            f"{WORKSPACE_ENV}). Not inferred from the current directory."
+        ),
+    )
+    byte_parser.add_argument(
+        "--task-file",
+        metavar="PATH",
+        default=None,
+        help="read the task from a file instead of argv",
+    )
+    byte_parser.add_argument(
+        "--model",
+        metavar="ID",
+        default=None,
+        help=(
+            f"provider model id (default: ${DEFAULT_MODEL_ENV}, else "
+            f"{DEFAULT_MODEL})"
+        ),
+    )
+    byte_parser.add_argument(
+        "--max-turns",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "cap model round-trips for this run. May lower the ceiling, never "
+            "raise it."
+        ),
+    )
+    byte_parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "run with no interactive approval channel. Anything "
+            "approval-required fails closed as denied unattended."
+        ),
+    )
+    byte_parser.add_argument(
+        "task",
+        nargs="?",
+        default=None,
+        metavar="TASK",
+        help="the task, as one argument",
+    )
 
     return parser
 
@@ -377,6 +456,7 @@ def _run_check_command(
     outcome = approver.submit_command(
         verdict,
         agent=args.agent,
+        workspace=workspace.root,
         secret_verdicts=secret_verdicts,
         tool="exec_command",
         intent=None,
@@ -506,6 +586,137 @@ def _run_check_path(
 
 
 # --------------------------------------------------------------------------
+# forge byte
+# --------------------------------------------------------------------------
+
+
+def _read_task(args: argparse.Namespace, err: TextIO) -> str | None:
+    """Resolve the task from argv or a file.
+
+    Exactly one source, and the error says so rather than silently preferring
+    one. Two sources is ambiguous, and picking a winner would run a task the
+    operator did not ask for.
+    """
+    from_file = getattr(args, "task_file", None)
+    inline = getattr(args, "task", None)
+
+    if from_file and inline:
+        print(
+            "forge: give the task either as an argument or with --task-file, "
+            "not both",
+            file=err,
+        )
+        return None
+
+    if from_file:
+        try:
+            text = Path(from_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            print(f"forge: task file could not be read: {exc}", file=err)
+            return None
+        if not text.strip():
+            print(f"forge: task file is empty: {from_file}", file=err)
+            return None
+        return text.strip()
+
+    if inline and inline.strip():
+        return inline.strip()
+
+    print(
+        'forge: no task given. For example:\n'
+        '  forge byte --workspace . "fix the failing tests"',
+        file=err,
+    )
+    return None
+
+
+def _run_byte(
+    args: argparse.Namespace,
+    workspace: Workspace,
+    *,
+    out: TextIO,
+    err: TextIO,
+    environ: dict[str, str],
+    channel: ApprovalChannel | None,
+) -> int:
+    """Run Byte on one task.
+
+    This is the first place in Forge that executes, and it does so through the
+    dispatcher -- the same pipeline `forge check` stops short of. Nothing here
+    classifies, approves, or executes directly; the CLI holds no policy, exactly
+    as it did before the runtime existed.
+    """
+    from ..agents.byte import BYTE, assemble_system_prompt
+    from ..agents.runtime import AgentRuntime, MaxTurnsExceeded, summarise
+    from ..models.base import GatewayError
+    from ..models.openrouter import OpenRouterGateway
+    from ..tools.dispatcher import ToolDispatcher
+    from ..tools.execution import Executor
+
+    task = _read_task(args, err)
+    if task is None:
+        return EXIT_USAGE
+
+    model_id = (
+        getattr(args, "model", None)
+        or environ.get(DEFAULT_MODEL_ENV)
+        or DEFAULT_MODEL
+    )
+
+    # The provider key is read by the gateway layer alone, from the injected
+    # mapping. It is never threaded through the profile, the state, or a tool
+    # result, and the runtime is constructed before anything can reach it.
+    try:
+        gateway = OpenRouterGateway(environ=environ)
+    except GatewayError as exc:
+        print(f"forge: {exc}", file=err)
+        return EXIT_USAGE
+
+    # `--unattended` means no channel, which correctly turns every
+    # approval-required operation into DENIED_UNATTENDED. Otherwise use an
+    # injected channel if one was supplied (tests), else the terminal.
+    approver_channel: ApprovalChannel | None
+    if getattr(args, "unattended", False):
+        approver_channel = None
+    else:
+        approver_channel = channel or TerminalApprovalChannel(prompt_stream=out)
+
+    dispatcher = ToolDispatcher(
+        workspace,
+        approver=Approver(approver_channel),
+        executor=Executor(workspace),
+        # The request genuinely is Byte's here, so the approval prompt says so.
+        agent_name=BYTE.name,
+        allowed_tools=BYTE.allowed_tools,
+        system_prompt=assemble_system_prompt(BYTE, str(workspace.root)),
+    )
+
+    runtime = AgentRuntime(
+        BYTE,
+        gateway=gateway,
+        dispatcher=dispatcher,
+        model_id=model_id,
+        max_turns=getattr(args, "max_turns", None),
+    )
+
+    try:
+        result = runtime.run(task)
+    except MaxTurnsExceeded as exc:
+        print(f"forge: {exc}", file=err)
+        return EXIT_INTERNAL
+    except GatewayError as exc:
+        # Already operator-safe: the gateway never puts provider bodies, request
+        # payloads, or credentials in its messages.
+        print(f"forge: {exc}", file=err)
+        return EXIT_INTERNAL
+
+    print(summarise(result), file=out)
+    print("", file=out)
+    print(result.text, file=out)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -593,6 +804,23 @@ def main(
 
             print(f"forge: unknown check subject: {args.leaf!r}", file=err_stream)
             return EXIT_USAGE
+
+        if args.subcommand == "byte":
+            workspace, problem = _resolve_workspace(
+                getattr(args, "workspace", None), env
+            )
+            if workspace is None:
+                print(f"forge: {problem}", file=err_stream)
+                return EXIT_USAGE
+
+            return _run_byte(
+                args,
+                workspace,
+                out=out_stream,
+                err=err_stream,
+                environ=env,
+                channel=channel,
+            )
 
         print(f"forge: unknown command: {args.subcommand!r}", file=err_stream)
         return EXIT_USAGE

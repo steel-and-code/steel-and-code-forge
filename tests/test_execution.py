@@ -102,10 +102,18 @@ def approve(
     agent: str = "tester",
     approve_it: bool = True,
 ) -> ApprovalOutcome:
-    """Classify and approve a command, the way a real caller would."""
+    """Classify and approve a command, the way a real caller would.
+
+    ``workspace`` is taken from the classifier rather than passed separately,
+    because the classifier was constructed with the very workspace the executor
+    will launch in. Supplying the wrong root here would produce an approval that
+    cannot be spent, which is the binding defect this argument exists to prevent.
+    """
     verdict = classifier.classify(Command(program, args))
     channel = ScriptedApprovalChannel(["y" if approve_it else "n"])
-    return Approver(channel).submit_command(verdict, agent=agent)
+    return Approver(channel).submit_command(
+        verdict, agent=agent, workspace=classifier.workspace.root
+    )
 
 
 def request_for(
@@ -406,7 +414,9 @@ def test_shell_string_approval_cannot_be_spent_by_argv(
 ) -> None:
     """A shell string is not an argv invocation and cannot be bound as one."""
     verdict = classifier.classify(Command("bash", ("-c", "echo hi"), shell=True))
-    outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(verdict, agent="t")
+    outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
+        verdict, agent="t", workspace=classifier.workspace.root
+    )
 
     result = executor.execute(outcome, request_for("-c", "print('x')", agent="t"))
 

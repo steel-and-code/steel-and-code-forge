@@ -298,15 +298,140 @@ def test_bare_invocation_prints_status_and_exits_zero() -> None:
     result = run([])
 
     assert result.code == render.EXIT_OK
-    assert "not implemented" in result.out.lower()
+    assert "current state" in result.out.lower()
 
 
-def test_status_states_that_byte_cannot_run() -> None:
-    """The status banner exists so this CLI cannot be mistaken for Byte."""
+def test_status_lists_the_two_entry_points() -> None:
+    """The banner must distinguish what classifies from what executes.
 
+    `forge check` still executes nothing and `forge byte` does execute, so a
+    reader who saw one and assumed the other would be wrong about the one they
+    did not use.
+    """
     result = run([])
 
-    assert "cannot run" in result.out.lower()
+    assert "forge check" in result.out
+    assert "forge byte" in result.out
+    assert "executes nothing" in result.out
+    assert "does execute" in result.out
+
+
+# ==========================================================================
+# forge byte
+# ==========================================================================
+
+
+def test_byte_requires_an_explicit_workspace(workspace_dir: Path) -> None:
+    """No workspace, no run. Not inferred from the current directory."""
+    result = run(["byte", "do something"], env={})
+
+    assert result.code == render.EXIT_USAGE
+    assert "workspace" in result.err
+
+
+def test_byte_requires_a_task(workspace_dir: Path) -> None:
+    result = run(
+        ["byte", "--workspace", str(workspace_dir)],
+        env={"FORGE_OPENROUTER_API_KEY": "x"},
+    )
+
+    assert result.code == render.EXIT_USAGE
+    assert "no task given" in result.err
+
+
+def test_byte_rejects_task_from_two_sources(workspace_dir: Path, tmp_path: Path) -> None:
+    """Ambiguous input is refused rather than silently preferring one source."""
+    task_file = tmp_path / "task.md"
+    task_file.write_text("from a file\n")
+
+    result = run(
+        [
+            "byte",
+            "--workspace",
+            str(workspace_dir),
+            "--task-file",
+            str(task_file),
+            "from argv",
+        ],
+        env={"FORGE_OPENROUTER_API_KEY": "x"},
+    )
+
+    assert result.code == render.EXIT_USAGE
+    assert "not both" in result.err
+
+
+def test_byte_reads_a_task_from_a_file(workspace_dir: Path, tmp_path: Path) -> None:
+    """`--task-file` is accepted; the run then fails at the provider, not here."""
+    task_file = tmp_path / "task.md"
+    task_file.write_text("summarise the repository\n")
+
+    result = run(
+        [
+            "byte",
+            "--workspace",
+            str(workspace_dir),
+            "--task-file",
+            str(task_file),
+        ],
+        env={},
+    )
+
+    # No key, so the gateway refuses before any request. That the failure is the
+    # credential and not the task file is what this asserts.
+    assert "FORGE_OPENROUTER_API_KEY" in result.err
+
+
+def test_byte_missing_task_file_is_reported(workspace_dir: Path) -> None:
+    result = run(
+        [
+            "byte",
+            "--workspace",
+            str(workspace_dir),
+            "--task-file",
+            str(workspace_dir / "does-not-exist.md"),
+        ],
+        env={"FORGE_OPENROUTER_API_KEY": "x"},
+    )
+
+    assert result.code == render.EXIT_USAGE
+    assert "could not be read" in result.err
+
+
+def test_byte_missing_key_fails_before_any_request(workspace_dir: Path) -> None:
+    """A missing provider key is a visible startup failure, not a silent one.
+
+    No network call is attempted, which is what makes this safe to assert.
+    """
+    result = run(["byte", "--workspace", str(workspace_dir), "hello"], env={})
+
+    assert result.code == render.EXIT_USAGE
+    assert "FORGE_OPENROUTER_API_KEY" in result.err
+
+
+def test_byte_missing_key_error_does_not_echo_other_secrets(workspace_dir: Path) -> None:
+    """The failure names the variable and no value from the environment."""
+    result = run(
+        ["byte", "--workspace", str(workspace_dir), "hello"],
+        env={
+            "FORGE_OPENROUTER_API_KEY": "   ",
+            "AWS_SECRET_ACCESS_KEY": "aws-SECRET-999",
+        },
+    )
+
+    assert "SECRET-999" not in result.err
+    assert "SECRET-999" not in result.out
+
+
+def test_byte_does_not_print_the_key(workspace_dir: Path) -> None:
+    """Even on a failure path, the credential never reaches a stream."""
+    key = "sk-or-v1-CLI-SHOULD-NOT-PRINT"
+    result = run(
+        ["byte", "--workspace", str(workspace_dir), "hello"],
+        env={"FORGE_OPENROUTER_API_KEY": key},
+    )
+
+    assert key not in result.out
+    assert key not in result.err
 
 
 # ==========================================================================
@@ -439,7 +564,13 @@ def test_interactive_approval_shows_the_real_prompt(workspace_dir: Path) -> None
 
 
 def test_prompt_names_the_cli_requester_not_byte(workspace_dir: Path) -> None:
-    """There is no Byte runtime, so claiming Byte asked would be a fabrication."""
+    """An operator-invoked check reports `forge-cli`, not `byte`.
+
+    Still correct now that a Byte runtime exists: this is `forge check`, run by
+    the operator, so attributing the request to Byte would be a fabrication an
+    operator could act on. `forge byte` reports `byte` because there the
+    attribution is true.
+    """
     result = run_recording(cmd(workspace_dir, "git", "commit", "-m", "x"), ["y"])
 
     assert DEFAULT_AGENT in result.out

@@ -86,7 +86,9 @@ def test_denied_command_becomes_policy_denial(
     approver = Approver(channel)
 
     outcome = approver.submit_command(
-        classifier.classify(_cmd("sudo", "rm", "file.txt")), agent="byte"
+        classifier.classify(_cmd("sudo", "rm", "file.txt")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.DENIED_BY_POLICY
@@ -103,7 +105,9 @@ def test_denied_command_outside_workspace_is_policy_denial(
     approver = Approver(ScriptedApprovalChannel(["yes"]))
 
     outcome = approver.submit_command(
-        classifier.classify(_cmd("ls", cwd=tmp_path)), agent="byte"
+        classifier.classify(_cmd("ls", cwd=tmp_path)),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.DENIED_BY_POLICY
@@ -165,6 +169,7 @@ def test_secret_denial_overrides_an_approvable_command(
     outcome = approver.submit_command(
         command,
         agent="byte",
+        workspace=workspace.root,
         secret_verdicts=(secrets.classify(_in(workspace, ".env")),),
     )
 
@@ -178,7 +183,9 @@ def test_request_constructor_refuses_a_denied_verdict(
     verdict = classifier.classify(_cmd("sudo", "true"))
 
     with pytest.raises(DeniedByPolicy):
-        ApprovalRequest.from_command(verdict, agent="byte")
+        ApprovalRequest.from_command(
+            verdict, agent="byte", workspace=classifier.workspace.root
+        )
 
 
 def test_resolve_refuses_a_hand_built_denial(
@@ -227,7 +234,9 @@ def test_allowed_command_approved_without_consulting_the_channel(
     approver = Approver(channel)
 
     outcome = approver.submit_command(
-        classifier.classify(_cmd("git", "status")), agent="byte"
+        classifier.classify(_cmd("git", "status")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.APPROVED
@@ -247,7 +256,9 @@ def test_unknown_command_is_gated_not_auto_approved(
     approver = Approver(channel)
 
     outcome = approver.submit_command(
-        classifier.classify(_cmd("some-unknown-tool", "--check")), agent="byte"
+        classifier.classify(_cmd("some-unknown-tool", "--check")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.APPROVED
@@ -259,7 +270,9 @@ def test_allow_records_no_operator_response(
     classifier: CommandClassifier,
 ) -> None:
     outcome = Approver(None).submit_command(
-        classifier.classify(_cmd("git", "status")), agent="byte"
+        classifier.classify(_cmd("git", "status")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.approved
@@ -277,7 +290,9 @@ def test_approval_required_without_a_channel_fails_closed(
     classifier: CommandClassifier,
 ) -> None:
     outcome = Approver(None).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.DENIED_UNATTENDED
@@ -291,7 +306,9 @@ def test_unavailable_channel_fails_closed(classifier: CommandClassifier) -> None
     approver = Approver(channel)
 
     outcome = approver.submit_command(
-        classifier.classify(_cmd("git", "push")), agent="byte"
+        classifier.classify(_cmd("git", "push")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.DENIED_UNATTENDED
@@ -309,7 +326,9 @@ def test_unattended_detail_states_the_operation_did_not_run(
     queued, because a silent skip is not a reportable condition.
     """
     outcome = Approver(None).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert "not run" in outcome.detail
@@ -320,7 +339,9 @@ def test_unattended_still_carries_the_request(
     classifier: CommandClassifier,
 ) -> None:
     outcome = Approver(None).submit_command(
-        classifier.classify(_cmd("rm", "build", "-r")), agent="byte"
+        classifier.classify(_cmd("rm", "build", "-r")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.DENIED_UNATTENDED
@@ -373,7 +394,9 @@ def test_affirmative_through_the_approver_approves(
     classifier: CommandClassifier, response: str
 ) -> None:
     outcome = Approver(ScriptedApprovalChannel([response])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.APPROVED
@@ -385,7 +408,9 @@ def test_non_affirmative_through_the_approver_rejects(
     classifier: CommandClassifier, response: str
 ) -> None:
     outcome = Approver(ScriptedApprovalChannel([response])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.REJECTED
@@ -402,7 +427,9 @@ def test_no_response_is_rejected_not_unattended(
     different from nobody being there at all.
     """
     outcome = Approver(ScriptedApprovalChannel([None])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.REJECTED
@@ -422,8 +449,12 @@ def test_approver_remembers_nothing_between_operations(
     approver = Approver(channel)
     command = classifier.classify(_cmd("git", "commit", "-m", "x"))
 
-    first = approver.submit_command(command, agent="byte")
-    second = approver.submit_command(command, agent="byte")
+    first = approver.submit_command(
+        command, agent="byte", workspace=classifier.workspace.root
+    )
+    second = approver.submit_command(
+        command, agent="byte", workspace=classifier.workspace.root
+    )
 
     assert first.approved and second.approved
     assert len(channel.presented) == 2
@@ -441,8 +472,12 @@ def test_approving_the_same_command_twice_uses_two_separate_outcomes(
     approver = Approver(channel)
     command = classifier.classify(_cmd("git", "commit", "-m", "x"))
 
-    approver.submit_command(command, agent="byte").claim()
-    second = approver.submit_command(command, agent="byte")
+    approver.submit_command(
+        command, agent="byte", workspace=classifier.workspace.root
+    ).claim()
+    second = approver.submit_command(
+        command, agent="byte", workspace=classifier.workspace.root
+    )
 
     # A second approval was genuinely required and genuinely given, and it is
     # still spendable.
@@ -461,6 +496,7 @@ def test_prompt_contains_every_specified_field(
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
         classifier.classify(_cmd("git", "commit", "-m", "message")),
         agent="byte",
+        workspace=classifier.workspace.root,
         intent="the operator asked for a commit",
         git_context="remote origin, branch main, 1 ahead",
     )
@@ -485,7 +521,9 @@ def test_prompt_shows_the_exact_program_and_arguments(
     classifier: CommandClassifier,
 ) -> None:
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("rm", "build", "-rf", "dist")), agent="byte"
+        classifier.classify(_cmd("rm", "build", "-rf", "dist")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -495,7 +533,9 @@ def test_prompt_shows_the_exact_program_and_arguments(
 def test_prompt_shows_resolved_targets(classifier: CommandClassifier) -> None:
     """A recursive delete shows the actual target list, per the wildcard policy."""
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("rm", "build", "dist", "-rf")), agent="byte"
+        classifier.classify(_cmd("rm", "build", "dist", "-rf")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -514,7 +554,9 @@ def test_prompt_states_when_targets_are_not_determinable(
     an absent field to anyone skimming.
     """
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "push", "origin", "main")), agent="byte"
+        classifier.classify(_cmd("git", "push", "origin", "main")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -525,7 +567,9 @@ def test_prompt_says_not_supplied_for_absent_intent(
     classifier: CommandClassifier,
 ) -> None:
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -551,6 +595,7 @@ def test_prompt_carries_git_context_when_supplied(
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
         classifier.classify(_cmd("git", "push")),
         agent="byte",
+        workspace=classifier.workspace.root,
         git_context="remote origin, branch main, 3 ahead",
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
@@ -563,6 +608,7 @@ def test_prompt_flags_a_shell_string(classifier: CommandClassifier) -> None:
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
         classifier.classify(_cmd("bash", "-c", "echo hi", shell=True)),
         agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -591,7 +637,9 @@ def test_prompt_footer_names_the_requesting_agent(
 ) -> None:
     """The question names who is asking, so the answer is not given blindly."""
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -606,7 +654,9 @@ def test_prompt_footer_spells_out_both_answers(
 ) -> None:
     """The footer names approve and reject, so rejecting needs no guessing."""
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -619,7 +669,9 @@ def test_prompt_footer_labels_stay_aligned(
 ) -> None:
     """The field column is fixed width, so prompts line up between operations."""
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
@@ -637,7 +689,9 @@ def test_prompt_footer_labels_stay_aligned(
 def test_render_prompt_is_pure(classifier: CommandClassifier) -> None:
     """Rendering a prompt must not itself be the moment it is asked."""
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert render_prompt(outcome.request) == outcome.request.render()  # type: ignore[arg-type]
@@ -657,7 +711,9 @@ def test_terminal_channel_prints_the_prompt_and_reads_a_line(
     )
 
     outcome = Approver(channel).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.APPROVED
@@ -674,7 +730,9 @@ def test_terminal_channel_rejects_on_decline(
     )
 
     outcome = Approver(channel).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.REJECTED
@@ -691,7 +749,9 @@ def test_terminal_channel_treats_eof_as_no_answer(
     )
 
     outcome = Approver(channel).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.REJECTED
@@ -711,7 +771,9 @@ def test_terminal_channel_treats_interrupt_as_no_answer(
     )
 
     outcome = Approver(channel).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.REJECTED
@@ -724,7 +786,9 @@ def test_terminal_channel_without_a_tty_is_unavailable(
     channel = TerminalApprovalChannel(prompt_stream=io.StringIO(), read=lambda _: "y")
 
     outcome = Approver(channel).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     # Either the probe correctly reports no TTY, or the host genuinely has one.
@@ -744,7 +808,9 @@ def test_unanswered_prompt_is_rejected_not_approved(
     channel = ScriptedApprovalChannel([])  # nothing to answer with
 
     outcome = Approver(channel).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.REJECTED
@@ -782,12 +848,16 @@ def _secret_verdicts(
 
 def _submit(
     verdict: CommandVerdict,
+    workspace: Workspace,
     secrets_found: tuple[SecretVerdict, ...],
     responses: list[str | None] | None = None,
 ) -> tuple[ApprovalOutcome, ScriptedApprovalChannel]:
     channel = ScriptedApprovalChannel(responses or [])
     outcome = Approver(channel).submit_command(
-        verdict, agent="byte", secret_verdicts=secrets_found
+        verdict,
+        agent="byte",
+        workspace=workspace.root,
+        secret_verdicts=secrets_found,
     )
     return outcome, channel
 
@@ -798,6 +868,7 @@ def test_command_allow_with_secret_allow_approves_without_a_channel(
     """Everything clean: no prompt at all."""
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", "plain.txt")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / "plain.txt"),
     )
 
@@ -817,6 +888,7 @@ def test_command_allow_with_secret_approval_required_prompts(
     """
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", "secrets.json")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / "secrets.json"),
         ["y"],
     )
@@ -830,6 +902,7 @@ def test_command_allow_with_secret_deny_is_policy_denial(
 ) -> None:
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", ".env")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / ".env"),
         ["y"],
     )
@@ -845,6 +918,7 @@ def test_command_approval_required_with_secret_allow_prompts(
     """The command's own gate stands on its own; secrets do not interfere."""
     outcome, channel = _submit(
         classifier.classify(_cmd("git", "commit", "-m", "x")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / "plain.txt"),
         ["y"],
     )
@@ -866,6 +940,7 @@ def test_command_approval_required_with_secret_approval_required_is_one_prompt(
     """
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", "secrets.json")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / "secrets.json"),
         ["y"],
     )
@@ -885,6 +960,7 @@ def test_multiple_secrets_produce_one_prompt_not_one_each(
 
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", *(t.name for t in targets))),
+        workspace,
         _secret_verdicts(secrets, *targets),
         ["y"],
     )
@@ -899,6 +975,7 @@ def test_command_approval_required_with_secret_deny_is_policy_denial(
     """A gated command does not survive a structural secret among its targets."""
     outcome, channel = _submit(
         classifier.classify(_cmd("git", "add", "secrets.json")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / ".env"),
         ["y"],
     )
@@ -917,6 +994,7 @@ def test_one_secret_deny_outranks_all_other_secret_verdicts(
     """
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", "secrets.json", ".env")),
+        workspace,
         _secret_verdicts(
             secrets, workspace.root / "secrets.json", workspace.root / ".env"
         ),
@@ -940,6 +1018,7 @@ def test_one_secret_approval_required_escalates_an_allow(
 
     outcome, channel = _submit(
         classifier.classify(_cmd("cat", "plain.txt", "secrets.json")),
+        workspace,
         _secret_verdicts(secrets, clean, guessed),
         ["n"],
     )
@@ -960,6 +1039,7 @@ def test_unattended_secret_approval_requirement_fails_closed(
     outcome = Approver(None).submit_command(
         classifier.classify(_cmd("cat", "secrets.json")),
         agent="byte",
+        workspace=workspace.root,
         secret_verdicts=_secret_verdicts(secrets, workspace.root / "secrets.json"),
     )
 
@@ -978,6 +1058,7 @@ def test_escalated_request_names_the_secret_rule(
     """
     outcome, _ = _submit(
         classifier.classify(_cmd("cat", "secrets.json")),
+        workspace,
         _secret_verdicts(secrets, workspace.root / "secrets.json"),
         ["y"],
     )
@@ -1000,6 +1081,7 @@ def test_escalated_prompt_shows_the_secret_reason(
     Approver(_Capturing(["y"])).submit_command(
         classifier.classify(_cmd("cat", "secrets.json")),
         agent="byte",
+        workspace=workspace.root,
         secret_verdicts=_secret_verdicts(secrets, workspace.root / "secrets.json"),
     )
 
@@ -1012,7 +1094,9 @@ def test_no_secret_verdicts_leaves_command_verdict_unchanged(
 ) -> None:
     """Supplying nothing must not change existing behaviour."""
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     assert outcome.decision is ApprovalDecision.APPROVED
@@ -1217,7 +1301,9 @@ def test_claim_token_absent_from_rendered_prompt(
     classifier: CommandClassifier,
 ) -> None:
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+        classifier.classify(_cmd("git", "commit", "-m", "x")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     prompt = outcome.request.render()  # type: ignore[union-attr]
@@ -1277,7 +1363,7 @@ def test_prompts_are_not_built_from_a_shadowed_verdict(
     """
     verdict = classifier.classify(_cmd("rm", "build", "-rf"))
     outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
-        verdict, agent="byte"
+        verdict, agent="byte", workspace=classifier.workspace.root
     )
 
     assert outcome.request is not None
@@ -1290,7 +1376,9 @@ def test_outcome_str_is_operator_safe(
     classifier: CommandClassifier, secrets: SecretClassifier
 ) -> None:
     outcome = Approver(ScriptedApprovalChannel(["n"])).submit_command(
-        classifier.classify(_cmd("git", "push", "origin", "main")), agent="byte"
+        classifier.classify(_cmd("git", "push", "origin", "main")),
+        agent="byte",
+        workspace=classifier.workspace.root,
     )
 
     text = str(outcome)

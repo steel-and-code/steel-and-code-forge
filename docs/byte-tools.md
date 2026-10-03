@@ -152,26 +152,77 @@ anything to get there.
 All three automatic. No approval. Read-only, and they cannot alter the
 repository.
 
-### Deliberately not in v1
+**Byte's v1 tool set is implemented.** Six tools, dispatched through
+`forge/tools/dispatcher.py`:
 
-- Branch create, checkout, merge, rebase, stash.
-- Remote operations of any kind (`fetch`, `pull`, `remote` management).
-- Tagging and release.
-- Submodules.
-- Package installation. Excluded from v1, not gated — see
-  [Dependency installation](#dependency-installation).
-- Network fetch tools other than those tests and search perform themselves.
-- GitHub or forge API operations.
+| Tool | Permission | Bound |
+| --- | --- | --- |
+| `read_file` | containment, secret classification, approval **before any read** | 2000 lines / 100 KB |
+| `search_files` | read-only, in-workspace | 200 results |
+| `search_content` | read-only, in-workspace | 200 matches |
+| `write_file` | in-workspace; secret check on the target before writing | 1 MB |
+| `patch_file` | classified **before the file is read** | one exact region, must be unique |
+| `exec_command` | the full pipeline | Executor bounds, 1 MiB/stream |
 
-Branch and remote operations are absent because each one has a plausible
-accident and no v1 need. Adding them later is additive.
+No git wrappers and no `run_tests` wrapper: those are `exec_command` with a
+different program, and a wrapper would be a second path to the same question
+with its own permission story. `git status` is `exec_command(program="git",
+args=["status"])` and is classified by the existing tables.
 
-This list is about **tool availability** — whether Byte has a dedicated tool —
-and is separate from the git action policy below. A dedicated `git_branch` tool
-does not exist in v1; the underlying `git branch` invocation is still classified
-by the classifier, and its listing form is automatic while its mutating forms are
-approval-required or denied. The two layers are independent by design: a
-permission ruling does not create a tool.
+**No arbitrary callable is reachable by name.** Tools live in a closed registry
+built at construction; a model naming something absent from it gets
+`unknown_tool`. There is no attribute lookup, no import, and no `eval` in the
+dispatcher. An agent configured without a tool gets `tool_not_allowed` even if it
+names the tool directly — that is how "an agent may be narrower" is structural
+rather than documentary.
+
+**Classification happens before content is read**, for `read_file` and
+`patch_file` alike. Reading first and classifying afterwards would leave the
+approval prompt unable to show what the agent was about to see or change.
+
+**Structured `write_file`/`patch_file` remain automatic** inside the workspace,
+per the settled policy. The behavioural requirement — inspect repository state
+before editing, avoid silently overwriting work you did not write — lives in
+Byte's system instructions, not in a permission. No dirty-file gate is
+implemented, and none is planned for v1.
+
+**Not implemented, by decision:** durable memory, n8n, HTTP surface, web UI,
+background jobs, concurrent agents, autonomous scheduling, persistent approval,
+project workflow trust config, `forge exec`, streaming, context-window
+management, and output redaction.
+
+### Execution path
+
+`forge byte` is the first command in Forge that executes, and it does so through
+the existing pipeline in the settled order:
+
+```
+    CommandClassifier
+      -> SecretClassifier on resolved targets
+      -> Approver.submit_command
+      -> Executor.execute
+```
+
+`ExecutionRequest.program` carries the **exact model-supplied token**, not
+`verdict.normalized_program`. The approval fingerprint binds the exact program
+token, so a substituted basename would break the binding and surface as a
+confusing `INVALID_APPROVAL` rather than a clear answer.
+
+A non-approved outcome never reaches `Executor`, so the executor's own fingerprint
+binding is a second line rather than the only one. `ToolDispatcher` is the sole
+importer of `forge/tools/execution.py` among runtime modules, asserted by import
+scan.
+
+**Interactive approval** pauses the loop inside `Approver`, using the existing
+`TerminalApprovalChannel`. A rejection becomes a `ToolResult` with
+`status="rejected"` that the model reads; Block D of the system instructions
+tells Byte that a denial is the answer. **Unattended** yields
+`status="denied_unattended"`, kept distinct from a human saying no because an
+operator reading the transcript needs to tell those apart.
+
+An identical repeated call returns the cached refusal without re-classifying or
+re-prompting, but **still consumes a model turn** — the cache is an optimisation,
+not the thing preventing a runaway loop.
 
 Commands are invoked as argument arrays rather than shell strings wherever
 possible. See
@@ -916,17 +967,21 @@ exactly those fields and adds nothing of its own.
 
 Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
 `tests/test_commands.py` (366), `tests/test_approval.py` (102),
-`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 716 passing.
+`tests/test_cli.py` (88), and `tests/test_execution.py` (86), plus
+`test_agent_runtime.py` (31), `test_dispatcher.py` (60), and `test_models.py`
+(32). 847 passing.
 
 Implemented: workspace containment, secret classification, command
 classification, terminal approval, the terminal interface, and command execution.
 
-Not implemented, by decision: `shell=True`, credential injection, agent
-runtime, CLI/TUI, HTTP surface, memory.
+Implemented since: the agent runtime, the model gateway, and the `forge byte`
+subcommand. Not implemented, by decision: `shell=True`, credential injection,
+durable memory, HTTP surface, n8n, and any chat session.
 
 **CLI status.** A terminal entry point now exists in `forge/cli/`:
 `main.py` owns argv, wiring, and exit codes; `render.py` is pure presentation.
-It classifies, it asks, and it executes nothing.
+`forge check` classifies and asks, and executes nothing. `forge byte` runs the
+agent and does execute, through the dispatcher.
 
     forge                                          status, exit 0
     forge check command --workspace DIR [-- PROG ARG...]
@@ -938,10 +993,19 @@ parent, so the supported placement is the only placement. The `--` separator is
 required on `check command`: Forge's options go before it, the command's own
 arguments after it.
 
-The requester identity defaults to `forge-cli`, not `byte`. There is no Byte
-runtime yet, so claiming Byte requested an operation would be a fabrication an
-operator could act on. `forge byte` will pass `byte` explicitly when that
-runtime exists.
+The requester identity defaults to `forge-cli`, not `byte`, for an operator
+invoked check — claiming Byte requested an operation there would be a
+fabrication an operator could act on. `forge byte` passes `byte` explicitly,
+which there is a true statement.
+
+`forge byte` is a separate leaf:
+
+    forge byte --workspace DIR [--model ID] [--max-turns N] "task"
+    forge byte --workspace DIR --task-file PATH
+
+It is the first command in Forge that executes. It assembles a `ToolDispatcher`,
+which is the only path to a process, and the CLI never calls `execute` itself —
+asserted by an AST scan in `tests/test_agent_runtime.py`.
 
 Six states are distinguished: `ALLOW`, `APPROVAL REQUIRED`, `APPROVED`,
 `REJECTED`, `DENIED BY POLICY`, `DENIED UNATTENDED`. The last three are all
@@ -950,9 +1014,11 @@ and reported distinctly. Exit codes: 0 success, 1 refused, 2 malformed
 invocation, 3 approval would be required in `--classify-only` mode, 4 internal
 failure.
 
-Two behaviours worth recording. An approved operation prints "execution is not
-implemented yet, so nothing ran" — approving something that then silently did
-nothing would be worse than no approval at all. And a relative path given to
+Two behaviours worth recording. An approved `forge check` operation prints
+"execution is not implemented yet, so nothing ran" — approving something that then
+silently did nothing would be worse than no approval at all; `forge check` still
+runs nothing, while `forge byte` executes through the dispatcher. And a relative
+path given to
 `check path` resolves against the named workspace rather than the shell's
 directory, because over SSH the shell directory is often unrelated and
 classifying a different file than the operator named is a silent wrong answer.
@@ -962,11 +1028,12 @@ verdicts to `Approver`, and renders what comes back. It never constructs an
 `ApprovalRequest`, so a denial cannot become a prompt by any route, and
 `tests/test_cli.py` asserts each of these properties rather than trusting them.
 
-Both remaining agent-contract decisions are now settled in
+Both remaining agent-contract decisions are settled in
 [agent-contract.md](agent-contract.md): Byte's system instructions are specified
 as seven instruction blocks, and the memory model is session memory in v1 with
 durable project memory designed and disabled. Byte's runtime status is
-**Partial** — every field answered, nothing implemented.
+**Runnable** — every field answered and implemented, with one known defect
+recorded there.
 
 ### How the approval step behaves
 

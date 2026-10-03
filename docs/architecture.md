@@ -146,7 +146,8 @@ operations and asks for approval; `forge check` still executes nothing.
 operation only when handed an already-approved outcome whose binding digest
 matches the invocation exactly, and an approved outcome is a single-spend
 capability that cannot be replayed — including by a second executor. The CLI
-does not call it yet; the agent runtime will.
+is called by `forge byte`, through `forge/tools/dispatcher.py` — the sole
+runtime path to a process.
 
 **There is no `forge exec` in v1, and that is a decision rather than a gap.** A
 human running a command uses their own shell, which already grants everything
@@ -158,6 +159,10 @@ exception the first is too slow to take. A human-facing execute verb would also
 be one `--yes` flag away from voiding the approval model. The reasoning and the
 only acceptable shape for a future one are in
 [byte-tools.md](byte-tools.md).
+
+`forge byte` is therefore the only Forge surface that executes, and it executes
+only what the dispatcher decided was permitted. `forge check` still stops at the
+approval step.
 
 ### OpenRouter — model gateway
 
@@ -299,7 +304,10 @@ would otherwise be re-litigated:
 - Executing repository code is approval-required — test runners and workspace
   scripts alike, because a repository is not a trust boundary.
 - Model access behind one gateway interface; no vendor names above it.
-- Agents are configuration, not classes or services.
+- Agents are configuration, not classes or services. Byte is an `AgentProfile`
+  value, and the runtime that serves it does not know its name.
+- The model decides what it wants to attempt; Forge decides whether it is
+  allowed. The runtime holds no classifier, `Approver`, or `Executor`.
 - Agents may use credentials but never see them.
 - Approval is per-operation; no blanket approval in v1.
 - Approval-required operations fail closed when unattended.

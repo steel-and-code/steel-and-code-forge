@@ -2,21 +2,21 @@
 
 Forge is the orchestration layer for Steel & Code's agent platform.
 
-This repository is currently a **skeleton**: it defines the project structure
-and documented boundaries only. No OpenRouter integration, no n8n wiring, no
-agent logic, no UI, no database, and no API exist yet.
+This repository holds the **orchestration layer and its safety stack**, plus the
+first agent runtime. There is no n8n wiring, no UI, no database, and no HTTP API
+yet.
 
 ## What lives here
 
 ```
 forge/
-  agents/     agent definitions (Byte, Ember, Fin)
+  agents/     agent profiles and the runtime (Byte, Ember, Fin)
   models/     model client abstractions (OpenRouter gateway)
   cli/        terminal entry point (the `forge` command)
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (716 passing)
+tests/        pytest suite (847 passing)
 docs/         architecture and design notes
 ```
 
@@ -48,29 +48,25 @@ Byte is the only agent specified so far. See
 
 ## Status
 
-Initial scaffold. The enforcement pipeline is complete for v1: workspace
-containment, secret-source classification, command classification, and the
-terminal approval step that sits between classification and execution. A
-terminal entry point exists and drives all of it. Byte's agent contract is
-fully specified — system instructions and memory included.
+The agent runtime works. `forge byte` sends a task to a model, routes every tool
+call through the Forge safety stack, and executes only what Forge decided was
+permitted.
 
-The execution layer exists and runs approved operations; the CLI does not call
-it yet, so `forge check` still executes nothing. There is **no `forge exec` in
-v1** — that is a decision, not a gap; the reasoning is in
-[docs/byte-tools.md](docs/byte-tools.md). The permission baseline is implemented
-in `forge/tools/commands.py`: explicit deny, approval, and allow rule tables with
-approval-required as the default for anything unrecognised. Next steps, in order:
+The enforcement pipeline is complete for v1: workspace containment, two-tier
+secret-source classification, the explicit deny/approval/allow command tables
+with approval-required as the default, the terminal approval step, and command
+execution. The model gateway is provider-neutral, with an offline scripted
+implementation used by every test and OpenRouter as the live provider.
 
-1. Define the model gateway contract in `forge/models/`.
-2. Implement the agent contract in `forge/agents/`, and wire the runtime to the
-   existing executor through the classify → secret checks → approval → execute
-   pipeline.
-3. Implement session memory, the one memory scope v1 enables.
-4. Record execution and approval events somewhere reviewable. Nothing is
+Next steps, in order:
+
+1. Define the secondary HTTP surface n8n and the website will call.
+2. Wire n8n trigger handling. Approval-required operations fail closed over HTTP.
+3. Record execution and approval events somewhere reviewable. Nothing is
    recorded durably yet, and this should exist before durable memory is enabled.
-5. Define the secondary HTTP surface n8n and the website will call.
-6. Wire n8n trigger handling.
-7. Write the remaining tools.
+4. Implement durable project memory — designed, still disabled.
+5. Decide whether an interactive chat session is worth building over the
+   one-shot runtime.
 
 ## Permission model
 
@@ -115,11 +111,20 @@ forge check command --workspace . -- rm -rf build      # prompts; runs nothing
 forge check path --workspace . secrets.json
 ```
 
-The CLI classifies and asks. It never executes, and an approved operation says
-so. It holds no policy: command and secret verdicts are ranked together by the
-approval layer, so `forge check command -- cat secrets.json` reports
+`forge check` classifies and asks. It never executes, and an approved operation
+says so. It holds no policy: command and secret verdicts are ranked together by
+the approval layer, so `forge check command -- cat secrets.json` reports
 `APPROVAL REQUIRED` even though `cat` is ordinary. See
 [docs/byte-tools.md](docs/byte-tools.md) for the full behaviour.
+
+`forge byte` runs the agent and does execute — through the same pipeline, with no
+second path to a process. It needs `FORGE_OPENROUTER_API_KEY` in the environment;
+a missing key fails before any request is attempted.
+
+```bash
+forge byte --workspace . "fix the failing tests"
+forge byte --workspace . --task-file task.md
+```
 
 ## Documentation
 
@@ -140,10 +145,10 @@ pip install -e '.[dev]'
 pytest
 ```
 
-This works. There is no agent runtime yet, no model gateway, no HTTP surface, and
-no memory layer. What exists is the security classification layer, the terminal
-approval step that consumes it, the command execution layer, the `forge` CLI, and
-their tests. `forge check` classifies and asks; it executes nothing.
+This works. There is no HTTP surface, no n8n wiring, no durable memory, and no
+model gateway *client* beyond OpenRouter. What exists is the security
+classification layer, the approval step that consumes it, the command execution
+layer, the agent runtime, the model gateway, the `forge` CLI, and their tests.
 
 ## Configuration
 

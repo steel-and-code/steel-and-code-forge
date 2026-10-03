@@ -531,15 +531,154 @@ handling is a decision rather than a detail.
 
 ### Runtime status
 
-**Partial.** Every field now has a real answer: name, role, system instructions,
-model configuration, workspace, permissions, memory configuration, and the v1
-candidate tool set.
+**Runnable, with one known defect.** Every field has a real answer and the
+runtime executes: `forge byte --workspace DIR "task"` runs the agent loop.
 
-Byte still cannot run. Nothing in this document is implemented, and the missing
-pieces are code rather than decisions: there is no agent runtime, no model
-gateway client, no command execution layer behind the approval gate, no CLI, and
-no memory implementation. Session memory in particular is specified and
-unbuilt; durable project memory is specified and disabled.
+Implemented in `forge/agents/` and `forge/models/`, with the permission
+integration in `forge/tools/dispatcher.py`:
+
+| Piece | Where | Role |
+| --- | --- | --- |
+| `AgentProfile` | `forge/agents/profile.py` | Byte is a value, not a class |
+| `ConversationState` | `forge/agents/state.py` | session-only, in-process |
+| `AgentRuntime` | `forge/agents/runtime.py` | the tool-call loop |
+| `ModelGateway` | `forge/models/base.py` | one-method provider Protocol |
+| `ScriptedGateway` | `forge/models/scripted.py` | offline; what every test uses |
+| `OpenRouterGateway` | `forge/models/openrouter.py` | the live provider |
+| `ToolDispatcher` | `forge/tools/dispatcher.py` | the only route into policy |
+
+**The separation, stated once because it is the whole design:** the model decides
+what it wants to attempt; Forge decides whether it is allowed.
+`AgentRuntime` holds no classifier, no `Approver` and no `Executor` — it holds a
+`ToolDispatcher`, and the dispatcher holds the pipeline. A runtime that could
+reach a classifier would be one edit away from holding a second opinion about
+what is permitted, which is how "approval narrows a permission, it never widens
+one" decays. The separation is asserted structurally, by import scan, in
+`tests/test_agent_runtime.py` — not by convention.
+
+`forge/tools/dispatcher.py` is the sole importer of `forge/tools/execution.py`
+among runtime modules, also asserted by import scan. There is no second path to
+a process.
+
+**The seven instruction blocks** are reproduced verbatim in
+`forge/agents/byte.py` rather than paraphrased, so a test can assert the profile
+still matches the contract above. What the assembled prompt adds is the
+workspace path and nothing else: no tool names (they travel as structured
+schemas), and no restatement of classifier rules, because a second copy of the
+safety layer in a prompt is weaker than the code and drifts from it on every
+future improvement.
+
+### Tool-call loop
+
+A model round-trip is one turn. A response carrying five parallel tool calls
+costs one turn, because the round-trip is what costs tokens. The bound is
+`MAX_TOOL_TURNS = 25`, configurable **downward** per run and by profile; a
+caller may lower it and never raise it past the constant.
+
+**A cached denial still consumes a turn.** The cache prevents repeated classifier
+work and repeated approval prompts. It does not exempt the model from the bound,
+so an agent looping on a denied call still terminates — which is the property
+that matters, since the cache is an optimisation rather than the thing preventing
+a runaway.
+
+Exhausting the limit raises `MaxTurnsExceeded`. The model does not get to
+narrate a conclusion it did not produce, and the operator is not shown a truncated
+run dressed up as a finished one.
+
+### What is cached, and what is not
+
+Only **final permission refusals** are cached: `DENIED_BY_POLICY`, `REJECTED`,
+`DENIED_UNATTENDED`. Those are the outcomes where policy or a human has already
+answered the question, so asking again would re-prompt someone who said no.
+
+Not cached, because they are different failure classes and several are
+legitimately worth retrying: malformed arguments, unknown tool, schema violation,
+execution failure, timeout, and internal errors. A malformed call retried with
+corrected arguments must reach the model again.
+
+The cache keys on canonical JSON of the call — argument order does not matter,
+and the provider's call id does not, because a model retrying usually mints a
+fresh one.
+
+### Credential boundary
+
+**`FORGE_OPENROUTER_API_KEY`**, read only by the model-gateway/bootstrap layer,
+from a mapping passed in explicitly rather than from `os.environ` directly. The
+ambient environment is never passed wholesale anywhere.
+
+Never placed in an `AgentProfile`, `ConversationState`, `Message`, `ToolResult`,
+system prompt, tool schema, execution environment, audit record, or log. Never
+present in an exception message, nor any prefix of it. A missing key fails at
+gateway construction, before any request is attempted, and the error names the
+variable without echoing the environment.
+
+A **provider error body is never echoed.** Providers quote the request that
+produced the error, and the request carried the authorization header. Only
+bounded, operator-safe metadata is surfaced: the HTTP status, and the provider's
+error code and type when they parse as short identifiers.
+
+### Process output is untrusted, and v1 does not redact it
+
+Stated plainly rather than reassuringly: **bounded stdout and stderr are
+returned to the model, and Forge v1 provides no general output-redaction
+guarantee.** Process output may contain sensitive data.
+
+What Forge does do: prevent *known* secret sources from being deliberately read
+where the secret classifier can identify them. What it cannot do: guarantee that
+an arbitrary subprocess's output is free of secrets. The path-based secret
+classifier is not applied to a byte stream — that is a different problem with
+different failure modes, and `execution.py` already records that redaction is
+separate work belonging after an audit trail exists to review what was redacted.
+
+Bounding is what v1 provides: 1 MiB retained per stream, truncation always
+flagged, output never written to a log or to memory.
+
+### Session memory
+
+Session-only, in-process, one run. `ConversationState` holds the messages, the
+turn counter, and the denial cache; it is returned in `RunResult` for inspection
+and dropped when the process exits. Nothing is written to disk, serialised, or
+pickled. A test asserts a run creates no file.
+
+The security consequence is worth stating because it removes the need for a
+scrubbing pass: every message that reaches the state has already passed through
+the dispatcher, and the provider key is never a message, never a tool result, and
+never a system instruction. There is nothing to scrub because nothing
+secret-shaped is ever constructed as a message.
+
+Durable project memory remains specified and disabled. Personal memory remains
+out of scope.
+
+### A defect that was found and fixed
+
+**A non-root `exec_command` cwd used to fail to execute.** `ApprovalRequest.from_command`
+set `workspace=verdict.cwd` instead of the workspace root. The two are the same
+directory for a root-level command and different directories for any nested one,
+so in a subdirectory the approval fingerprinted the subdirectory as the workspace
+while the executor fingerprinted the real root. The digests disagreed and a
+correctly-approved operation was refused with `INVALID_APPROVAL`.
+
+`CommandVerdict` carries the resolved *cwd* but not the workspace root, so the
+constructor could not infer it and had nothing correct to bind.
+
+**The fix makes `workspace` a required keyword** on both
+`ApprovalRequest.from_command` and `Approver.submit_command`. There is no
+default and no fallback to `verdict.cwd`, because that fallback is precisely
+what let the defect ship: it is correct for a root-level command and wrong for a
+nested one, so it fails only in the case that matters. A caller that forgets now
+gets a `TypeError` at the call site instead of an approval that is silently
+mis-bound and can never be spent.
+
+Every caller passes the root explicitly: `forge check` uses the workspace it
+already resolved, and the agent dispatcher uses `self.workspace.root`.
+
+**Nothing was relaxed to make the digests match.** `workspace` and `cwd` remain
+separate fields, both still enter the digest, and both still independently
+invalidate an approval. `tests/test_dispatcher.py` covers that directly: changing
+the cwd after approval fails, changing the workspace after approval fails, and the
+two fields are asserted distinct on one request. A structural test asserts the
+required argument cannot be dropped again. The existing binding, claim, and
+target-revalidation tests in `test_execution.py` all still pass unchanged.
 
 ## Agent: Ember
 

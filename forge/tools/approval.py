@@ -361,11 +361,29 @@ class ApprovalRequest:
         verdict: CommandVerdict,
         *,
         agent: str,
+        workspace: Path,
         tool: str = "exec_command",
         intent: str | None = None,
         git_context: str | None = None,
     ) -> "ApprovalRequest":
         """Build a request from a :class:`CommandVerdict`.
+
+        Args:
+            workspace: The Forge workspace root. **Required, with no default.**
+
+                It was once optional and fell back to ``verdict.cwd``, which is
+                how a defect shipped: the fallback is correct for a root-level
+                command and wrong for a nested one, so the approval
+                fingerprinted a subdirectory as the workspace, the executor
+                fingerprinted the real root, the digests disagreed, and a
+                correctly-approved operation was refused with
+                ``INVALID_APPROVAL``. ``CommandVerdict`` carries the resolved cwd
+                but not the root, so there was never a safe fallback to infer.
+
+                Making it mandatory removes the failure mode rather than
+                documenting it. A caller that forgets now gets a ``TypeError`` at
+                the call site instead of a subtly mis-bound approval that only
+                misbehaves for commands run outside the root.
 
         Raises:
             DeniedByPolicy: ``verdict`` is a denial. A denied command has no
@@ -385,7 +403,7 @@ class ApprovalRequest:
             rule=verdict.rule,
             classification=verdict.classification,
             reason=verdict.reason,
-            workspace=verdict.cwd,
+            workspace=workspace,
             detail=detail,
             intent=intent,
             targets=verdict.targets_resolved,
@@ -890,6 +908,7 @@ class Approver:
         verdict: CommandVerdict,
         *,
         agent: str,
+        workspace: Path,
         secret_verdicts: tuple[SecretVerdict, ...] = (),
         tool: str = "exec_command",
         intent: str | None = None,
@@ -922,6 +941,10 @@ class Approver:
             intent: The agent's own reason, in its words. Optional.
             git_context: Caller-supplied git context. No lookup is performed
                 here.
+            workspace: The Forge workspace root, forwarded to
+                :meth:`ApprovalRequest.from_command`. **Required.** The command
+                verdict carries only a resolved cwd, and conflating the two
+                mis-binds every command run outside the root.
         """
         effective = effective_classification(
             verdict.classification,
@@ -943,7 +966,12 @@ class Approver:
 
         try:
             request = ApprovalRequest.from_command(
-                verdict, agent=agent, tool=tool, intent=intent, git_context=git_context
+                verdict,
+                agent=agent,
+                tool=tool,
+                intent=intent,
+                git_context=git_context,
+                workspace=workspace,
             )
         except DeniedByPolicy as denial:
             return ApprovalOutcome(
