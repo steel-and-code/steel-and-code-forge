@@ -602,7 +602,8 @@ def render_prompt(request: ApprovalRequest) -> str:
             _field("Reason", request.intent or NOT_SUPPLIED),
             _field("Git context", request.git_context or NOT_SUPPLIED),
             "",
-            f"Approve request from {request.agent}? Type 'y' or 'yes':",
+            f"Approve request from {request.agent}? "
+            "Type 'y'/'yes' to approve or 'n'/'no' to reject:",
         ]
     )
     return "\n".join(lines)

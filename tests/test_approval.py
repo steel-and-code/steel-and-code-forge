@@ -569,7 +569,23 @@ def test_prompt_footer_names_the_requesting_agent(
     )
     prompt = outcome.request.render()  # type: ignore[union-attr]
 
-    assert "Approve request from byte? Type 'y' or 'yes':" in prompt
+    assert prompt.endswith(
+        "Approve request from byte? "
+        "Type 'y'/'yes' to approve or 'n'/'no' to reject:"
+    )
+
+
+def test_prompt_footer_spells_out_both_answers(
+    classifier: CommandClassifier,
+) -> None:
+    """The footer names approve and reject, so rejecting needs no guessing."""
+    outcome = Approver(ScriptedApprovalChannel(["y"])).submit_command(
+        classifier.classify(_cmd("git", "commit", "-m", "x")), agent="byte"
+    )
+    prompt = outcome.request.render()  # type: ignore[union-attr]
+
+    assert "Type 'y'/'yes' to approve or 'n'/'no' to reject:" in prompt
+    assert "Type 'y' or 'yes'" not in prompt
 
 
 def test_prompt_footer_labels_stay_aligned(

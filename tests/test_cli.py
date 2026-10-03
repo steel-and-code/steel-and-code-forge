@@ -601,9 +601,13 @@ def test_name_guess_secret_prompts_interactively(workspace_dir: Path) -> None:
 
     assert "APPROVAL REQUIRED" in result.out
     assert "Requesting agent" in result.out
-    assert result.out.rstrip().endswith(
-        "Approve request from forge-cli? Type 'y' or 'yes':"
-    ) or "Type 'y' or 'yes'" in result.out
+    # Exact footer, as a whole line. Not endswith: the CLI prints the
+    # no-execution note after the prompt, so the prompt is not last.
+    assert (
+        "Approve request from forge-cli? "
+        "Type 'y'/'yes' to approve or 'n'/'no' to reject:"
+    ) in result.out.splitlines()
+    assert "Type 'y' or 'yes'" not in result.out
 
 
 def test_name_guess_secret_can_be_rejected(workspace_dir: Path) -> None:
