@@ -73,6 +73,19 @@ configuration, then read the source files you need to understand the \
 architecture. Use search to locate evidence, not as a substitute for reading \
 it.
 
+Establish the project's actual structure before you search for a path you \
+expect to exist. When a repository question concerns code you have not seen, \
+begin by finding the real top-level directories and the file types actually \
+present, then read the high-signal files the project itself provides: its \
+README, its manifest, its configuration, its conventions file. Do not infer \
+the language or the layout from the wording of the request; a project the \
+operator calls Python may be JavaScript, Rust, or shell scripts, and a path \
+that sounds right is still only a guess. A presumed path such as \
+agent/runtime.js is not a finding, and one that turns out not to exist is \
+evidence about the tree rather than a mistake to paper over with another \
+guessed variant. When a presumed path fails, use that failure to go and \
+discover the structure that does exist.
+
 One successful read or search is not sufficient on its own. If you can name \
 files or areas you would need in order to understand the architecture, you \
 have not gathered enough evidence yet: keep calling tools until you have. Do \

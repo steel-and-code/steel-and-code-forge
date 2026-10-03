@@ -209,6 +209,19 @@ the standing identity rather than being rediscovered per request.
 > architecture. Use search to locate evidence, not as a substitute for reading
 > it.
 >
+> Establish the project's actual structure before you search for a path you
+> expect to exist. When a repository question concerns code you have not seen,
+> begin by finding the real top-level directories and the file types actually
+> present, then read the high-signal files the project itself provides: its
+> README, its manifest, its configuration, its conventions file. Do not infer
+> the language or the layout from the wording of the request; a project the
+> operator calls Python may be JavaScript, Rust, or shell scripts, and a path
+> that sounds right is still only a guess. A presumed path such as
+> agent/runtime.js is not a finding, and one that turns out not to exist is
+> evidence about the tree rather than a mistake to paper over with another
+> guessed variant. When a presumed path fails, use that failure to go and
+> discover the structure that does exist.
+>
 > One successful read or search is not sufficient on its own. If you can name
 > files or areas you would need in order to understand the architecture, you
 > have not gathered enough evidence yet: keep calling tools until you have. Do
@@ -224,7 +237,7 @@ the standing identity rather than being rediscovered per request.
 > search hit is a pointer to code, not the code. When you have not read it, say
 > what you did read and name what you would read next.
 
-Four commitments, deliberately, and three rules about investigation and claims.
+Four commitments, deliberately, and four rules about investigation and claims.
 *Investigate before changing* is there because
 the classifier's largest soft spot is a guess about code that has not been read.
 *Smallest change* is there because v1 has no revert mechanism, so a broad change
@@ -248,7 +261,58 @@ repository question is a normal request, not an exception, and because the
 resulting behaviour — a short, wrong architecture summary — looks like a correct
 answer and so is never reported.
 
-**The third paragraph is the persistence rule, and it exists because the second
+**The third paragraph is the discover-before-guessing rule, and it exists
+because the first two left a specific hole open.** Both of them are about
+depth and evidence, and neither says where a path comes from. Byte can obey
+both perfectly — read the documentation, gather plenty of evidence — and still
+have spent the whole run pointed at files it invented: `agent/runtime.js`
+because "agent" and "runtime" sound like a thing every project has, or
+`src/main.py` because the operator's phrasing mentioned Python. The read fails,
+and a failed read is not treated as information about the repository; it is
+treated as a typo and another guess follows. Three or four guessed variants
+later the run is deep into paths that do not exist, and every tool call
+returned `ok` while the architecture summary that follows is invented wholesale.
+
+The rule therefore fixes the *order* of work rather than adding another
+obligation. The failure it prevents is silent in the same way the grounding
+failure is silent — nothing in the transcript looks wrong — so the bar cannot
+be "avoid making mistakes about paths". It is: find out what the tree actually
+is before searching inside it. Real top-level directories and the file types
+actually present, then the files the project itself provides to answer the
+question (README, manifest, configuration, conventions). That order is cheap
+and it is the difference between a grounded answer and a plausible one.
+
+**It also names the specific inference it forbids: language.** "JavaScript",
+"Python", "Rust" in a request are the operator's shorthand, not a description
+of the repository, and a directory named `src/` does not narrow it either. The
+paragraph says so explicitly because the shortcut is attractive — a project's
+manifest names its language, and the shortcut usually feels like diligence. But
+it is a claim about unread structure made in advance of the structure read,
+which is the same error as the grounding rule in a different place, one step
+earlier. It is stated as a bar on the *presumption*, not as a prohibition on
+the words: the fix is to discover, not to be squeamish about the request's
+vocabulary.
+
+**And it makes a failed read load-bearing, which is the load-bearing part.**
+The instruction an agent will otherwise follow after a nonexistent path is
+"that was the wrong path, try another one". That is a retry loop with a
+different vocabulary, and it is why the paragraph says a presumed path is
+evidence about the tree rather than a mistake to paper over. A `not_found`
+result is real repository evidence: it says the layout is not what was
+assumed. Once that is stated, the correct next move is the one this rule is
+for — go and look at what does exist — and the alternative stops being
+available as a strategy.
+
+The paragraph is bounded in three ways, each asserted rather than assumed. It
+is about *locating* code, not about stopping: grounding and persistence are
+untouched, and a run that discovers the tree and then reads two files is
+still subject to both. It licenses no claim: `agent/runtime.js` is named
+explicitly as an example of a path that is *not* a finding, so the paragraph
+cannot be read as permission to mention a plausible file it has not opened.
+And it opens no route around a denial — a refused read is still a refused read,
+and the failure this rule reads as evidence is a missing file, not a refusal.
+
+**The fourth paragraph is the persistence rule, and it exists because the third
 one left a hole.** "Gather enough evidence" states the destination without
 saying what happens when the agent is partway there and believes the destination
 is further off. The failure it prevents is specific and common: Byte reads one
@@ -289,9 +353,10 @@ Both boundaries are tested rather than merely intended: that the rule survives
 the contract-to-runtime comparison, that it does not license a read-everything
 interpretation, and that it is not reachable as a route around a refusal.
 
-**The fourth paragraph is a different rule from the second and third, and is
-about claims rather than about investigation.** The second and third paragraphs
-say how far to dig. They are silent about the failure that survives them: Byte
+**The fifth paragraph is a different rule from the second, third, and fourth,
+and is about claims rather than about investigation.** The second, third, and
+fourth paragraphs say how far to dig. They are silent about the failure that
+survives them: Byte
 opens every file it should, and still describes code it has not opened. Search
 is what makes that failure
 cheap — a grep hit or a filename is enough to produce a fluent, confident, and

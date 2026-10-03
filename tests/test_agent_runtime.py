@@ -614,6 +614,184 @@ def test_persistence_is_a_separate_paragraph_from_grounding() -> None:
 
 
 # --------------------------------------------------------------------------
+# Discover before guessing: establish the real tree before searching it
+# --------------------------------------------------------------------------
+
+#: The opening words of the discover-before-guessing paragraph. Located by text
+#: rather than by paragraph index, so the neighbouring persistence and grounding
+#: tests keep pointing at their own paragraphs.
+DISCOVERY_PHRASE = "Establish the project's actual structure"
+
+#: The presumed path the rule names. It is deliberately a real-looking path in
+#: neither this repository nor any other, because that is the point: it is what
+#: a filename search invents out of the request's own vocabulary.
+PRESUMED_PATH_EXAMPLE = "agent/runtime.js"
+
+
+def _discovery_paragraph() -> str:
+    block = _block_b()
+    assert DISCOVERY_PHRASE in block, "Block B has no discover-before-guessing paragraph"
+    rest = block[block.index(DISCOVERY_PHRASE) :]
+    end = rest.find("\n\n")
+    return rest if end == -1 else rest[:end]
+
+
+def test_discovery_precedes_any_search_for_an_expected_path() -> None:
+    """The tree is established before a path inside it is searched for.
+
+    The failure this pins is a run that obeys both existing Block B rules and is
+    still wrong: it gathers evidence diligently, at real paths it invented,
+    because nothing said where a path is supposed to come from. So the rule is
+    asserted as an ordering claim -- establish the actual structure, and only
+    then search -- and as a discovery of what is *actually present*, not as a
+    bar on any particular file.
+    """
+    paragraph = _discovery_paragraph()
+
+    # The ordering is stated as a before, not implied by word order.
+    assert "before you search" in paragraph
+    # Discovery is of the real tree: top-level directories and real file types.
+    assert "top-level directories" in paragraph
+    assert "actually present" in paragraph
+    # And the high-signal files, named rather than gestured at, because reading
+    # the project's own documentation is the cheapest substitute for guessing.
+    for signal_file in ("README", "manifest", "configuration", "conventions"):
+        assert signal_file in paragraph, f"discovery rule lost a source: {signal_file}"
+
+
+def test_discovery_does_not_assume_a_language_from_the_request() -> None:
+    """Operator shorthand is not a description of the repository.
+
+    This is the specific inference that makes the others tempting: "it's the
+    JavaScript one", "it's Python", so `src/main.py` or `index.js`. Asserted as
+    a bar on the presumption and not as a ban on the words themselves, so the
+    fix stays discovery rather than squeamishness about the request.
+    """
+    paragraph = _discovery_paragraph()
+
+    # The prohibition is on inferring, stated as an instruction.
+    assert "Do not infer" in paragraph
+    assert "the language or the layout from the wording of the request" in paragraph
+    # The counterexample is given, so the rule is concrete rather than abstract.
+    for language in ("Python", "JavaScript", "Rust"):
+        assert language in paragraph, f"language inference not illustrated: {language}"
+    # A guess is still called a guess. Hiding the word would let the paragraph
+    # be satisfied by talking about "expected paths".
+    assert "still only a guess" in paragraph
+
+
+def test_a_presumed_path_is_not_treated_as_a_finding() -> None:
+    """The plausible filename is named as the thing it is: not evidence.
+
+    Grounding already bars claiming what unread code does. This is the same
+    error one step earlier, and it needs its own bar because the moment a
+    plausible path appears in the transcript it starts to look like knowledge
+    of the layout.
+    """
+    paragraph = _discovery_paragraph()
+
+    assert PRESUMED_PATH_EXAMPLE in paragraph
+    assert "is not a finding" in paragraph
+    # The grounding rule is still downstream and still intact, so this
+    # paragraph cannot be read as replacing it.
+    assert GROUNDING_PHRASE in _block_b()
+    assert paragraph.index(DISCOVERY_PHRASE) < _block_b().index(GROUNDING_PHRASE)
+
+
+def test_a_failed_presumed_path_is_evidence_rather_than_a_retry() -> None:
+    """The not-found result changes what Byte does next.
+
+    Without this, the default continuation after a nonexistent path is "that
+    was the wrong path, try another" -- a retry loop in different vocabulary,
+    several guesses deep, with every tool call returning ok. So the rule has to
+    state that a failed read is information about the tree, and that the
+    response is to discover rather than to re-guess.
+    """
+    paragraph = _discovery_paragraph()
+
+    # A missing path is evidence about the structure, not a typo to absorb.
+    assert "evidence about the tree" in paragraph
+    assert "paper over with another" in paragraph
+    # And the named next move is discovery, which is the whole rule.
+    assert "discover the structure that does exist" in paragraph
+    # Not a quota: no "keep trying until one works" reading is licensed.
+    for banned in ("at least", "minimum of", "try each", "until one works"):
+        assert banned not in paragraph, f"failed-path rule became a quota: {banned}"
+
+
+def test_discovery_does_not_license_a_claim_or_a_route_around_a_denial() -> None:
+    """The new paragraph is bounded on the two axes that matter.
+
+    It could rot in two ways. Read as a licence to mention a plausible file,
+    it becomes a loophole through grounding -- the agent did not claim to have
+    read it, it merely noticed where it would be. Read as "keep looking for
+    the file I expected", it becomes a route around a refusal. Both are
+    checked against the denial rule, which is where circumvention is closed.
+    """
+    paragraph = _discovery_paragraph()
+
+    # No hedging licence crept in, same banned set the grounding test uses.
+    for banned in ("likely", "probably", "assume", "inferred"):
+        assert banned not in paragraph, f"discovery rule licenses a guess: {banned}"
+    # Not a retry or re-routing rule.
+    for banned_route in ("alias", "wrapper script", "different tool"):
+        assert banned_route not in paragraph, f"discovery opened a route: {banned_route}"
+    # The evidence it reads is a *missing file*. A refusal is not a missing
+    # file, so this cannot be read as "the read was refused, find another way":
+    # persistence still names the refused read as a stopping condition, and the
+    # denial rule still closes every re-routing route.
+    assert "turns out not to exist" in paragraph
+    assert "a read is refused" in _persistence_paragraph()
+    assert BLOCK_D_DENIAL_PHRASE in next(
+        b for b in BLOCKS if b.startswith("Call tools with the exact")
+    )
+
+
+def test_discovery_survives_the_contract_comparison() -> None:
+    """The rule lives in the contract, so a prompt-only edit cannot introduce it.
+
+    Same reasoning as the grounding, persistence, and recoverable-error rules.
+    The prompt-only version of this test would pass against a change that was
+    never reviewed as an instruction; the contract is the record, and the
+    verbatim sync test carries the wording into the prompt from there.
+    """
+    contract = parse_contract_blocks(CONTRACT_PATH.read_text(encoding="utf-8"))
+    block_b = contract["B"]
+
+    assert DISCOVERY_PHRASE in block_b
+    assert PRESUMED_PATH_EXAMPLE in block_b
+    assert "Do not infer" in block_b
+    # The rules it neighbours were preserved rather than traded away for it.
+    assert GROUNDING_PHRASE in block_b
+    assert PERSISTENCE_PHRASE in block_b
+    assert WOULD_NEED_MOVE in block_b
+
+
+def test_discovery_is_a_separate_paragraph_from_persistence_and_grounding() -> None:
+    """Three rules, three paragraphs.
+
+    Discovery and persistence share a trigger -- a failed or absent path is
+    exactly when "keep going until you have enough" could decay into "keep
+    guessing until one lands". Merged, the model could satisfy the cheaper
+    reading at the expense of the expensive one, and the expensive one is the
+    one that prevents four invented paths.
+    """
+    block = _block_b()
+
+    # Neither rule leaked *into* the discovery paragraph. (Ordering the other
+    # way is asserted below: discovery precedes persistence, so persistence
+    # legitimately appears later in the block.)
+    assert PERSISTENCE_PHRASE not in _discovery_paragraph()
+    assert GROUNDING_PHRASE not in _discovery_paragraph()
+    assert DISCOVERY_PHRASE not in _persistence_paragraph()
+    # And it sits after the evidence-gathering paragraph it constrains: gather
+    # the evidence, from the paths the project actually has.
+    discovery_start = block.index(DISCOVERY_PHRASE)
+    assert block.index("When you are asked to inspect") < discovery_start
+    assert discovery_start < block.index(PERSISTENCE_PHRASE)
+
+
+# --------------------------------------------------------------------------
 # Approval integration
 # --------------------------------------------------------------------------
 
