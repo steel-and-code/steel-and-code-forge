@@ -110,6 +110,18 @@ Three things are kept distinct: whether a tool exists in Forge at all
 particular call needs a human (approval). Approval narrows a permission, it
 never widens one.
 
+**Permissions come from the Forge-wide baseline**, specified in
+[byte-tools.md](byte-tools.md). Three properties:
+
+1. **One baseline.** Every agent runs under it.
+2. **An agent may be narrower.** Its configuration selects a subset of the
+   baseline's tools and permissions. This is structurally guaranteed: nothing in
+   the configuration path can add a permission.
+3. **An agent may not widen the baseline in v1.** Not quietly and not loudly.
+   There is no "allow extra" key, no trust override, and no per-agent policy
+   file that grants what the baseline withholds. Any future widening is a change
+   to the Forge baseline itself, reviewed like any other policy change.
+
 Two rules apply to every agent:
 
 - **Credentials are usable but not visible.** An agent may invoke a Forge-managed
@@ -118,7 +130,8 @@ Two rules apply to every agent:
 - **Approval is per-operation.** One approval covers one call. No
   session-wide or persistent approval mode.
 
-Byte's v1 permission model is specified in [byte-tools.md](byte-tools.md).
+Byte is the baseline's reference configuration. Ember, Fin, and any future agent
+inherit it unless a future contract explicitly changes it.
 
 ### Workspace
 
@@ -309,18 +322,31 @@ document; whether all of it ships in v1 is not.
 
 ### Permissions
 
-Configurable per the v1 permission model in [byte-tools.md](byte-tools.md): read,
-edit, search, tests, and git inspection are automatic inside the workspace;
-destructive filesystem operations and `git commit`/`git push` require approval;
-system-level, `sudo`, out-of-workspace, and credential access are denied by
-default; force push is denied outright.
+The Forge-wide baseline in [byte-tools.md](byte-tools.md), which Byte
+instantiates without modification:
+
+**Automatic inside the workspace:** read-only inspection (non-secret files and
+the read-only command forms), structured `write_file` / `patch_file` edits,
+search, and git inspection including the listing forms of `git branch`,
+`git tag`, and `git stash`.
+
+**Approval-required:** destructive and general command-based filesystem writes,
+every git mutation (`git add`, `commit`, `push`, `merge`, `rebase`, branch and
+tag creation, stash push/pop/drop), executing repository code (`pytest`,
+`python -m pytest`, `make`, `npm test`, `cargo`, `go`, `tox`, `nox`), any
+executable resolving inside the workspace, inline interpreter code, network
+egress, and **any unrecognised argv command**.
+
+**Denied:** system-level and `sudo` operations, out-of-workspace access,
+credential access, dependency installation, force push, destructive git history
+operations, wildcard destructive deletes, and destructive SQL.
 
 Two further v1 constraints: commands are invoked as argument arrays rather than
-shell strings wherever possible, and unclassifiable commands are treated as
-ambiguous and approval-gated rather than assumed safe. Dependency installation
-is excluded from v1 entirely.
+shell strings wherever possible, and **automatic is an explicit rule rather than
+a default** — an unrecognised command is approval-gated, not assumed safe.
 
-No per-project overrides decided.
+Byte is the reference configuration and carries no special exception. An agent
+may be configured narrower; there is no configuration that makes it wider.
 
 ### Workspace
 
@@ -535,10 +561,6 @@ remaining here are contract-level:
   least one tool to be useful?
 - What does a run look like when the agent lacks something it needs: fail on
   startup, or fail when the gap is hit?
-- Should Byte's permission model become the shared default for all agents, or
-  stay a per-agent decision?
-- Do the credential and per-operation-approval rules hold for every agent, or
-  does an agent with a different trust profile need an exception?
 - When does Ember and Fin stop being placeholders?
 - **Personal memory.** Excluded from v1 and undesigned. If it is ever added it
   lives outside any repository and needs its own governance — retention, what may
@@ -554,3 +576,16 @@ remaining here are contract-level:
 **Resolved here:** memory scope is a Forge-wide decision rather than a per-agent
 one, with Byte as the reference agent. Ember, Fin, and any future agent inherit
 the same memory architecture unless a future contract explicitly changes it.
+
+**Also resolved here: the permission baseline is Forge-wide, not per-agent, and
+is not overridable by an agent.** Byte is the reference configuration. An agent
+may be configured narrower; nothing in the configuration path can widen the
+baseline, and no agent-level "allow extra" or trust override exists in v1. Any
+future widening is a change to the Forge baseline itself, reviewed like any other
+policy change.
+
+This closes the two contract-level questions that asked whether the model should
+be shared, and whether the credential and per-operation-approval rules need
+exceptions for a different trust profile. They hold for every agent. An agent
+with a different trust profile gets a narrower configuration, not a different
+model — and there is deliberately no mechanism for the latter.

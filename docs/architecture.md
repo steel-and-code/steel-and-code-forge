@@ -146,7 +146,18 @@ operations and asks for approval; `forge check` still executes nothing.
 operation only when handed an already-approved outcome whose binding digest
 matches the invocation exactly, and an approved outcome is a single-spend
 capability that cannot be replayed — including by a second executor. The CLI
-does not call it yet; a future `forge exec` would.
+does not call it yet; the agent runtime will.
+
+**There is no `forge exec` in v1, and that is a decision rather than a gap.** A
+human running a command uses their own shell, which already grants everything
+such a surface would and keeps their own judgement and undo history. An agent
+requesting execution goes through the one pipeline — classify, secret checks,
+approval, execute — and that pipeline is not exposed as a second entry point,
+because two entry points mean two policies once the second one needs an
+exception the first is too slow to take. A human-facing execute verb would also
+be one `--yes` flag away from voiding the approval model. The reasoning and the
+only acceptable shape for a future one are in
+[byte-tools.md](byte-tools.md).
 
 ### OpenRouter — model gateway
 
@@ -190,6 +201,16 @@ service.
 All three run on the same Forge runtime and differ by configuration: model,
 tools, instructions, permissions, workspace, and memory scope. Byte is the only
 one specified so far; Ember and Fin are planned names with no agreed scope.
+
+**Permissions are not part of that per-agent freedom.** Every agent runs under
+one Forge-wide safety baseline — the workspace boundary, the two-tier secret
+classification, and the command classifier, with automatic / approval-required /
+denied decided by an explicit rule table and approval-required as the default for
+anything unrecognised. Byte is its reference configuration. An agent may be
+configured **narrower** than the baseline; nothing in the configuration path can
+widen it, and there is no agent-level "allow extra" or trust override in v1. Any
+future widening is a change to the baseline itself, reviewed like any other
+policy change.
 
 The per-agent fields are defined in [agent-contract.md](agent-contract.md). No
 agent logic, prompt, or executable definition exists.
@@ -268,9 +289,15 @@ would otherwise be re-litigated:
 - The terminal entry point classifies and asks; `forge check` still executes
   nothing.
 - Execution lives in exactly one module and requires a claimed approval. There
-  is no second path to `subprocess`.
+  is no second path to `subprocess`, and no `forge exec` in v1.
 - An approved outcome is a single-spend capability, and it is bound to the exact
   invocation it approved.
+- Permissions are a Forge-wide baseline, not a per-agent choice. Agents may be
+  narrower; nothing may widen the baseline in v1.
+- Automatic is an explicit rule. An unrecognised command is approval-required,
+  so a classifier miss produces a prompt rather than silent execution.
+- Executing repository code is approval-required — test runners and workspace
+  scripts alike, because a repository is not a trust boundary.
 - Model access behind one gateway interface; no vendor names above it.
 - Agents are configuration, not classes or services.
 - Agents may use credentials but never see them.
@@ -291,9 +318,13 @@ would otherwise be re-litigated:
 - Does Forge ever call out to n8n, or only receive from it?
 - Are the security classification lists in
   [byte-security-classification.md](byte-security-classification.md) accepted
-  as written? All five classification decisions are settled: two-tier secret
-  sources, wildcard deletes denied, inline code approval-gated without analysis,
-  network commands approval-gated, Linux-only scope.
+  as written? Settled: two-tier secret sources, wildcard deletes denied, inline
+  code approval-gated without analysis, network commands approval-gated,
+  Linux-only scope, and — from the permission-model pass — an explicit ALLOW
+  table with approval-required as the default for unrecognised commands, plus
+  approval-required for workspace-local executables and for anything executing
+  repository code. **The code has not caught up to the last three yet**; see the
+  gap table in [byte-tools.md](byte-tools.md).
 
 **Resolved:** memory scope is a single Forge-wide decision, not a per-agent one,
 with Byte as the reference agent. Session memory in v1; durable project memory

@@ -16,7 +16,7 @@ forge/
   tools/      tools an agent is allowed to call
   memory/     agent memory and state
   workflows/  multi-step orchestration, trigger handling
-tests/        pytest suite (609 passing)
+tests/        pytest suite (610 passing)
 docs/         architecture and design notes
 ```
 
@@ -55,18 +55,42 @@ terminal entry point exists and drives all of it. Byte's agent contract is
 fully specified — system instructions and memory included.
 
 The execution layer exists and runs approved operations; the CLI does not call
-it yet, so `forge check` still executes nothing. Next steps, in order:
+it yet, so `forge check` still executes nothing. There is **no `forge exec` in
+v1** — that is a decision, not a gap; the reasoning is in
+[docs/byte-tools.md](docs/byte-tools.md). Next steps, in order:
 
-1. Wire a `forge exec` subcommand to the executor, and decide what Byte is
-   allowed to run without asking.
+1. Implement the permission-model changes: an explicit ALLOW rule table,
+   approval-required as the default for unrecognised commands, and gating for
+   workspace-local executables and repository-code execution. The gap between
+   the spec and the code is tabulated in
+   [docs/byte-tools.md](docs/byte-tools.md).
 2. Define the model gateway contract in `forge/models/`.
-3. Implement the agent contract in `forge/agents/`.
+3. Implement the agent contract in `forge/agents/`, and wire the runtime to the
+   existing executor through the classify → secret checks → approval → execute
+   pipeline.
 4. Implement session memory, the one memory scope v1 enables.
 5. Record execution and approval events somewhere reviewable. Nothing is
    recorded durably yet, and this should exist before durable memory is enabled.
 6. Define the secondary HTTP surface n8n and the website will call.
 7. Wire n8n trigger handling.
 8. Write the remaining tools.
+
+## Permission model
+
+One Forge-wide safety baseline, with Byte as its reference configuration. Every
+agent runs under it; an agent may be configured narrower, and nothing in v1 can
+widen it.
+
+| | Examples |
+| --- | --- |
+| **Automatic** | Read-only inspection in the workspace (`ls`, `pwd`, `find` read forms, `grep`, `rg`, `cat`, `head`, `tail`, `wc`, `stat`, `file`, `diff`); `git status`, `diff`, `log`, `show`, `rev-parse`, `ls-files`, and the listing forms of `git branch`, `tag`, `stash`; structured `write_file` / `patch_file` edits. |
+| **Approval required** | Every git mutation including `add`, `commit`, `push`; general filesystem writes (`mkdir`, `touch`, `cp`, `mv`, `ln`, `chmod`, `rm`); executing repository code (`pytest`, `make`, `npm test`, `cargo`); any executable resolving inside the workspace (`./scripts/check.sh`); inline interpreter code; network egress; **any unrecognised command**. |
+| **Denied** | `sudo` and system-level changes; anything outside the workspace; credential access and environment dumps (`env`, `printenv`); dependency installation; force push and destructive git history; wildcard destructive deletes. |
+
+Automatic is an explicit rule, never a default, and the allowlist is
+deliberately small: an entry is added only when there is confidence it belongs
+there. An unrecognised command is approval-required, so a classifier miss
+produces a prompt rather than silent execution.
 
 ## Terminal interface
 
@@ -114,9 +138,10 @@ pip install -e '.[dev]'
 pytest
 ```
 
-This works. There is no application code yet — no agent runtime, no CLI, no
-interfaces, and no command execution. What exists is the security classification
-layer, the terminal approval step that consumes it, and their tests.
+This works. There is no agent runtime yet, no model gateway, no HTTP surface, and
+no memory layer. What exists is the security classification layer, the terminal
+approval step that consumes it, the command execution layer, the `forge` CLI, and
+their tests. `forge check` classifies and asks; it executes nothing.
 
 ## Configuration
 

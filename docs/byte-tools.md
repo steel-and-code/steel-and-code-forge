@@ -1,10 +1,12 @@
 # Byte v1 — Tools and Permissions
 
-Status: specification. No tools implemented. No code exists for any of this.
+Status: specification, implemented in `forge/tools/` and `forge/cli/`. Several
+rules in this document were changed by the permission-model pass; each is marked
+where it changed.
 
-Scope: Byte only, version 1. This is the first agent to get a concrete tool
-list, and the pattern here is intended to become the reference for Ember and
-Fin.
+Scope: the Forge-wide safety baseline, with Byte as its reference configuration.
+This is the pattern Ember and Fin inherit. The baseline is not Byte-specific and
+does not become so.
 
 ## Purpose
 
@@ -75,7 +77,21 @@ region.
 Within the workspace: automatic for both. No approval.
 
 An existing file that the operator has open or uncommitted changes in is the
-one case that might warrant a prompt. Not decided here — see open questions.
+one case that might warrant a prompt.
+
+> **Ruled: no special dirty-file gate in v1.** The permission mechanism is
+> deferred. `write_file` and `patch_file` remain automatic in the workspace,
+> exactly as documented above.
+>
+> What is *not* deferred is the behavioural requirement. Byte's instructions
+> should still require inspecting repository state before editing and avoiding
+> silent overwrites of work it did not write — that is a prompt to good conduct
+> in the system instructions, not a permission Forge enforces, and the two are
+> kept distinct rather than conflated. A permission gate here would need to
+> decide what "the operator cares about" means, which is a workflow judgement
+> rather than a safety property; see the open questions.
+>
+> Deferred with the reasoning: in-place edits to dirty files.
 
 ### Search
 
@@ -104,12 +120,26 @@ for how Byte invokes commands and how they are classified.
 A deliberate convenience over raw `exec_command`. It knows how to find the test
 runner in a given project, so Byte does not have to guess the command.
 
-Automatic inside the workspace. No approval. Tests may legitimately do things
-that look destructive — write to a temp dir, build, delete a cache — and
-prompting on that would make Byte useless.
-
 `run_tests` runs an already-provisioned environment. It does not install
 anything to get there.
+
+> **Changed by the permission-model pass. `run_tests` is approval-required,
+> not automatic.** The earlier draft made it automatic, reasoning that tests
+> "may legitimately do things that look destructive" and that prompting on them
+> would make Byte useless. That reasoning was sound about the *destructive* part
+> and wrong about the *automatic* part, because running a test suite is running
+> repository code: `pytest` executes `conftest.py`, loads installed plugins,
+> imports fixtures, and runs arbitrary test code. The same pass ruled that
+> `./scripts/check.sh` requires approval, and those two rulings cannot both be
+> right — a shell script in the repository and a test runner in the repository
+> are the same trust proposition. Gated.
+>
+> See [Repository code is not a trust
+> boundary](byte-security-classification.md#repository-code-is-not-a-trust-boundary).
+>
+> Reading a test file is unaffected. `cat tests/test_x.py`, `grep`,
+> `search_content`, and `read_file` on a test file stay automatic; the gate is
+> on executing repository code, not on looking at it.
 
 ### Git — inspect
 
@@ -136,6 +166,13 @@ repository.
 Branch and remote operations are absent because each one has a plausible
 accident and no v1 need. Adding them later is additive.
 
+This list is about **tool availability** — whether Byte has a dedicated tool —
+and is separate from the git action policy below. A dedicated `git_branch` tool
+does not exist in v1; the underlying `git branch` invocation is still classified
+by the classifier, and its listing form is automatic while its mutating forms are
+approval-required or denied. The two layers are independent by design: a
+permission ruling does not create a tool.
+
 Commands are invoked as argument arrays rather than shell strings wherever
 possible. See
 [Command execution and classification](#command-execution-and-classification).
@@ -150,9 +187,15 @@ write actions are not.
 | `git status` | Automatic |
 | `git diff` | Automatic |
 | `git log` | Automatic |
+| `git branch` / `git tag` listing forms | Automatic |
+| `git stash list` | Automatic |
+| `git add` | Requires explicit human approval |
 | `git commit` | Requires explicit human approval |
 | `git push` | Requires explicit human approval |
+| `git branch` create, `git switch`, `git tag` create | Requires explicit human approval |
+| `git stash push` / `pop` / `drop` | Requires explicit human approval |
 | force push (`--force`, `--force-with-lease`) | **Denied by default** |
+| branch delete (`-d`, `-D`), tag delete (`-d`) | **Denied by default** |
 | branch, merge, rebase, stash, fetch, pull, tag | Not implemented in v1 |
 
 ### On commit
@@ -176,31 +219,124 @@ push in normal development is low.
 `--force-with-lease` is safer but is still a force push and is covered by the
 same denial until someone decides otherwise.
 
+### On branch, tag, and stash
+
+These are three families with an automatic listing form and a mutating form, and
+they are **classified per operation, not per program**. `git branch` is not one
+permission level; neither is `git tag` or `git stash`.
+
+| Command | Policy |
+| --- | --- |
+| `git branch`, `--list`, `-a -v` | Automatic |
+| `git branch <name>`, `-c`, `git switch` | Approval-required |
+| `git branch -d`, `-D` | **Denied** |
+| `git tag`, `git tag --list` | Automatic |
+| `git tag <name>`, `git tag -a` | Approval-required |
+| `git tag -d` | **Denied** — same reasoning as branch deletion |
+| `git stash list` | Automatic |
+| `git stash push`, `pop`, `drop`, `clear` | Approval-required; `drop` and `clear` destroy state |
+
+Tag deletion is denied because it is the same operation as branch deletion under a
+different noun, and denying one while approving the other would be arbitrary.
+
+### On `git add`
+
+Approval-required. It is the one git write that does not reach the network, so
+the argument for it is not publication — it is that staging is a state change to
+the operator's index, made on the agent's judgement about what belongs in a
+commit, and the operator reviewing that is the point of the gate.
+
+**Approval is per invocation.** v1 does not introduce per-path approval or
+batching semantics: one `git add` invocation is one approval decision, whatever
+it stages. Batching would be a UX refinement of the same gate, not a safety
+one, and it is not designed here.
+
+## The Forge-wide baseline
+
+**Decision: the permission model below is Forge's, not Byte's. Byte is its
+reference configuration.**
+
+This is a naming and ownership correction as much as a policy one. The
+classifier, the workspace boundary, the secret tiers, the approval layer, and the
+executor are all agent-agnostic already — `commands.py` cites this
+specification, not Byte — so describing the model as Byte's would invite reading
+a Forge-wide rule as a per-agent special case.
+
+Three properties, all settled:
+
+1. **One baseline.** Every agent runs under it.
+2. **An agent may be narrower.** An agent's configuration selects a *subset* of
+   the tools and permissions. This is structurally guaranteed: nothing in the
+   configuration path can add a permission.
+3. **An agent may not widen the baseline in v1.** Not quietly and not loudly.
+   There is no "allow extra", no trust override, and no per-agent policy file
+   that grants anything the baseline withholds.
+
+Property 3 is deliberately stronger than "may not *silently* widen". "Silently"
+would imply a loud widening exists. It does not. **Any future widening is a
+change to the Forge baseline itself**, which goes through code review like any
+other policy change and is visible in the diff. That is the only route.
+
+The agent contract reached the same conclusion independently for memory scope,
+and the two should read the same way.
+
 ## Permission model
 
 ### Automatic inside the workspace
 
 No prompt, no delay.
 
-- **Read** any file in the workspace.
-- **Edit** files in the workspace: create, write, patch.
+- **Read** any file in the workspace that is not a secret source.
+- **Edit** files in the workspace through Forge's structured tools:
+  `write_file` and `patch_file`.
 - **Search** filenames and contents in the workspace.
-- **Normal development command execution** inside the workspace.
-- **Run tests** inside the workspace.
-- **Inspect** git status, diff, and log.
+- **Read-only inspection commands**: `ls`, `pwd`, `find` (read forms), `grep`,
+  `rg`, `cat`, `head`, `tail`, `wc`, `stat`, `file`, `diff`, and version probes.
+- **Inspect** git status, diff, log, and the listing forms of `git branch`,
+  `git tag`, and `git stash`.
 
-"Normal development command execution" means the ordinary work of building
-software: build, test, lint, format, typecheck, run, install into a project
-virtualenv. It is defined by intent rather than by an allowlist of binaries,
-because a command allowlist that can express `python -m pytest` cannot express
-the project it is standing in.
+> **The allowlist is deliberately small.** The governing principle:
+>
+>     if we are not confident it belongs in automatic,
+>     leave it at APPROVAL_REQUIRED
+>
+> It is not broadened to reduce prompt count. A missing entry costs one prompt;
+> a wrongly-added one costs a silent execution, and that asymmetry sets the size
+> of the table. Coverage grows one reviewed row at a time.
+
+> **Changed by the permission-model pass.** The earlier draft also listed "normal
+> development command execution" and "run tests" as automatic. Both are now
+> approval-required:
+>
+> - **"Normal development command execution" was not a rule.** It was defined by
+>   intent rather than by a list of programs, on the reasoning that an allowlist
+>   expressing `python -m pytest` "cannot express the project it is standing in".
+>   With an explicit allowlist this objection dissolves: the allowlist is data,
+>   so `python -m <module>` is one row, and a repository that needs a command
+>   covered gets a v2 declaration rather than a standing exemption.
+> - **"Run tests" executes repository code** and is gated with everything else
+>   that does. See the `run_tests` note above.
+
+Automatic remains an **explicit rule**, not a fall-through. A program not on
+List 3 is approval-required.
 
 ### Requires human approval
 
 - **Destructive filesystem operations**: deleting or overwriting outside the
-  workspace, recursive deletes, bulk rewrites, `rm -rf` on any path, force
-  removal of files with changes.
-- **`git commit`** and **`git push`**, per the policy above.
+  workspace, recursive deletes, bulk rewrites, `rm -rf` on any explicit path.
+- **General command-based filesystem writes**: `mkdir`, `touch`, `cp`, `mv`,
+  `ln`, `chmod`, `chown`, `sed -i`, and any redirection Forge does not perform
+  itself.
+- **`git add`**, **`git commit`**, **`git push`**, and every other git mutation
+  not denied above.
+- **Executing repository code**: `pytest`, `python -m pytest`, `make`, `npm
+  test`, `npm run`, `cargo test`/`build`/`run`, `go test`/`build`/`run`, `tox`,
+  `nox`, and `run_tests`.
+- **Any executable that resolves inside the workspace**: `./configure`,
+  `./scripts/check.sh`, `./tool`, `/workspace/bin/lint`.
+- **Any unrecognised argv invocation.** Not automatic by default — see
+  [Unknown commands](byte-security-classification.md#unknown-commands).
+- **Inline code in any interpreter**: `python -c`, `bash -c`, `node -e`.
 - Operations that leave the machine or cost real money: contacting paid APIs,
   sending messages, publishing, opening pull requests, deploying.
 - Anything the operator's project marks as protected.
@@ -210,16 +346,19 @@ the project it is standing in.
 - **System-level and `sudo` operations**: installing system packages, editing
   files outside the workspace root, changing system services, touching `/etc`,
   managing users, changing firewall or network config.
-- **Access outside the assigned workspace**: paths outside the Steel & Code
-  project directories. Includes `~`, `/tmp` as a default, and any path that
-  resolves outside via `..` or symlink.
+- **Access outside the assigned workspace**: any path that resolves outside via
+  `..` or symlink, including a workspace-local executable that resolves out.
 - **Credential access**: reading `.env`, SSH keys, tokens, or any secret file,
-  even inside the workspace. See [Credential handling](#credential-handling) —
-  the rule is that Byte may use credentials it is given, never read one.
+  even inside the workspace. See [Credential handling](#credential-handling).
 - **Dependency installation**. Excluded from v1 entirely, not gated. See
   [Dependency installation](#dependency-installation).
-- **Force push.**
-- **Destructive git history operations** on a shared remote.
+- **Force push**, and remote history destruction generally.
+- **Branch and tag deletion**, `git reset --hard`, `git clean -f`,
+  `git checkout -- .`, `git filter-branch`, `git filter-repo`,
+  `git reflog expire`.
+- **Wildcard destructive deletes**: any destructive operation whose targets
+  cannot be enumerated before execution.
+- **Destructive SQL** reaching a database client.
 
 Denied means the call does not execute and is reported as denied. It is not a
 prompt that a human can approve.
@@ -248,25 +387,30 @@ matters: cheapest and most decisive first.
 
 1. **Workspace containment** — resolve the real path, confirm it is inside the
    workspace. Symlinks resolved before the check, not after.
-2. **Secret-source check** — if the target is a credential source, deny. Not
+2. **Program-token resolution** — where does the executable come from? If it
+   resolves inside the workspace, it is approval-required. This sits next to
+   containment because it uses the same resolution and the same boundary.
+3. **Secret-source check** — if the target is a credential source, deny. Not
    reached for operations that only *use* credentials through Forge.
-3. **Tool availability** — does the tool exist?
-4. **Tool permission** — is Byte allowed this tool?
-5. **Operation classification** — automatic, approval-gated, or denied, per
+4. **Tool availability** — does the tool exist?
+5. **Tool permission** — is the agent allowed this tool? An agent may be
+   narrower than the baseline; it may never be wider.
+6. **Operation classification** — automatic, approval-gated, or denied, per
    [Command execution and classification](#command-execution-and-classification).
-   Ambiguous resolves to approval-gated.
-6. **Prompt** — if approval-gated, present the operation for review and wait.
+   **An unrecognised operation resolves to approval-gated.** Automatic is an
+   explicit rule, never an absence.
+7. **Prompt** — if approval-gated, present the operation for review and wait.
    No interactive channel means the operation fails closed.
-7. **Execute** — only after the above.
+8. **Execute** — only after the above.
 
 Denied at any step stops there. Nothing below a denial runs.
 
 Approvals apply to one operation. They do not persist to the next call, and
 there is no session-wide or persistent allow mode in v1.
 
-The secret-source check sits at step 2, before tool permission, because it does
-not depend on what Byte is allowed to do — a secret is a secret regardless of
-configuration.
+The secret-source check sits at step 3, before tool permission, because it does
+not depend on what the agent is allowed to do — a secret is a secret regardless
+of configuration.
 
 ### Verdicts are ranked together, and one approval covers the operation
 
@@ -522,6 +666,22 @@ that under time pressure, before anything runs, would be premature.
 v1 assumes **none**. Any Byte run that requires approval fails if triggered
 unattended.
 
+> **Accepted: an unattended run that reaches an unknown or unapproved command
+> fails closed.** With approval-required as the default for unrecognised
+> invocations, this now applies to ordinary-looking commands on a toolchain List
+> 3 does not cover — not only to commands that were always gated.
+>
+> That cost is intentional. It is the direct consequence of ruling that a
+> classifier miss must produce a prompt, applied to a run where there is nobody
+> to answer one. The alternative — unattended auto-approval or persistent
+> command trust — is rejected outright, and the same reasoning that forbids a
+> persistent allowlist for an operator forbids it more strongly for a run with
+> no operator at all.
+>
+> The operational implication is a precondition rather than a surprise: an
+> unattended run is viable only for a project whose toolchain is fully covered
+> by List 3.
+
 An explicit unattended permission policy is separate work and is not designed
 here. When it is designed, it should be a per-project allowlist rather than a
 loosening of the approval model.
@@ -585,8 +745,10 @@ Still needed, none of which block starting implementation:
   non-exposure requirement? Exact-value matching against known secrets catches
   the known ones and nothing else. Deciding the approach is needed before the
   output path exists.
-- **Read-only subpaths.** Should there be paths inside the workspace Byte can
-  never write, even though it may read them? `LICENSE`, or generated output?
+- **Read-only subpaths — DEFERRED, no mechanism in v1.** Should there be paths
+  inside the workspace Byte can never write, even though it may read them?
+  `LICENSE`, or generated output? Ruled out for v1; see [Closed by the
+  permission-model pass](#closed-by-the-permission-model-pass).
 - The credential-key check cannot read the candidate → **DENY**,
   `rule="secret.content_unreadable"`. Settled and implemented. A file Forge
   cannot read is a file Forge cannot clear; treating an unreadable file as
@@ -597,7 +759,87 @@ Still needed, none of which block starting implementation:
 - **Database reachability.** The classifier has destructive-database patterns, but
   whether Byte can reach a database in v1 is still undecided.
 
+### Execution path, and why there is no `forge exec`
+
+**Decision: `forge exec` does not exist in v1.** No human-facing execute
+subcommand, and no bypass surface of any kind.
+
+Two things get conflated here, so they are separated:
+
+**A human running a command.** The operator has a shell. They can already type
+`rm -rf build`, `git push --force`, `sudo make install`, or `curl` an internal
+address. A Forge command surface would add no capability they lack and would
+remove one they want — their own shell, with their own judgement and their own
+undo history. **The v1 answer for human execution is the human's own shell,
+outside Forge.** There is nothing to decide.
+
+**An agent requesting execution.** That is `exec_command` inside the agent
+runtime, and its shape is already fixed by what exists:
+
+```
+    classify CommandClassifier
+      -> secret checks
+      -> approval Approver
+      -> Executor.execute
+```
+
+`forge check` already performs the first three and stops. Wiring it to the
+executor belongs to the agent runtime, not to a new CLI verb.
+
+**Why this is not a missing feature but a closed question.** A human-facing
+`forge exec` becomes a bypass the moment it does any of five things:
+
+| Bypass route | Why it is fatal |
+| --- | --- |
+| Classifies with a laxer policy | A second policy system, and the two drift |
+| Skips the approval step | The gate is the product |
+| Accepts shell strings | Unparseable, and already approval-gated for that reason |
+| Inherits the parent environment | Hands every executed command every secret the session held |
+| Offers `--yes` / `--force` | Inverts approval into a rubber stamp |
+
+The `--yes` route is the tempting one, and it is exactly the "approve
+everything" mode `byte-tools.md` already forbids — arriving through a flag
+instead of a documented policy. If a human wants no prompt, the answer is to
+type the command themselves.
+
+There is also a structural argument: two entry points to execution means two
+policies eventually, because the second accumulates the exceptions the first is
+too slow to take. That is precisely the "second independent policy system" the
+design forbids, and `forge exec` is how it would get built.
+
+**If one is added later**, the only acceptable shape is a front end over the
+*identical* pipeline: classify, prompt, and execute through the same `Approver`
+and `Executor`, with no flag that skips a stage and no separate policy table.
+Then it is not a bypass, merely a different entry point. That is a v2 question
+and belongs to whoever has the actual need for it.
+
 ## Implementation status
+
+### What the permission-model pass changed
+
+The policy above is now the specification of record. The classifier in
+`forge/tools/commands.py` still implements the **previous** default — an
+unrecognised argv invocation classifies ALLOW — and has no ALLOW rule table yet.
+That gap is intentional and is the next code change, not a documentation defect.
+Concretely, the following documented rules are **specified but not yet
+implemented**:
+
+| Rule | Specified | Shipped |
+| --- | --- | --- |
+| Unrecognised argv → approval-required | Yes | **No** — still ALLOW |
+| Explicit ALLOW rule table (List 3) | Yes | **No** — table does not exist |
+| Workspace-local executable → approval-required | Yes | **No** |
+| `pytest` / `make` / `npm` / `cargo` → approval-required | Yes | **No** — falls to the old default |
+| `git branch`/`tag`/`stash` per-operation | Yes | **No** — no ALLOW rules, so all fall through |
+| `git add` → approval-required | Yes | **No** |
+| `git tag -d` → denied | Yes | **No** |
+
+Everything else in this document is implemented and tested. The implementation
+work is one focused change to `commands.py`: add `ALLOWED_PROGRAMS`, invert the
+fall-through, add the program-token resolution check, and add the missing git and
+runner rules. No new module and no second policy table.
+
+### Existing implementation
 
 Four pieces of the pipeline are implemented, in `forge/tools/`:
 
@@ -614,8 +856,8 @@ built on top without re-running any of these checks. `approval.py` builds on
 exactly those fields and adds nothing of its own.
 
 Tested by `tests/test_workspace.py` (18), `tests/test_secrets.py` (64),
-`tests/test_commands.py` (261), `tests/test_approval.py` (100),
-`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 609 passing.
+`tests/test_commands.py` (261), `tests/test_approval.py` (101),
+`tests/test_cli.py` (80), and `tests/test_execution.py` (86). 610 passing.
 
 Implemented: workspace containment, secret classification, command
 classification, terminal approval, the terminal interface, and command execution.
@@ -827,10 +1069,19 @@ Nothing was loosened. `docker system prune` remains denied even though the spec
 lists it under approval-required: that over-blocking predates this pass and a
 stricter existing denial is left alone rather than relaxed to match a table.
 
-**Still undecided:** arbitrary repository executables (`./configure`,
-`./scripts/check.sh`) classify ALLOW under the documented convenience case. That
-is byte-security-classification.md's own item 9 — the largest soft spot in the
-design — and narrowing it is a policy change rather than a defect fix.
+**Resolved by the permission-model pass.** Arbitrary repository executables
+(`./configure`, `./scripts/check.sh`) previously classified ALLOW under the
+documented convenience case. That was
+[byte-security-classification.md](byte-security-classification.md)'s own item 9
+— the largest soft spot in the design — and narrowing it was a policy change
+rather than a defect fix.
+
+They are now **approval-required**, and so is any executable resolving inside the
+workspace. The test is where the *resolved* path lands, not whether the token
+contains a `/`: `/usr/bin/git` is an ordinary system program classified by its
+normal rules, while `./tool` and `/workspace/bin/lint` are gated. The reasoning,
+and the consistency argument with `cmd.inline_code`, are in [Workspace-local
+executables](byte-security-classification.md#workspace-local-executables).
 
 ### Command execution
 
@@ -1057,16 +1308,65 @@ stdin, and any second entry point to execution.
 
 ### Needed before Byte is usable
 
-- **In-place edits to dirty files.** If Byte patches a file the operator has
-  uncommitted changes in, does that need approval?
-- **Test detection.** How does `run_tests` decide which runner a project uses?
-  Declared in project config, or guessed?
-- **Command timeout.** What is the ceiling for one command, and does a
-  long-running process belong in v1 at all?
+- **Implement the permission-model changes.** The gap table above is the
+  work: `ALLOWED_PROGRAMS`, the inverted default, program-token resolution, and
+  the missing git and runner rules. Until this lands, the code and this document
+  disagree about unknown commands.
+- **In-place edits to dirty files — DEFERRED, no gate in v1.** `write_file` and
+  `patch_file` stay automatic. The behavioural requirement (inspect state,
+  avoid silent overwrites) belongs in Byte's system instructions rather than in
+  the permission model. Deferred because deciding what "the operator cares
+  about" is a workflow judgement, not a safety property.
+- **Read-only subpaths — DEFERRED, no mechanism in v1.** No protection for
+  `LICENSE` or generated directories. A new mechanism rather than a permission
+  question, and v1 does not build one.
+- **Test detection — DEFERRED to v2**, along with project-declared workflow
+  commands. The declared route is the only sane one for picking a runner, and
+  that mechanism is not in v1.
+- **Command timeout.** Settled in `execution.py` at 120s default, 900s ceiling.
+  Whether a long-running process belongs in v1 at all is still open.
 - **Provisioning story.** v1 assumes the environment is already provisioned.
   What happens when it is not — clear failure telling the operator to provision
   it, or something more helpful? A stub environment is the one remaining way
   Byte can be useless through no fault of the permission model.
+
+### Closed by the permission-model pass
+
+Recorded so they are not reopened as though they were still undecided:
+
+- **Automatic allowlist scope — ruled: deliberately small.** The principle is
+  "if we are not confident it belongs in automatic, leave it at
+  APPROVAL_REQUIRED", and the list is not broadened to reduce prompt count.
+- **`git add` batching — ruled: per invocation.** No per-path approval or
+  batching semantics in v1.
+- **Unattended cost — accepted.** An unattended run reaching an unknown command
+  fails closed. No unattended auto-approval, no persistent command trust.
+- **Test runner detection and project declarations — deferred to v2.** No
+  project-declared widening mechanism in v1.
+- **`env` / `printenv` / `set` — ruled: stay denied.** No name-only environment
+  reads until the classifier can structurally distinguish a safe form. No new
+  matcher capability in the current implementation pass.
+
+### Project-declared workflow commands — v2
+
+A repository will need to declare its normal commands (`make test`, `npm test`,
+`cargo test`) so an agent is not prompted for a project's whole test cycle.
+
+**Deferred to v2. No configuration format, no config file, and no code in v1.**
+
+The constraints are recorded so it is not designed afresh later, and they are
+deliberately restrictive because this would be the first mechanism able to move
+an operation from approval-required to automatic without a human present:
+
+1. May narrow approval-required → automatic only. Never affects a denial.
+2. Never applies to a workspace-local executable, inline code, shell strings,
+   or network egress.
+3. Static data in the repository, reviewed through the normal code-review path.
+4. Program plus exact argv prefix, matched with the same structured matcher.
+   No globs, no shell.
+5. `./scripts/check.sh` is not eligible.
+6. Availability is a Forge-level operator setting, not a per-repository switch,
+   so a repository cannot opt itself in.
 
 ### Deferred, not blocking
 

@@ -1,11 +1,14 @@
-# Byte v1 — Security Classification Lists
+# Forge v1 — Security Classification Lists
 
-Status: draft for review. No code implements any of this.
+Status: specification, implemented in `forge/tools/`. Superseded rules are
+marked where they were changed, so the current model and the history of it can
+both be read from this file.
 
-Scope: Byte v1. Reference material for the enforcement pipeline described in
-[byte-tools.md](byte-tools.md). Both lists here are inputs to that pipeline:
-secret-source patterns decide what a path is, command patterns decide what an
-operation is.
+Scope: the Forge-wide safety baseline. Byte is the reference configuration; the
+model applies to every agent. Reference material for the enforcement pipeline
+described in [byte-tools.md](byte-tools.md). Both lists here are inputs to that
+pipeline: secret-source patterns decide what a path is, command patterns decide
+what an operation is.
 
 ## What this is and is not
 
@@ -29,6 +32,15 @@ silent execution — provided the matching rules below are honoured.
 That property is the point. The list is a convenience for the common cases
 and a backstop for the rest. It is not a security boundary, and it should never
 be described as one.
+
+> **This paragraph described the model as it was designed, and no longer
+> describes how it ships.** An earlier version classified an unrecognised
+> argv invocation as automatic and treated that as an acceptable convenience.
+> It was the single largest soft spot in the design — acknowledged as item 9 of
+> the uncertainties below — because a classifier miss landed as silent
+> execution rather than as a prompt. **Unknown invocations are now
+> approval-required**, which restores the property this section claimed. See
+> [Unknown commands](#unknown-commands).
 
 ## Matching model
 
@@ -55,6 +67,8 @@ Rules:
 5. **A secret-source match is applied at its own tier.** A structural or
    content-proven match is **denied** with no approval path. A name-guess match
    is **approval-required**, resolved per the principle above.
+6. **Automatic is an explicit rule, never an absence.** An operation is
+   automatic only because a rule said so. See [List 3 — Automatic operations](#list-3--automatic-operations).
 
 ## The principle for classifying secret sources
 
@@ -361,6 +375,294 @@ required** where a human might legitimately want it.
 | Docker/containers | `docker run`, `docker exec`, `docker stop`, `docker system prune` | `docker run` can mount the host filesystem. |
 | Crontab | `crontab -e`, writing to `/etc/cron*` | Scheduling is n8n's job per architecture.md. An agent scheduling itself contradicts the design. |
 
+## List 3 — Automatic operations
+
+**Decision: automatic is an explicit rule.** An operation is automatic only
+because a rule in this list says so. It is not automatic because nothing was
+recognised. This list is the allowlist; the absence of a rule is
+approval-required (see [Unknown commands](#unknown-commands)).
+
+> **Decision: v1 ships a deliberately small allowlist.**
+>
+>     if we are not confident it belongs in automatic,
+>     leave it at APPROVAL_REQUIRED
+>
+> The governing principle, and the reason this list is short rather than
+> comprehensive. Broadening it to reduce prompt count would trade a safety
+> property for convenience, which is the trade this design refuses to make
+> everywhere else. A missing row costs one prompt; a wrongly-added row costs a
+> silent execution. That asymmetry sets the size of the table.
+>
+> Coverage is expected to grow over time, one reviewed row at a time, and each
+> addition is a normal change to this file. Nothing requires the list to be
+> exhaustive for the baseline to be correct.
+
+Each entry is narrow on purpose. The table below is grouped by family, but the
+granularity that matters is **program plus operation**, not program alone — see
+the git rows for cases where the same program has automatic and
+approval-required forms.
+
+### Read-only inspection, inside the workspace
+
+The inspection tools Byte needs to do its job. All are read-only, none can
+mutate the workspace, and none is a repository-code executor.
+
+| Operation | Examples |
+| --- | --- |
+| List a directory | `ls`, `pwd` |
+| Search filenames | `find` (read forms only), `search_files` |
+| Search contents | `grep`, `rg`, `search_content` |
+| Read a file | `cat`, `head`, `tail` |
+| Measure and identify | `wc`, `stat`, `file` |
+| Compare two files | `diff` |
+| Version probes | `--version` on any recognised program |
+
+`find` is automatic in its read forms (`-name`, `-path`, `-type`, `-print`).
+`find ... -delete` and `find ... -exec rm` are destructive and are
+approval-required or denied per the wildcard policy below.
+
+**Not automatic, despite being inspection-shaped.** `du` and `df` are omitted:
+`df` reports mounted filesystems outside the workspace, which is host
+information Byte has no v1 need for. `tree`, `less`, and `more` are omitted as
+inconsistent rather than dangerous — a later row if wanted. `which`, `type`,
+`date`, `uname`, and `id` are omitted because v1 has no use for them; they can
+be added on review.
+
+**`env`, `printenv`, and `set` are DENIED**, per List 2. There is no name-only
+form in v1. Reading a variable by name rather than by value is a genuinely
+different operation, and the classifier has no rule shape capable of
+structurally distinguishing the two — so the safe reading is the denied one. No
+matcher capability will be added for this in the current implementation pass.
+
+### Git inspection
+
+Automatic forms only:
+
+| Operation | Example |
+| --- | --- |
+| Working tree state | `git status` |
+| Change inspection | `git diff`, `git diff --cached` |
+| History | `git log`, `git show` |
+| Object and ref reads | `git rev-parse`, `git ls-files` |
+| Branch listing | `git branch` with no mutation flag, `git branch --list` |
+| Tag listing | `git tag` with no mutation flag, `git tag --list` |
+| Stash listing | `git stash list` |
+
+Everything else in the git family is approval-required or denied per List 2.
+**`git branch`, `git tag`, and `git stash` are not one permission level each.**
+Each has an automatic listing form and an approval-required mutating form, and
+they are classified per operation:
+
+| Command | Classification |
+| --- | --- |
+| `git branch`, `git branch --list`, `git branch -a -v` | Automatic |
+| `git branch -d`, `-D` | **Denied** |
+| `git branch <name>`, `git branch -c <name>`, `git switch <name>` | Approval-required |
+| `git tag`, `git tag --list` | Automatic |
+| `git tag -d <name>` | **Denied** (destroys work, same reasoning as branch deletion) |
+| `git tag <name>`, `git tag -a` | Approval-required |
+| `git stash list` | Automatic |
+| `git stash push`, `pop`, `drop`, `clear` | Approval-required (`drop`/`clear` destroy state) |
+
+### Structured Forge tools
+
+Not command invocations, and listed here because the permission model is about
+operations rather than about `exec_command` alone.
+
+| Tool | Condition |
+| --- | --- |
+| `read_file` | In-workspace, not a secret source |
+| `write_file` | In-workspace, not a secret source |
+| `patch_file` | In-workspace, not a secret source |
+| `search_files`, `search_content` | In-workspace |
+
+**A secret source is never automatic regardless of the tool.** A name-guess
+secret read through `read_file` is approval-required, because the secret verdict
+is ranked together with the command verdict and the strictest wins.
+
+## Unknown commands
+
+**Decision: an unrecognised argv invocation is APPROVAL_REQUIRED.** This
+replaces the earlier "convenience case", which classified anything unmatched as
+automatic.
+
+### The model
+
+```
+    explicit DENY rules      -> denied
+    explicit APPROVAL rules  -> approval-required
+    explicit ALLOW rules     -> automatic
+    nothing matched          -> approval-required
+```
+
+Strictest-wins is unchanged and still resolves the result across every rule that
+fires. What changed is the default, and that an ALLOW rule table now exists to
+be matched against.
+
+### Why
+
+The failure mode of a classifier miss is what matters. With unknown-as-automatic,
+a miss means **silent execution** — Forge runs something it never classified. The
+entire conservatism argument in this document depends on a miss degrading to a
+prompt instead, and it did not.
+
+Approval-required rather than denied, because denying the unknown would refuse a
+large number of legitimate development commands an operator would happily
+approve. A refusal teaches the operator to look for a way around the tool; a
+prompt costs them one keystroke and keeps them in the loop. Byte is documented as
+a permitted agent, and prompts are the price of that.
+
+The cost is honest and worth stating: **an unfamiliar toolchain now produces a
+prompt per command**, and unattended runs against a toolchain that is not fully
+covered by List 3 will fail closed on ordinary work. That is the correct
+behaviour under the fail-closed rule, and it is a real operational cost rather
+than a hypothetical one.
+
+The mitigation is structural rather than procedural: List 3 is *data*, so
+covering a new program is adding a row, not changing code. And the table is
+additive in the safe direction — a missing row costs one prompt, never an
+unreviewed execution.
+
+Note what this fixed incidentally. `git branch`, `git stash`, `git tag`, and
+`git checkout` are listed under approval-required in List 2 and previously
+matched no rule at all, so they silently classified as automatic. Under this
+model they classify as the spec says they should.
+
+## Workspace-local executables
+
+**Decision: an executable that resolves inside the current workspace is
+APPROVAL_REQUIRED.**
+
+### The rule
+
+Resolve the program token to a real path. If that path is inside the workspace
+root, the operation is approval-required. If it resolves outside, containment
+denies it as any other out-of-workspace path.
+
+This is a question about *where the code comes from*, not about the shape of the
+token:
+
+| Program token | Classification |
+| --- | --- |
+| `./configure` | Approval-required — resolves inside the workspace |
+| `./scripts/check.sh` | Approval-required — resolves inside the workspace |
+| `./tool` | Approval-required — resolves inside the workspace |
+| `/workspace/bin/lint` | Approval-required — resolves inside the workspace |
+| `../outside/tool` | **Denied** — resolves outside the workspace |
+| `/usr/bin/git` | Classified by its normal program and operation rules |
+| `/usr/bin/python` | Classified by its normal program and operation rules |
+
+**A path separator in the token is not the test.** `/usr/bin/git` contains one
+and is an ordinary system program. The test is where the resolved path lands.
+A workspace-local executable is arbitrary code the agent chose to run; a system
+program is a named, reviewed piece of the host.
+
+### Why this is not inconsistent with trusting `git`
+
+A repository is attacker-reachable input. Cloning a project is importing code,
+and the workspace is therefore not a trust boundary in the way `/usr/bin` is. A
+file's *location* is not evidence of its behaviour: the executable bit is the
+only signal available, and it is a signal the operator set rather than one Forge
+can verify.
+
+This is the same argument that gates `cmd.inline_code`, and the two are kept
+consistent on purpose. `./scripts/check.sh` is arbitrary code in exactly the
+sense `python -c "..."` is: the form permits anything. Gating inline code while
+trusting a workspace-local executable because of where it lives would be
+incoherent.
+
+A prompt is sufficient. The path and arguments are short and readable, and the
+operator can open the file before answering. This is a stop-and-look gate of the
+kind `cmd.inline_code` already is.
+
+### The v2 deferral
+
+A repository may later declare named workflow commands that are trusted
+automatically. That mechanism is **v2 and is not implemented or configured in
+v1** — see [Project-declared workflow commands](#project-declared-workflow-commands).
+When it exists, a workspace-local executable does not become automatic through
+it: the declaration narrows approval-required operations, and an executable that
+resolves inside the workspace is gated because of where it came from, not
+because of what it was asked to do.
+
+## Repository code is not a trust boundary
+
+**Decision: commands that execute repository code are APPROVAL_REQUIRED in v1.**
+
+| Operation | Form |
+| --- | --- |
+| `pytest`, `pytest tests/ -q` | Approval-required |
+| `python -m pytest` | Approval-required |
+| `make`, `make test`, `make build` | Approval-required |
+| `npm test`, `npm run <script>` | Approval-required |
+| `cargo test`, `cargo build`, `cargo run` | Approval-required |
+| `go test`, `go build`, `go run` | Approval-required |
+| `tox`, `nox` | Approval-required |
+
+**Why this is a change from the earlier draft.** That draft called running tests
+automatic, on the reasoning that tests "may legitimately do things that look
+destructive" and that prompting on them would make the agent useless. Both
+halves are true and neither settles the question, because the draft also gated
+`./scripts/check.sh` — a repository shell script — while trusting `pytest`
+automatically. Those two positions cannot both hold.
+
+`pytest` is not a passive reader of test files. It executes `conftest.py`, loads
+installed plugins, imports fixtures, and runs arbitrary test code — all of it
+repository-supplied. So a `pytest` invocation is repository code executing by
+another name, and it belongs in the same bucket as
+`./scripts/check.sh`. This is the workspace-trust argument from the previous
+section, applied to a program that happens to have a familiar name.
+
+The prompt cost is real and is accepted: an agent that verifies its work will
+ask before each test run. That is the correct trade under a model whose central
+claim is that a miss becomes a prompt.
+
+**Reading a test file is not this.** `cat tests/test_thing.py`, `grep`,
+`search_content`, and `read_file` on a test file are read-only inspection and
+remain automatic per List 3. The gate is on *executing* repository code.
+
+**This is a policy default, not a permanent verdict.** A reviewed project
+workflow mechanism (v2) may narrow selected approval-required operations to
+automatic. That is the intended way to reduce the prompt cost without
+reintroducing a trust shortcut. No such mechanism exists in v1.
+
+## Project-declared workflow commands
+
+**Decision: deferred to v2. No configuration format, no code, and no config file
+in v1.**
+
+A repository will eventually need to declare its normal commands — `make test`,
+`npm test`, `cargo test`, `./scripts/check.sh` — so that an agent working in it
+is not prompted for the project's entire test cycle. That is a real need. It is
+not a v1 capability.
+
+### Why not v1
+
+- It is the first mechanism in Forge that would move an operation from
+  approval-required to automatic **without a human present at the time**. Every
+  other v1 gate is either a code-level rule or a live prompt.
+- The declarations live in the repository, which is the untrusted input the
+  workspace-trust argument is about. A repository declaring its own permissions
+  inverts the trust direction.
+- Its value partly comes from avoiding curation of List 3. It is not a
+  substitute for it.
+
+### Constraints recorded for v2
+
+So the mechanism is not designed afresh later:
+
+1. A declaration may narrow **approval-required → automatic only**. It may never
+   affect a denial, and it may never apply to a workspace-local executable, to
+   inline code, to a shell string, or to network egress.
+2. It is a static data file in the repository, reviewed through the normal
+   code-review path.
+3. Entries are program plus exact argv prefix, matched with the same structured
+   matcher used everywhere else. No globs, no shell, no `=`.
+4. `./scripts/check.sh` is **not eligible** to become automatic through this
+   mechanism.
+5. Whether the mechanism is available at all is a Forge-level operator setting,
+   not a per-repository switch, so a repository cannot opt itself in.
+
 ## Workspace boundary
 
 Status: **decided for v1.**
@@ -591,16 +893,20 @@ Then:
    is worse than no parsing.
 2. Resolve every path argument. If any resolves outside the workspace →
    **denied**. Stop.
-3. If any resolved path matches a secret-source pattern → **denied**. Stop.
-4. Match program and flags against the command tables. Take the strictest
+3. Resolve the program token itself. If it resolves inside the workspace →
+   **approval-required** (see [Workspace-local executables](#workspace-local-executables)).
+4. If any resolved path matches a secret-source pattern → **denied**. Stop.
+5. Match program and flags against the command tables. Take the strictest
    match: denied > approval-required > automatic.
-5. If nothing matches and `shell` is false → **automatic** (subject to tool
-   permission).
-6. Report the matched pattern name with the decision, so a denial is
+6. If nothing matched → **approval-required**. Never automatic by default. See
+   [Unknown commands](#unknown-commands).
+7. Report the matched pattern name with the decision, so a denial is
    explainable rather than mysterious.
 
-Step 6 matters operationally. A denied operation that says which rule denied it
-is fixable; one that says "permission error" is not.
+Step 7 matters operationally. A denied operation that says which rule denied it
+is fixable; one that says "permission error" is not. The same applies to step 6:
+an approval-required decision should name *why* it was ambiguous, or the operator
+is being asked to approve something Forge could not describe.
 
 ### Which patterns cause approval vs denial
 
@@ -616,10 +922,9 @@ legitimately want it.
 ### How ambiguous commands are handled
 
 - `shell: true` → always approval-required. Non-negotiable in v1.
-- A program not on either list, invoked with argv → automatic. This is the
-  convenience case, and it is where a miss would land.
-- A program not on either list, but with a subcommand not recognised → automatic.
-  This is a real gap; see uncertainties.
+- **An unrecognised argv invocation → approval-required.** This replaces the
+  earlier convenience case. The reasoning, and the contradiction it resolved in
+  this document's own summary, are in [Unknown commands](#unknown-commands).
 - Anything whose *targets cannot be determined before execution* → **denied**
   under the wildcard policy above. Not approval-gated.
 - A tool that would let Byte supply arbitrary code → **approval-required**,
@@ -629,6 +934,10 @@ legitimately want it.
 That last point deserves emphasis. `python -c "import os; os.system('rm -rf /')"`
 has argv that matches nothing dangerous. It should be approval-required because
 of what the *form* allows, not what the *arguments* say.
+
+The workspace-local executable rule is the same principle applied to a
+different form. `./scripts/check.sh` is not a shell string, but it is arbitrary
+code by the same reasoning, and it is gated for the same reason.
 
 ### Inline-code execution
 
@@ -727,12 +1036,19 @@ classifier will not protect a Windows host.**
 
 ## Items I am unsure about
 
-**Resolved decisions.** Four items previously raised here are now settled and
+**Resolved decisions.** Five items previously raised here are now settled and
 documented above: name-guess secret patterns are approval-required rather than
 denied (see the principle section), wildcard recursive deletes are denied
 (see the wildcard policy), inline-code execution is approval-required with no
-source analysis, and network commands are approval-required with no dedicated
-web tool in v1. Platform scope is settled too: Linux-focused, Windows out.
+source analysis, network commands are approval-required with no dedicated
+web tool in v1, and **an unrecognised argv invocation is approval-required
+rather than automatic** (see [Unknown commands](#unknown-commands)). Platform
+scope is settled too: Linux-focused, Windows out. Two further decisions were
+added during the permission-model pass: executables resolving inside the
+workspace are approval-required ([Workspace-local
+executables](#workspace-local-executables)), and commands that execute
+repository code are approval-required ([Repository code is not a trust
+boundary](#repository-code-is-not-a-trust-boundary)).
 
 What remains is not a list of decisions blocking implementation. These are
 judgement calls, noted because a reviewer should see them rather than discover
@@ -779,11 +1095,42 @@ them later.
    either failing open or rejecting a legitimate delete of something already
    gone.
 
-9. **The convenience-case risk.** "A program not on either list, invoked with
-   argv → automatic" is where a classifier miss lands. It is correct for v1 and
-   it is the single largest soft spot in the whole design. Narrowing it would
-   mean allowlisting rather than blocklisting, which changes the character of the
-   classifier substantially.
+9. **The convenience-case risk — RESOLVED, and the resolution was the opposite
+   of what this item assumed.** "A program not on either list, invoked with
+   argv → automatic" was called "the single largest soft spot in the whole
+   design", and narrowing it "would mean allowlisting rather than blocklisting,
+   which changes the character of the classifier substantially". It does change
+   the character's character, and the change was accepted: the classifier is now
+   an explicit three-table model with an approval-required default. See
+   [Unknown commands](#unknown-commands). The cost is stated there too — prompt
+   per unrecognised command, and unattended runs failing closed on a toolchain
+   List 3 does not cover.
+
+10. **Scope of List 3 at launch — RULED: deliberately small.** Because the
+    default is approval-required, a program missing from the automatic table
+    costs a prompt on every invocation. Ruled that v1 ships a short list under
+    the principle "if we are not confident it belongs in automatic, leave it at
+    APPROVAL_REQUIRED", and that the list is **not** broadened to reduce prompt
+    count. Coverage grows one reviewed row at a time.
+
+11. **`git add` batching — RULED: per invocation.** One `git add` is one
+    approval decision, whatever it stages. No per-path approval or batching
+    semantics in v1; that would be a UX refinement of the same gate.
+
+12. **Unattended runs against a partial List 3 — ACCEPTED.** An unattended run
+    reaching an unknown or unapproved command fails closed. This is intentional
+    and follows directly from ruling that a miss must produce a prompt, applied
+    where nobody can answer one. No unattended auto-approval and no persistent
+    command trust. The operational precondition is stated rather than hidden: an
+    unattended run is viable only for a project whose toolchain is fully covered
+    by List 3.
+
+13. **`env` / `printenv` / `set` — RULED: stay denied.** There is no name-only
+    environment read in v1. The classifier has no rule shape capable of
+    structurally distinguishing a safe by-name form from a value-dumping one, so
+    the denied reading stands until a matcher capability exists to make the
+    distinction structural. No such capability will be added in the current
+    implementation pass.
 
 ## Summary for implementation
 
@@ -799,14 +1146,20 @@ Ordinary public certificates are not blocked.
 Known-dangerous commands: **denied** for root, raw devices, filesystem
 destruction, history rewrite, secret values, system state, and package
 installation. **Approval-required** for in-workspace development operations,
-inline-code execution, and network egress.
+inline-code execution, network egress, repository-code execution (tests and
+build runners), and any executable resolving inside the workspace.
+
+**Automatic is an explicit rule** (List 3): read-only inspection, git inspection
+in its listing forms, and Byte's structured in-workspace file tools. Reading a
+file is automatic; executing what the repository contains is not.
 
 Any invocation using a shell string → **approval-required**, never parsed.
 
+**An unrecognised argv invocation → approval-required.** Automatic is never
+the default. A classifier miss produces a prompt, not silent execution.
+
 Destructive operations with unresolved wildcards → **denied**. Byte resolves the
 target list itself and re-requests with explicit paths.
-
-Anything unrecognised → not silently trusted; ambiguity resolves to a prompt.
 
 Platform scope: **Linux only in v1.** Windows and PowerShell patterns are out of
 scope and the classifier will not protect a Windows host.
