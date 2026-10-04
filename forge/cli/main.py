@@ -118,6 +118,18 @@ from ..models.registry import LOCAL_CONFIG_NAME, MODELS_CONFIG_ENV  # noqa: E402
 #: piped prompt collides awkwardly with `--workspace` and with a future chat mode.
 TASK_FILE_FLAG = "--task-file"
 
+#: Wall-clock ceiling for one external-agent run. An external agent is a program
+#: Forge does not control, so an unbounded subprocess is an unbounded run. Long
+#: enough for a real reasoning task, short enough that a wedged child does not
+#: hold a terminal indefinitely.
+DEFAULT_HERMES_TIMEOUT = 900.0
+
+#: Lets an operator point Forge at a Hermes installation that is not on PATH.
+#: A program *name or absolute path*; never a shell fragment, because it is
+#: passed as argv[0] and no shell is involved.
+HERMES_PROGRAM_ENV = "FORGE_HERMES_PROGRAM"
+
+#: The Workbench bind address is fixed, and not configurable. Stated as a
 #: constant rather than merely omitted from the parser so that a future edit
 #: adding a `--host` flag has to delete a named safety property rather than
 #: just supply a new argument.
@@ -438,6 +450,82 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     neighbor_parser.add_argument(
+        "task",
+        nargs="?",
+        default=None,
+        metavar="TASK",
+        help="the task, as one argument",
+    )
+
+    hermes_parser = sub.add_parser(
+        "hermes",
+        help="invoke the external Hermes Agent on a task",
+        description=(
+            "Invoke the Hermes Agent -- an existing, separate agent runtime -- as "
+            "an external Forge agent. Hermes runs as a subprocess with its own "
+            "tools and its own model; Forge cannot see or classify its internal "
+            "tool calls, so it is granted no capabilities at all in this "
+            "version.\n\n"
+            "TEXT-ONLY. Hermes receives no toolsets: no web, no terminal, no "
+            "file, no code execution. It reads the task and answers in prose. "
+            "That is the safety boundary, not an oversight -- there is no flag "
+            "to widen it, because widening an external agent's authority is a "
+            "change to Forge's safety architecture and belongs in a reviewed "
+            "code change.\n\n"
+            "The task text is classified by Forge before anything is spawned, "
+            "and a task that reads a secret source or asks for shell execution "
+            "is refused. Forge cannot classify what it cannot observe, so this "
+            "is the only gate available and it fails closed.\n\n"
+            "HERMES CHOOSES ITS OWN MODEL. There is no --model flag: Hermes "
+            "manages its own provider, credentials, and routing, and Forge "
+            "reports the model it chose rather than overriding it."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  forge hermes --workspace . \"what does this project do?\"\n"
+            "  forge hermes --workspace . --task-file task.md\n"
+            "  forge hermes --workspace . --max-turns 4 \"summarise the docs\"\n"
+        ),
+    )
+    hermes_parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        default=None,
+        help=(
+            "explicit workspace root (required; may also be set via "
+            f"{WORKSPACE_ENV}). Not inferred from the current directory. Also "
+            f"becomes the subprocess's working directory."
+        ),
+    )
+    hermes_parser.add_argument(
+        "--task-file",
+        metavar="PATH",
+        default=None,
+        help="read the task from a file instead of argv",
+    )
+    hermes_parser.add_argument(
+        "--max-turns",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "advisory ceiling on the child's tool-calling iterations. Advisory "
+            "because Forge cannot enforce it; it is passed through to Hermes."
+        ),
+    )
+    hermes_parser.add_argument(
+        "--timeout",
+        metavar="SECONDS",
+        type=float,
+        default=DEFAULT_HERMES_TIMEOUT,
+        help=(
+            "wall-clock ceiling for the whole run (default: %(default)s). An "
+            "external agent is a program Forge does not control, so this is "
+            "Forge's only bound on it."
+        ),
+    )
+    hermes_parser.add_argument(
         "task",
         nargs="?",
         default=None,
@@ -971,6 +1059,18 @@ class ModelResolutionError(Exception):
     """
 
 
+#: Shown on stderr when ``--model`` names a model this registry does not carry
+#: as usable. A *warning*, never a block -- see ``_override_advisory``.
+OVERRIDE_WARNING_PREFIX = "forge: warning:"
+
+#: The override is an invocation-level decision, so these two sources are the
+#: whole of it. Both are read fresh per run and neither is written anywhere.
+#: Kept as names rather than inlined because the CLI parser, the help text, and
+#: the docs all refer to them.
+OVERRIDE_FLAG = "--model"
+OVERRIDE_ENV = DEFAULT_MODEL_ENV
+
+
 def _override_advisory(
     model_id: str, environ: Mapping[str, str]
 ) -> str | None:
@@ -1080,16 +1180,6 @@ def _warn_about_override(
     if message:
         print(f"{OVERRIDE_WARNING_PREFIX} {message}", file=warn)
 
-
-#: Shown on stderr when ``--model`` names a model this registry does not carry
-#: as usable. A *warning*, never a block -- see ``_override_advisory``.
-OVERRIDE_WARNING_PREFIX = "forge: warning:"
-
-#: The override is an invocation-level decision, so these two sources are the
-#: whole of it. Both are read fresh per run and neither is written anywhere.
-#: Kept as names rather than inlined because the CLI parser, the help text, and
-#: the docs all refer to them.
-OVERRIDE_FLAG = "--model"
 
 def _resolve_default_model(
     args: argparse.Namespace,
@@ -1571,6 +1661,138 @@ def _run_workbench(
 
 
 # --------------------------------------------------------------------------
+# forge hermes
+# --------------------------------------------------------------------------
+
+
+def _run_hermes(
+    args: argparse.Namespace,
+    workspace: Workspace,
+    *,
+    out: TextIO,
+    err: TextIO,
+    environ: dict[str, str],
+) -> int:
+    """Invoke the external Hermes agent on one task.
+
+    **This is not ``_run_agent``.** Byte and Neighbor are native profiles served
+    by Forge's own runtime, with every tool call passing through Forge's
+    dispatcher. Hermes is a separate program with its own runtime, its own tools,
+    and its own safety decisions, and Forge cannot see a single one of its tool
+    calls. The two are wired differently on purpose, and the difference is the
+    point of this function.
+
+    What it does, in order:
+
+    1. reads the task (Byte's rules, unchanged -- one source, or it is ambiguous);
+    2. **gates the task text** and refuses to spawn on anything but ``allow``;
+    3. builds argv and a minimal environment through the adapter;
+    4. runs it with a bounded timeout, never with ``--yolo``;
+    5. prints Hermes's own text, and its own model/provider as a *report*.
+
+    What it deliberately does not do: classify Hermes's internal calls (impossible
+    from here), route Hermes's model (Hermes owns it), or offer a capability
+    flag. There is no ``--model`` and no ``--toolsets`` on this subcommand, and
+    their absence is the safety property rather than an oversight.
+    """
+    from ..external.base import ExternalInvocation
+    from ..external.gating import gate_task
+    from ..external.hermes import HermesAdapter
+    from ..external.runner import spawn
+
+    task = _read_task(args, err)
+    if task is None:
+        return EXIT_USAGE
+
+    # Resolved per invocation rather than at import, so an operator can point
+    # Forge at a different Hermes without editing configuration. Read from the
+    # injected environment for the same reason every other setting is.
+    program = (environ.get(HERMES_PROGRAM_ENV) or "").strip() or None
+    agent = HermesAdapter(program) if program else HermesAdapter()
+
+    if not agent.available():
+        print(
+            f"forge: the Hermes Agent was not found "
+            f"({agent.describe() if program else 'not on PATH'}). Install it, "
+            f"or set {HERMES_PROGRAM_ENV} to its path.",
+            file=err,
+        )
+        return EXIT_USAGE
+
+    # The gate runs before anything is spawned, and a refusal here means no
+    # process ever starts. Failing closed is the whole point: an external agent
+    # with no toolsets is a far smaller risk than one spawned because a
+    # classifier threw.
+    decision = gate_task(task, workspace)
+    if not decision.allowed:
+        print(
+            f"forge: refusing to run the Hermes agent: {decision.reason}",
+            file=err,
+        )
+        # Deliberately a usage error rather than a refusal code: the operator
+        # asked for something this MVP does not do, and a distinct exit code
+        # would suggest a policy verdict they could argue with.
+        return EXIT_USAGE
+
+    invocation = ExternalInvocation(
+        agent=agent.name,
+        task=task,
+        workspace=str(workspace.root),
+        timeout=float(
+            getattr(args, "timeout", None) or DEFAULT_HERMES_TIMEOUT
+        ),
+        max_turns=getattr(args, "max_turns", None),
+    )
+
+    print(
+        f"forge: {agent.name} (external, text-only) on {workspace.root}",
+        file=out,
+    )
+    print(f"forge: gate {decision.rule}: {decision.reason}", file=out)
+
+    # The launch itself lives in ``forge.external.runner`` so this module never
+    # imports ``subprocess``. ``tests/test_cli.py`` asserts that structurally,
+    # and the guard is settled: ``forge check`` must not be able to run
+    # anything. Composition and rendering are this module's whole job.
+    run_outcome = spawn(agent, invocation, environ=environ)
+    result = run_outcome.result
+
+    if run_outcome.timed_out:
+        print(f"forge: {result.detail}", file=err)
+        return EXIT_INTERNAL
+    if run_outcome.launch_error:
+        print(f"forge: {result.detail}", file=err)
+        return EXIT_USAGE
+
+    # Hermes reports the model it chose. Reported, never selected: Forge's
+    # registry has no authority over an external agent's inference.
+    if result.model:
+        provider = result.provider or "unspecified"
+        print(
+            f"forge: hermes chose model {result.model} (provider {provider})",
+            file=out,
+        )
+    if result.session_id:
+        print(f"forge: hermes session {result.session_id}", file=out)
+
+    if not result.ok:
+        print(
+            f"forge: hermes reported a failed run "
+            f"(exit_code {result.exit_code}): {result.detail}",
+            file=err,
+        )
+        # A nonzero child exit code is a visible failure, never swallowed. The
+        # subprocess's own status is ignored for this purpose because it is
+        # always 0 -- see forge/external/hermes.py.
+        return EXIT_MODEL_UNAVAILABLE
+
+    print("", file=out)
+    print(result.text, file=out)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# forge route / forge models status
 # --------------------------------------------------------------------------
 
 
@@ -1902,6 +2124,26 @@ def main(
                 channel=channel,
             )
 
+        if args.subcommand == "hermes":
+            workspace, problem = _resolve_workspace(
+                getattr(args, "workspace", None), env
+            )
+            if workspace is None:
+                print(f"forge: {problem}", file=err_stream)
+                return EXIT_USAGE
+
+            # Kept out of the native dispatch table above on purpose: an
+            # external agent is not a native profile and must not be reachable
+            # through the code path that assumes one.
+            return _run_hermes(
+                args,
+                workspace,
+                out=out_stream,
+                err=err_stream,
+                environ=env,
+            )
+
+        if args.subcommand == "route":
             return _run_route(args, env, out=out_stream, err=err_stream)
 
         if args.subcommand == "models":

@@ -646,3 +646,140 @@ an instruction and not a permission.
 The per-agent contract, including Neighbor's settled fields and the reasoning
 behind each, is in [agent-contract.md](agent-contract.md).
 
+### 4d. External agents — subprocesses, not profiles
+
+Byte and Neighbor are **native**: Forge holds them in process, routes their tool
+calls through its own `ToolDispatcher`, and enforces every permission decision
+itself. That works because Forge sees every call the agent makes.
+
+An **external agent** is a program Forge starts. It has its own runtime, its own
+tools, and its own safety decisions, and Forge cannot see, classify, or stop a
+single one of its internal tool calls. `forge hermes` invokes the real Hermes
+Agent installation this way. Everything in this section follows from that one
+fact.
+
+**An external agent is never an `AgentProfile`.** A profile's `allowed_tools` is
+enforced by Forge's dispatcher. An external agent's tools run in another process
+behind another dispatcher, so a profile would be a *decorative* narrowing — it
+would constrain nothing while appearing to. That is strictly worse than no
+profile, because a reader would reasonably believe the limit was real.
+`forge/external/` is a sibling of `forge/agents/`, not a child: they share CLI
+ergonomics, not implementation.
+
+| | Native agent | External agent |
+|---|---|---|
+| Lives | in process | a subprocess |
+| Profile | `AgentProfile` | none |
+| Tool calls | every one passes `ToolDispatcher` | **invisible to Forge** |
+| Authority bounded by | a membership test on `allowed_tools` | the capabilities granted at launch |
+| Model | Forge routes it | **it chooses its own** |
+| Dispatched by | `_run_agent` | `_run_hermes` |
+
+#### Capability narrowing replaces permission narrowing
+
+Forge cannot approve a request it cannot observe. So for an external agent the
+only lever that works is narrowing the child's capabilities **up front**. This is
+the same "narrowing is structural, widening is impossible" principle as
+`AgentProfile`, applied one layer out — but a different mechanism, in a command
+line rather than a membership test.
+
+**In the MVP, Hermes is granted nothing: no `web`, `terminal`, `file`,
+`code_execution`, or `computer_use`.** It reads the task and answers in prose.
+
+That boundary is set by a measured fact, not by reading documentation. Against
+the real Hermes on this machine:
+
+| Hermes invocation | Shell | File | Network |
+|---|---|---|---|
+| `-t` **omitted** | **granted** | **granted** | **granted** |
+| `-t ""` | **granted** | **granted** | **granted** |
+| `-t none` | blocked | blocked | blocked |
+
+**Omitting the flag grants everything**, because Hermes falls back to the
+operator's configured toolsets. So does `-t ""`, because an empty value is
+silently ignored — the most dangerous possible reading, since it looks like a
+restriction and is not one. Only `none` blocks. Asking the model "do you have
+tools?" proved worthless as evidence: with `-t ""` it answered `NO-TOOLS` and
+then ran the command anyway. Only an attempt to act is a test.
+
+**There is deliberately no `--toolsets` flag on `forge hermes`.** Granting an
+external agent a capability is a change to Forge's safety architecture and
+belongs in a reviewed code change, not in something an operator can widen from a
+shell.
+
+#### The task is gated before the agent exists
+
+Forge classifies the **task text** — the only artefact it can see — and refuses
+to spawn on anything but `allow`:
+
+| Gate verdict | What Forge does |
+|---|---|
+| `allow` | spawn |
+| `approval_required` | refuse; the capability is not supported by the MVP yet |
+| `deny` | refuse |
+| classification failure | **refuse** — fail closed |
+
+Failing closed is the point: an external agent with no toolsets is a much smaller
+risk than one spawned because a classifier threw.
+
+**Why prose is not fed to `CommandClassifier`.** It does not work. That
+classifier's default for an unrecognised program is `approval_required` —
+deliberately, so an unknown command prompts rather than executes. Run a sentence
+through it and *every* task classifies as approval-required, including "what does
+this project do?". A gate that refuses everything is not a gate. So the gate
+reuses Forge's **secret** classifier for credential-shaped tokens and adds a
+shell-escape check, and treats everything else as prose. An approval-required
+secret source refuses too: a native agent's read of `kubeconfig` would raise a
+prompt the operator could answer, and an external agent has no such moment.
+
+This is a real and accepted limitation, stated rather than hidden: the gate
+cannot see what the agent does once started. It is one gate on one artefact, and
+the empty toolset is what carries the actual boundary.
+
+#### Model ownership: the external agent's, entirely
+
+Hermes chooses its own model, provider, reasoning configuration, and
+credentials. Forge does not route it, does not override it, and **exposes no
+`--model` on `forge hermes`**. Passing a Forge-routed model through would address
+a model to an endpoint whose provider pairing Forge does not control — the exact
+mistake [model-registry.md](model-registry.md) forbids.
+
+Forge *reports* the model from Hermes's own `init`/`result` events, which is the
+visible form of respecting that ownership.
+
+#### Subprocess contract
+
+*   **argv, never a shell string.** Every element is separate, so `$(...)` and
+    backticks in a task are data. Asserted structurally: no module under
+    `forge/external/` contains `shell=True` or `os.system`.
+*   **A minimal environment**, built from an allowlist (`HOME`, `PATH`,
+    `HERMES_HOME`, locale, XDG dirs) rather than inherited. Forge's
+    `FORGE_WORKSPACE`, `FORGE_MODEL`, and every provider credential are absent,
+    and `HERMES_INFERENCE_MODEL` is deliberately *not* forwarded so Forge cannot
+    become the thing that picks Hermes's model.
+*   **The workspace is explicit**, passed as `--in` and set as the subprocess cwd.
+    A subprocess inherits whatever directory Forge was launched from, which is not
+    a safety decision; verified necessary, since a plain `cd` did not move Hermes.
+*   **A wall-clock timeout.** An external agent is a program Forge does not
+    control, so this is Forge's only bound on it.
+*   **The result event is authoritative, not the exit code.** Hermes's process
+    exits 0 even when the run failed — verified. Trusting `returncode` would
+    report success for a failed run. A nonzero child `exit_code` becomes a
+    visible `EXIT_MODEL_UNAVAILABLE`.
+*   **`--yolo` is never passed.** It bypasses Hermes's own approvals.
+
+#### Residual risk, stated plainly
+
+*   **Forge cannot observe the child's behaviour.** The gate covers the task text
+   only. With no toolsets granted the exposure is small, but it is not zero: a
+   text-only Hermes still reasons, and its output is returned to the operator
+   unfiltered.
+*   **Hermes's own configuration is outside Forge's control.** A user's Hermes
+   config could change what `-t none` means in a future version. The adapter's
+   tests pin the argv; they cannot pin a third party's semantics forever.
+*   **Network reachability of the child itself is not bounded by Forge** beyond
+   the toolset. An external process with no tools can still be configured to
+   phone home if its own configuration says so.
+*   **This is an MVP.** Streaming events to the operator, session resume, and any
+   capability beyond "none" are all deliberately absent.
+

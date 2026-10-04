@@ -1192,3 +1192,85 @@ and never learns which agent it is serving, and `forge/ui/runner.py` already
 takes `profile` as a parameter. Adding an agent was a profile, a registry
 entry, and a CLI subcommand.
 
+## Agent: Hermes (external)
+
+Hermes is **not** a Forge agent and does not answer this contract. It is an
+existing, separate agent runtime that Forge *invokes*; it has its own tools, its
+own safety decisions, and its own model. There is no `AgentProfile` for it,
+because a profile's `allowed_tools` is enforced by Forge's dispatcher and an
+external agent's tools run in another process behind another dispatcher — the
+profile would constrain nothing while appearing to.
+
+It is recorded here because `forge hermes` exists, and because the difference
+matters enough to be worth stating where the other agents are described.
+
+### Name
+
+Hermes, invoked as `forge hermes`.
+
+### Role
+
+External collaborator. Forge passes it a task and returns its answer; it is not
+hosted, wrapped, or reimplemented.
+
+### System instructions
+
+**Hermes's own, not Forge's.** Forge contributes no instructions and no persona.
+Anything Forge said here would either be ignored or would be a second copy of
+something Hermes already owns.
+
+### Model configuration
+
+**Hermes's, entirely.** It chooses its own model, provider, reasoning level, and
+credentials; Forge reports the choice from Hermes's own events and never
+overrides it. Forge exposes no `--model` on `forge hermes`, and its model
+registry is never consulted for this agent.
+
+### Allowed tools
+
+**None.** No `web`, `terminal`, `file`, `code_execution`, or `computer_use`. Hermes
+reads the task and answers in prose.
+
+This is the whole safety story for the MVP, and it rests on a measurement rather
+than on an assumption: omitting Hermes's `--toolsets` flag grants *everything*,
+and so does passing it an empty string, because an empty value is silently
+ignored. Only the value `none` blocks. Verified by having Hermes attempt a shell
+command, a file read, and a network fetch — all three refused.
+
+The table of measurements, and the reasoning for not offering a capability flag,
+are in [architecture.md](architecture.md) §4d.
+
+### Permissions
+
+**Not Forge's, and not reachable by Forge.** Forge cannot classify a tool call it
+cannot observe, so it cannot gate one. What Forge *can* bound is what the child is
+granted at launch, and it grants nothing.
+
+This is a genuine difference from a native agent and is not a gap to be closed by
+adding a profile. A native agent's permissions are enforced per call; an external
+agent's are bounded per launch.
+
+### Workspace
+
+Passed explicitly as the subprocess's working directory, because a subprocess
+inherits whatever directory Forge was launched from and that is not a safety
+decision. **This is not containment.** With no filesystem tool granted, the child
+has no way to act on the workspace — but Forge is relying on the empty toolset
+for that, not on a directory boundary it could enforce.
+
+### Memory configuration
+
+**Hermes's own**, entirely. Forge holds no memory for an external agent and
+persists nothing about the run beyond the child's own session id, which is
+reported to the operator for them to use.
+
+### Runtime status
+
+**Runnable, text-only, deliberately limited.** `forge hermes --workspace DIR
+"task"` invokes the real Hermes installation and prints its answer, with the
+model it chose reported above it.
+
+The task text is classified by Forge before anything is spawned, and a task that
+names a secret source or asks for shell execution is refused. Forge cannot gate
+anything the child does afterwards; the empty toolset is what carries that
+boundary, and the limitation is recorded rather than papered over.
