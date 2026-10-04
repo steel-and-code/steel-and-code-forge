@@ -59,7 +59,30 @@
     </div>
   </header>
 
-  <main class="split">
+  <!--
+    The view switcher. Two views in one page, chosen here rather than by a second
+    document, so there is one token substitution, one stylesheet, and one place
+    that decides what the operator is looking at.
+
+    The buttons carry `aria-pressed`, so the active view is announced as well as
+    drawn. The board is a sibling of the workbench main rather than a third pane:
+    six columns do not fit beside a conversation, and squeezing them in would
+    make the existing view worse for everyone.
+
+    No localStorage, and no saved view preference either: which view is open is a
+    display choice, not state Forge decides, and a page that remembers it would be
+    a page carrying state across a reload for no reason.
+  -->
+  <nav class="views" id="view-switch" role="group" aria-label="Workbench view">
+    <button type="button" class="view-button" id="view-workbench" data-view="workbench" aria-pressed="true">
+      Workbench
+    </button>
+    <button type="button" class="view-button" id="view-board" data-view="board" aria-pressed="false">
+      Order Board
+    </button>
+  </nav>
+
+  <main class="split" id="workbench-view">
     <section class="pane conversation" aria-label="Byte conversation">
       <div class="pane-head">
         <h2>Conversation</h2>
@@ -90,6 +113,57 @@
   </main>
 
   <!--
+    The Order Board view. Present in the DOM from the start and hidden, so the
+    switcher is a `hidden` toggle rather than a mount: the board reads its data
+    when it is first opened and after every command, and holds nothing of its own.
+
+    Everything inside #board is drawn by board.js. The only markup here is the
+    shell, the create form, and the dialog host -- a board rendered by the
+    browser as markup would be a second source of truth about what an order is.
+  -->
+  <section class="board-view" id="board-view" aria-label="Order Board" hidden>
+    <div class="board-bar">
+      <div class="board-intro">
+        <h2>The Order Board</h2>
+        <p class="hint" id="board-note" role="status" aria-live="polite"></p>
+      </div>
+      <form class="board-create" id="order-form" autocomplete="off">
+        <label class="sr-only" for="order-title">Order title</label>
+        <input
+          type="text"
+          id="order-title"
+          name="title"
+          maxlength="200"
+          required
+          placeholder="Title"
+        />
+        <label class="sr-only" for="order-priority">Priority</label>
+        <!--
+          The options are filled from `GET /api/orders`'s `priorities` list, so
+          this control cannot offer a priority the backend would refuse. Left
+          empty in the markup rather than hard-coded for the same reason the
+          board's columns are not hard-coded.
+        -->
+        <select id="order-priority" name="priority"></select>
+        <label class="sr-only" for="order-smith">Assigned smith</label>
+        <input
+          type="text"
+          id="order-smith"
+          name="smith"
+          maxlength="80"
+          placeholder="smith (optional)"
+        />
+        <button type="submit" id="order-create">New order</button>
+      </form>
+    </div>
+    <div class="board" id="board"></div>
+    <div class="overlay order-overlay" id="order-overlay" hidden>
+      <div class="order-overlay-host" id="order-detail"></div>
+      <button type="button" class="order-close" id="order-close">Close</button>
+    </div>
+  </section>
+
+  <!--
     The approval card. Present in the DOM, hidden until the server reports a
     pending approval. It holds no state of its own: `approval_id` arrives from
     GET /api/status or from the approval.required event, and a refreshed page
@@ -110,6 +184,7 @@
   </div>
 
   <script src="/static/health.js"></script>
+  <script src="/static/board.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

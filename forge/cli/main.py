@@ -1220,6 +1220,10 @@ def _run_workbench(
             token=token,
             port=int(port),
             health=health,
+            # Not passed: create_app derives the board from the workspace root,
+            # so it lands in <workspace>/.forge/orders.json and no caller can
+            # aim it somewhere else. Stated here because the CLI builds every
+            # other collaborator explicitly.
         )
     except ImportError as exc:  # pragma: no cover - guarded above
         raise UiUnavailable(str(exc)) from exc

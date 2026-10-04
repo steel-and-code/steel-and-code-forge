@@ -150,6 +150,11 @@ distinction that matters between them is observation versus command:
 | `/api/run` | POST | command | token + exact `Origin` |
 | `/api/approvals/{id}` | POST | command | token + exact `Origin` |
 | `/api/events` | GET | observation | single-use stream ticket + read-only pair |
+| `/api/orders` | GET | observation | token + read-only same-origin pair |
+| `/api/orders/{id}` | GET | observation | token + read-only same-origin pair |
+| `/api/orders` | POST | command | token + exact `Origin` |
+| `/api/orders/{id}` | PATCH | command | token + exact `Origin` |
+| `/api/orders/{id}/move` | POST | command | token + exact `Origin` |
 
 `/api/health` is a seventh, deliberately outside this table: unauthenticated,
 capability-free liveness that reveals nothing.
@@ -177,6 +182,94 @@ The frontend does not decide health. `forge/ui/static/health.js` maps the
 backend's health string to a glyph and a word, and structural tests fail if it
 ever compares a health value, assigns one, or names a model or provider. See
 [model-registry.md](model-registry.md) for the full contract.
+
+### 3b. The Order Board — durable workspace state
+
+The Order Board is a Kanban view inside the Workbench: six fixed columns, one
+Order each, moved between states explicitly. It is the first Forge surface to
+persist anything, and the decisions below are recorded because they are the ones
+a later reader would otherwise have to reverse-engineer.
+
+**It is workspace-scoped, at `<workspace>/.forge/orders.json`.** Not under
+`~/.forge/`, and not configurable. An Order belongs to the project it was made
+in, so the board travels with the repository the same way durable project memory
+does — see [agent-contract.md](agent-contract.md) for the reasoning, and for why
+a human-readable tracked file was chosen over a database there. The same ruling
+applies here. The path is derived from the workspace root inside
+`OrderStore.__init__`, so no caller can aim it elsewhere; a run cannot read or
+write orders belonging to another workspace.
+
+Orders are **not secrets**. Byte can read the file through ordinary workspace
+access, and that is accepted rather than worked around.
+
+**Persistence is a whole-document atomic JSON write under one lock.** Every
+mutation serialises the entire board, writes it to a temporary file in the same
+directory, `fsync`s it, and moves it into place with `os.replace`. The temp file
+is in the same directory because a rename across filesystems is not atomic, which
+would reintroduce the window this avoids. One `threading.Lock` is held across
+each read-modify-write, so two concurrent writes cannot interleave and lose one.
+Every store call runs through `asyncio.to_thread`, because a blocking write on
+the event loop would stall the SSE stream and refuse an approval for as long as a
+disk takes.
+
+**A malformed file fails visibly.** It raises and the route answers 500 naming
+the file. It is never replaced by an empty board: an empty board is a
+trustworthy-looking statement that there is nothing here, and serving one over a
+corrupt file would erase Orders silently and then tell the operator there is
+nothing to do about it. A missing file *is* an empty board, which is a different
+thing.
+
+**`ORD` numbers are monotonic, gaps are valid, and an id is never intentionally
+reused.** The next number is `max(stored counter, highest id present + 1)`,
+reconciled on every load — never `len(orders) + 1`, which is correct only while
+the file is exactly as Forge last wrote it. Taking the greater of two independent
+facts about the sequence is the only rule that cannot reuse a number: an
+operator who hand-adds `ORD-0042` without bumping the counter gets `ORD-0043`
+next, and an operator who deletes orders by hand does not make the board start
+reissuing numbers they have already seen. **A gap in the sequence is therefore
+normal and is not a defect.** The worst outcome is a skipped number; the
+alternative is two Orders sharing an id, which makes every later lookup
+ambiguous.
+
+**Movement is not editing.** `POST /api/orders/{id}/move` is the only route that
+writes `status`, and `PATCH /api/orders/{id}` — the edit route — has no `status`
+field in its body at all, so a title edit cannot become a transition by
+accident. There is exactly one place to hang transition rules, approvals, or agent
+automation later, without changing what an edit means.
+
+The five routes, each split by whether it observes or commands:
+
+| Route | Method | Changes an Order |
+| --- | --- | --- |
+| `GET /api/orders` | GET | no — returns every Order grouped by status |
+| `GET /api/orders/{id}` | GET | no — returns one Order |
+| `POST /api/orders` | POST | yes — creates one, answering 201 |
+| `PATCH /api/orders/{id}` | PATCH | yes — title, priority, smith, description |
+| `POST /api/orders/{id}/move` | POST | yes — status only |
+
+The guards are the ones in the route table in section 3a: the two GETs take the
+read-only same-origin pair, the three writes take exact `Origin`. Neither half of
+the split is a formality — a forged `Origin` on a write is refused, and a read
+with neither an `Origin` nor `Sec-Fetch-Site: same-origin` is refused too.
+
+The workflow states are stable snake_case identifiers
+(`orders_received`, `at_the_forge`, …); the blacksmith wording an operator reads
+is presentation, lives in `board.js`, and can be reworded without touching a
+stored Order. `GET /api/orders` publishes the backend's own `statuses` and
+`priorities` so the page consumes that vocabulary rather than keeping a second
+copy that can drift from it, and structural tests fail if the frontend names a
+state.
+
+**An Order has no execution semantics in this MVP.** Creating, editing, or moving
+one starts no run, calls no model, spends nothing, and consumes no approval.
+`forge/ui/orders.py` imports nothing from `forge/models/`, `forge/tools/`, or
+`forge/ui/session.py`, and that is asserted on the module's import graph rather
+than left as a comment. The board is inert by construction, not by a flag. There
+is also deliberately **no delete, no drag-and-drop, and no history** — no
+activity log, no blockers, no approvals, no model cost, no Git metadata, and no
+test counts on an Order. Movement is an explicit set of buttons, one per state
+the backend published, because a control reachable only by pointer gesture is
+unusable by keyboard.
 
 ### 4. Provider-agnostic core
 
@@ -362,7 +455,10 @@ differ.
 - OpenRouter integration, or any model provider client.
 - n8n wiring.
 - Agent logic, prompts, or execution.
-- Database or persistence layer.
+- A **database**. The one durable store in Forge is the Order Board's
+  workspace-scoped JSON file (section 3b), which is deliberately not a database
+  and deliberately not general-purpose. A shared multi-user store, a server-side
+  database, or a background job runner is still out of scope.
 - Public API and its schema.
 - Python classes for the agent contract.
 - Tool implementations.
@@ -370,6 +466,7 @@ differ.
   is already provisioned.
 - Unattended approval over HTTP. Deferred approval with resume exists only in
   `forge workbench`, where a human is present; see section 3a.
+- Execution triggered by an Order, and any history on an Order. See section 3b.
 
 ## Consequences worth stating
 

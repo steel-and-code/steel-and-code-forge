@@ -38,6 +38,12 @@ state the server already holds, a **command** changes something.
     The decision. A command, not an event, so it is a POST rather than a frame
     on the stream.
 
+Five more routes serve the Order Board, and they follow the same line between an
+observation and a command -- ``GET /api/orders`` and ``GET /api/orders/{id}``
+take the read-only guard pair, and the three writes take the strict exact-Origin
+guard. Movement is ``POST /api/orders/{id}/move`` and is deliberately *not* a
+field of the edit body: see :mod:`forge.ui.orders`.
+
 Three properties of the whole surface, each of which is a decision:
 
 *   **The event loop is never blocked waiting for a human.** ``present()`` waits
@@ -84,6 +90,14 @@ from .security import (
     check_same_origin,
 )
 from .models import HealthUnavailable, ModelHealth
+from .orders import (
+    InvalidOrder,
+    OrderStore,
+    OrderStoreError,
+    STATUSES,
+    UnknownOrder,
+    UnknownStatus,
+)
 from .session import SessionBusy, UiSessionState, WorkbenchSession
 
 __all__ = ["create_app", "STATIC_DIR", "TOKEN_PLACEHOLDER"]
@@ -101,6 +115,59 @@ TOKEN_PLACEHOLDER = "__FORGE_UI_TOKEN__"
 # --------------------------------------------------------------------------
 # Request bodies
 # --------------------------------------------------------------------------
+
+
+class CreateOrderRequest(BaseModel):
+    """``POST /api/orders`` body.
+
+    ``title`` has no default, so omitting it is a 422 from the schema rather than
+    a lookup error in the store: a missing required field and an empty required
+    field should read the same way to a caller, and the store enforces the second
+    one for a title that arrives as ``""``.
+
+    ``status`` is accepted so a create and a move can be driven the same way in a
+    test, and defaults to the first workflow state. It is validated against
+    :data:`~forge.ui.orders.STATUSES` by the store rather than as an enum here,
+    so the vocabulary is defined once and the route does not carry a second copy.
+    """
+
+    title: str = Field(min_length=1, max_length=200)
+    priority: str | None = None
+    status: str | None = None
+    smith: str = Field(default="", max_length=80)
+    description: str = Field(default="", max_length=2000)
+
+
+class EditOrderRequest(BaseModel):
+    """``PATCH /api/orders/{id}`` body.
+
+    **No ``status`` field, deliberately.** Movement is a separate route so a
+    transition is one explicit request rather than a side effect of editing a
+    title, and so transition rules, approvals, or agent automation can attach to
+    movement later without changing what an edit means. FastAPI ignores an
+    undeclared field, so a client that sends one cannot move an order either.
+
+    Every field is optional so a caller can change one field without restating the
+    others. ``None`` means "not supplied", and an explicit ``""`` is how a field
+    is cleared -- the distinction is what lets a smith be unassigned without
+    blanking the description.
+    """
+
+    title: str | None = Field(default=None, max_length=200)
+    priority: str | None = None
+    smith: str | None = Field(default=None, max_length=80)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class MoveOrderRequest(BaseModel):
+    """``POST /api/orders/{id}/move`` body.
+
+    A plain ``str``, not an ``Enum``, so the route can answer with the full list
+    of states it accepts. A refused move should tell the caller what it may send
+    instead, which an enum's validation error does not.
+    """
+
+    status: str
 
 
 class RunRequest(BaseModel):
@@ -142,6 +209,7 @@ def create_app(
     token: UiToken,
     port: int,
     health: ModelHealth | None = None,
+    orders: OrderStore | None = None,
 ) -> FastAPI:
     """Build the Workbench application.
 
@@ -160,6 +228,10 @@ def create_app(
             the page. ``GET /api/models`` then answers 503 with the reason
             rather than the indicator showing an empty row an operator would
             read as healthy.
+        orders: The Order Board's store. Built from ``workspace`` when not given,
+            so no caller can aim the board at a directory outside the run's
+            workspace root -- the same reason the root itself is not a request
+            parameter. A test passes one to keep orders in a directory it owns.
 
     Deliberately constructed with explicit arguments rather than read from
     ``os.environ`` or a global: a test needs to build two independent
@@ -206,6 +278,10 @@ def create_app(
     app.state.model_health = (
         health if health is not None else ModelHealth(None)
     )
+    # The board is derived from the workspace, never from a request. Exposed on
+    # app.state for the same reason the ticket store is: a test asserts against
+    # the store the routes actually use.
+    app.state.orders = orders if orders is not None else OrderStore(workspace.root)
 
     # -- guards ---------------------------------------------------------
 
@@ -478,6 +554,193 @@ def create_app(
                 "Connection": "keep-alive",
             },
         )
+
+    # -- the Order Board ------------------------------------------------
+    #
+    # Five routes, and the split follows the same observation/command line as the
+    # rest of the surface: the two GETs read state the server already holds and
+    # take the read-only guard pair; the three writes change something and take
+    # the strict exact-Origin guard.
+    #
+    # Nothing here reaches the session, the dispatcher, or a gateway. Creating
+    # and moving orders leaves the run exactly as it found it -- no model is
+    # called and no approval is consumed. That is the "no automatic execution"
+    # boundary, and it is enforced by the absence of an import rather than by a
+    # flag.
+
+    def board_errors(exc: Exception) -> JSONResponse:
+        """Map a store failure onto the status code it deserves.
+
+        A board that cannot be read is a 500, never a 200 with no orders. An
+        empty board is a truthful and calm statement -- "there is nothing here" --
+        and serving one on top of a corrupt file would say that when the truth is
+        "your orders are here and I cannot read them". 422 for a field the
+        operator supplied, 404 for an order that does not exist.
+        """
+        if isinstance(exc, UnknownOrder):
+            return JSONResponse({"detail": str(exc)}, status_code=404)
+        if isinstance(exc, UnknownStatus):
+            return JSONResponse(
+                {"detail": str(exc), "statuses": list(STATUSES)}, status_code=422
+            )
+        if isinstance(exc, InvalidOrder):
+            return JSONResponse({"detail": str(exc)}, status_code=422)
+        return JSONResponse({"detail": str(exc)}, status_code=500)
+
+    async def read_board(call, *, status_code: int = 200):
+        """Run one store call off the event loop and shape the outcome.
+
+        A single place where the store's exceptions become status codes, so the
+        five routes cannot each answer a corrupt board differently.
+
+        ``call`` is awaited, and every route here runs its store work through
+        :func:`asyncio.to_thread`. Reading and writing the board file blocks, and
+        a blocking write on the event loop would stall the SSE stream and refuse
+        an approval for as long as a disk takes -- which is the property the
+        worker-thread design exists to protect.
+
+        ``status_code`` is explicit rather than read off the route decorator,
+        because this function builds the response itself: a create is 201
+        whatever the decorator on the route says.
+        """
+        try:
+            return JSONResponse(await call(), status_code=status_code)
+        except (OrderStoreError, InvalidOrder) as exc:
+            # `InvalidOrder` is a ValueError rather than an OrderStoreError,
+            # because it is also raised from store methods the tests call
+            # directly. Both are caught here: a rejected field is a 422, and
+            # letting it escape would make a typo in a form a 500.
+            return board_errors(exc)
+
+    @app.get("/api/orders")
+    async def api_orders(
+        request: Request, _: None = Depends(guarded_read)
+    ) -> JSONResponse:
+        """Every order, grouped by status, in workflow order.
+
+        Read-only and never probing: this returns what is on disk, so reloading
+        the page cannot change anything and cannot spend anything.
+
+        Every status key is present even with nothing in it. The board has a fixed
+        set of columns, and a column the API omits is a column the page cannot
+        draw a heading for -- which is where the empty-state message lives.
+
+        ``statuses`` and ``priorities`` travel with the payload so the page
+        consumes the backend's vocabulary instead of keeping a second copy that
+        can drift from it.
+        """
+        store: OrderStore = app.state.orders
+
+        async def load() -> dict[str, object]:
+            board = await asyncio.to_thread(store.board)
+            return board.as_payload()
+
+        return await read_board(load)
+
+    @app.get("/api/orders/{order_id}")
+    async def api_order(
+        order_id: str, request: Request, _: None = Depends(guarded_read)
+    ) -> JSONResponse:
+        """One order's details.
+
+        404 for an id that is not on the board, which is also the answer for an
+        order that exists but is not the operator's to see -- there is exactly one
+        operator and no per-order capability in this MVP, so inventing a 403 here
+        would describe an authorization model that does not exist.
+        """
+        store: OrderStore = app.state.orders
+
+        async def load() -> dict[str, object]:
+            order = await asyncio.to_thread(store.get, order_id)
+            return order.as_dict()
+
+        return await read_board(load)
+
+    @app.post("/api/orders", status_code=201)
+    async def api_create_order(
+        body: CreateOrderRequest,
+        request: Request,
+        _: None = Depends(guarded),
+    ) -> JSONResponse:
+        """Create one order in the first workflow state.
+
+        A POST because it is a command. ``201`` with the created order, so a
+        client renders the card from the server's answer rather than from what it
+        hoped it sent.
+
+        Takes the store's defaults for ``priority`` and ``status`` when the body
+        omits them, and refuses a value outside the published vocabulary rather
+        than correcting it -- a create that silently fixed a bad priority would
+        hide the bug in whatever computed it.
+        """
+        store: OrderStore = app.state.orders
+        fields: dict[str, str] = {
+            "title": body.title,
+            "smith": body.smith,
+            "description": body.description,
+        }
+        if body.priority is not None:
+            fields["priority"] = body.priority
+        if body.status is not None:
+            fields["status"] = body.status
+
+        async def create() -> dict[str, object]:
+            order = await asyncio.to_thread(store.create, **fields)
+            return order.as_dict()
+
+        return await read_board(create, status_code=201)
+
+    @app.patch("/api/orders/{order_id}")
+    async def api_edit_order(
+        order_id: str,
+        body: EditOrderRequest,
+        request: Request,
+        _: None = Depends(guarded),
+    ) -> JSONResponse:
+        """Change title, priority, smith, or description.
+
+        **Not the status.** Movement is
+        :meth:`forge.ui.orders.OrderStore.move` behind its own route, so an edit
+        cannot become a transition by accident and there is one place to hang
+        transition rules later.
+
+        Only the fields present in the body are changed, so an edit does not
+        blank the fields it was not asked about.
+        """
+        store: OrderStore = app.state.orders
+        changes = body.model_dump(exclude_none=True)
+
+        async def edit() -> dict[str, object]:
+            order = await asyncio.to_thread(store.edit, order_id, **changes)
+            return order.as_dict()
+
+        return await read_board(edit)
+
+    @app.post("/api/orders/{order_id}/move")
+    async def api_move_order(
+        order_id: str,
+        body: MoveOrderRequest,
+        request: Request,
+        _: None = Depends(guarded),
+    ) -> JSONResponse:
+        """Move one order to a workflow state.
+
+        422 for a state the board does not have, and the response lists the states
+        it does: a caller that guessed wrong should be told what to send next
+        instead of only that it was wrong.
+
+        No transition rules are enforced, and moving to the state an order is
+        already in succeeds. Both are current decisions, and the second is the
+        kind that avoids a spurious failure when a page re-sends what it already
+        displayed.
+        """
+        store: OrderStore = app.state.orders
+
+        async def move() -> dict[str, object]:
+            order = await asyncio.to_thread(store.move, order_id, body.status)
+            return order.as_dict()
+
+        return await read_board(move)
 
     @app.get("/api/health")
     async def api_health() -> JSONResponse:

@@ -645,3 +645,377 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
   .models-recheck { align-self: stretch; text-align: center; }
 }
+/* -- view switcher ---------------------------------------------------- */
+
+/* Two views, one page. The active view is drawn from `aria-pressed`, so the
+   pressed state is a fact in the markup rather than a class the script has to
+   remember to keep in step -- and it is what assistive tech reads. */
+.views {
+  display: flex;
+  gap: 2px;
+  padding: 6px 20px 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--edge);
+  flex: 0 0 auto;
+}
+
+.view-button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  color: var(--ink-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 14px;
+}
+
+.view-button:hover { color: var(--ink); background: var(--panel-2); }
+
+/* The pressed view is underlined as well as tinted: the underline is the part
+   that survives a colour-blind reading of the switcher. */
+.view-button[aria-pressed="true"] {
+  color: var(--ink);
+  background: #0d1013;
+  border-color: var(--edge);
+  box-shadow: inset 0 2px 0 var(--hot);
+}
+
+.view-button:focus-visible {
+  outline: 2px solid var(--hot);
+  outline-offset: -2px;
+}
+
+/* -- the Order Board -------------------------------------------------- */
+
+.board-view {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.board-view[hidden] { display: none; }
+
+/* The workbench pane is hidden by the `hidden` attribute when the Order Board is
+   selected, and `hidden` alone does NOT hide it here.
+
+   The UA stylesheet's `[hidden] { display: none }` is a plain type selector, and
+   `.split { display: grid }` below beats it on specificity. Measured on the
+   board view: `#workbench-view` reported `hidden=true` and still painted the
+   conversation, the activity feed, and the composer at 1440x308 -- both views on
+   screen at once, which is exactly what the switcher ruling rules out. An
+   explicit rule is the fix, matching how every other hidden element in this
+   stylesheet is handled. */
+.split[hidden] { display: none; }
+
+.board-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 18px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--edge);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.board-intro h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.board-intro .hint { margin: 2px 0 0; }
+
+.board-create {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.board-create input,
+.board-create select {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 9px;
+}
+
+.board-create input#order-title { min-width: 220px; }
+.board-create input:focus-visible,
+.board-create select:focus-visible {
+  outline: 2px solid var(--hot);
+  outline-offset: -1px;
+}
+
+/* Six columns will not fit a laptop at any width. They scroll horizontally
+   inside `.board` instead of being squeezed into unreadable slivers or folded
+   into a stacked list: the left-to-right sequence *is* the workflow, and a board
+   that reads top-to-bottom loses it.
+
+   `min-height: 0` and `min-width: 0` are the standard overrides for a flex
+   child's automatic minimum size, kept as a guard rather than as a fix. They
+   were added while chasing a 291px sideways scroll on a tablet, but measurement
+   showed the cause was elsewhere -- see the note on `.board-column` -- and
+   removing these two lines changes no measured width. They stay because a flex
+   item's `min-width: auto` refusing to shrink below its content is a real
+   failure mode for a scroll container, and this one holds a grid of six columns. */
+.board {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overflow-x: auto;
+  padding: 14px;
+}
+
+.board-columns {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(240px, 1fr);
+  gap: 12px;
+  align-items: start;
+  min-height: 100%;
+}
+
+.board-column {
+  /* A containing block, and load-bearing. Each column carries an `.sr-only`
+     summary, which is `position: absolute` with no offsets and so sits at its
+     static position -- inside the horizontally scrolling columns grid. With no
+     positioned ancestor that static position is resolved against the initial
+     containing block, where it counted toward the *document* width: measured on
+     a tablet, the last column's summary sat at x=1124 in an 834px viewport and
+     scrolled the whole page sideways by 291px. Anchoring these boxes to their
+     own column keeps them inside the scroll container that is supposed to own
+     them. */
+  position: relative;
+
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 140px;
+}
+
+.board-column[data-known="no"] { border-style: dashed; }
+
+.board-column-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--edge);
+}
+
+.board-column-title { margin: 0; font-size: 12px; font-weight: 600; }
+
+/* A number, not a coloured dot. Readable at a glance, legible with no colour. */
+.board-column-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.board-cards {
+  list-style: none;
+  margin: 0;
+  padding: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* The empty state is a sentence naming the column, not a blank space. An empty
+   region with no explanation reads as a rendering failure. */
+.board-empty {
+  color: var(--ink-faint);
+  font-size: 12px;
+  font-style: italic;
+  padding: 14px 6px;
+  text-align: center;
+}
+
+.board-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--steel);
+  border-radius: var(--radius);
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  padding: 8px 10px;
+}
+
+.board-card:hover { border-color: var(--edge-hot); background: #20262d; }
+
+.board-card:focus-visible {
+  outline: 2px solid var(--hot);
+  outline-offset: 1px;
+}
+
+.board-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.board-number { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); }
+
+.board-card-title {
+  display: block;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.board-card-foot { display: block; margin-top: 5px; }
+
+.board-smith { font-size: 11px; color: var(--ink-dim); }
+.board-unassigned { font-style: italic; color: var(--ink-faint); }
+
+/* Priority: a coloured left border AND a distinct glyph AND the word. The colour
+   is the third signal, never the only one. */
+.board-priority {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--ink-dim);
+}
+
+.board-priority-glyph { font-weight: 700; }
+
+.board-card[data-priority="low"] { border-left-color: var(--steel); }
+.board-card[data-priority="normal"] { border-left-color: var(--good); }
+.board-card[data-priority="high"] { border-left-color: var(--warn); }
+.board-card[data-priority="urgent"] { border-left-color: var(--bad); }
+
+.board-card[data-priority="urgent"] { background: #241a19; }
+
+/* -- order details ---------------------------------------------------- */
+
+.order-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 10, 12, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 20;
+}
+
+.order-overlay[hidden] { display: none; }
+
+.order-overlay-host {
+  background: var(--panel);
+  border: 1px solid var(--edge-hot);
+  border-radius: var(--radius);
+  max-width: 520px;
+  width: 100%;
+  max-height: 84vh;
+  overflow: auto;
+  position: relative;
+}
+
+.order-detail { padding: 18px 20px 64px; }
+
+.order-detail-title { margin: 0; font-family: var(--mono); font-size: 13px; color: var(--ink-dim); }
+.order-detail-title-line { margin: 4px 0 14px; font-size: 16px; font-weight: 600; }
+
+.order-detail-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 14px;
+}
+
+.order-detail-field { margin: 0; }
+.order-detail-field dt { font-size: 11px; color: var(--ink-faint); }
+.order-detail-field dd { margin: 1px 0 0; color: var(--ink); overflow-wrap: anywhere; }
+
+.order-detail-description {
+  margin: 0 0 16px;
+  color: var(--ink-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Movement is an explicit set of buttons, one per state the backend published.
+   No drag-and-drop: a control that can only be operated by a pointer gesture is
+   unusable by keyboard, and the ruling made it optional. */
+.order-move {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--edge);
+}
+
+.order-move-button {
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+.order-move-button:hover:not(:disabled) { color: var(--ink); border-color: var(--edge-hot); }
+
+.order-move-button:focus-visible {
+  outline: 2px solid var(--hot);
+  outline-offset: 1px;
+}
+
+.order-move-button[aria-current="true"] {
+  border-color: var(--hot);
+  color: var(--ink);
+  background: var(--hot-soft);
+  cursor: default;
+}
+
+.order-move-button:disabled { opacity: 0.85; }
+
+.order-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 11px;
+}
+
+.order-close:hover { color: var(--ink); }
+
+/* Tablet. The header switches to two rows and the create form takes the full
+   width, but the board keeps its columns: they scroll, which is the readable
+   answer at this width. */
+@media (max-width: 900px) {
+  .views { padding: 6px 14px 0; }
+  .board-bar { padding: 10px 14px; }
+  .board-create { width: 100%; }
+  .board-create input#order-title { flex: 1 1 200px; min-width: 0; }
+  .board-columns { grid-auto-columns: minmax(210px, 1fr); }
+  .order-detail-facts { grid-template-columns: minmax(0, 1fr); }
+}

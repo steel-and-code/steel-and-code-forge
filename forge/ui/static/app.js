@@ -10,6 +10,17 @@
  *   GET  /api/events?ticket=   ticket + same-origin -> SSE activity stream
  *   POST /api/approvals/{id}   token + origin      -> the decision
  *
+ * And five more for the Order Board, which follow the same split:
+ *
+ *   GET  /api/orders           token + same-origin -> every order, grouped
+ *   GET  /api/orders/{id}      token + same-origin -> one order
+ *   POST /api/orders           token + origin      -> create, 201
+ *   PATCH /api/orders/{id}     token + origin      -> edit title/priority/smith
+ *   POST /api/orders/{id}/move token + origin      -> move between states
+ *
+ * Movement is its own route and is deliberately not a field of the edit body:
+ * an edit must not be able to become a transition by accident.
+ *
  * "origin" and "same-origin" are different server-side checks, and the split
  * follows what a browser actually sends. A browser attaches `Origin` to a
  * POST and attaches **nothing** to a same-origin GET — so the two GETs are
@@ -543,6 +554,243 @@
       .catch(function () {
         el.streamHint.textContent = "stream: unavailable";
       });
+  }
+
+  // -- the Order Board -------------------------------------------------
+  //
+  // Five endpoints, one pure renderer, and no state of its own. `board.js` holds
+  // every decision about how an order looks; this section only fetches, calls the
+  // renderer, and posts. The rules it keeps:
+  //
+  //  - THE SERVER IS THE ONLY SOURCE OF STATE. The board re-reads
+  //    GET /api/orders on open and after every command. Nothing is cached, so a
+  //    refresh shows the server's answer rather than a stale local copy.
+  //
+  //  - IT NEVER NAMES A WORKFLOW STATE. The columns, the move buttons, and the
+  //    priority options are all built from the payload's own `statuses` and
+  //    `priorities`. A state added on the backend appears here without a frontend
+  //    change, and one removed here cannot linger.
+  //
+  //  - A REFUSED COMMAND SAYS SO. A 422 or 404 puts the server's own detail in
+  //    the board note rather than optimistically moving a card the server did not
+  //    move.
+  //
+  //  - ORDERS DO NOT RUN ANYTHING. Nothing here starts a run or reaches the
+  //    conversation pane. The board is inert by construction, not by a flag.
+
+  var board = {
+    el: {
+      view: document.getElementById("board-view"),
+      workbench: document.getElementById("workbench-view"),
+      switcher: document.getElementById("view-switch"),
+      container: document.getElementById("board"),
+      note: document.getElementById("board-note"),
+      form: document.getElementById("order-form"),
+      title: document.getElementById("order-title"),
+      priority: document.getElementById("order-priority"),
+      smith: document.getElementById("order-smith"),
+      overlay: document.getElementById("order-overlay"),
+      detail: document.getElementById("order-detail"),
+      close: document.getElementById("order-close"),
+    },
+    // The last payload, kept only to render the detail dialog and to know which
+    // statuses to offer. Never a source of truth: every command re-reads.
+    payload: null,
+    open: false,
+  };
+
+  function boardNote(message) {
+    if (!board.el.note) return;
+    board.el.note.textContent = message || "";
+  }
+
+  function boardRequest(path, options) {
+    var opts = options || {};
+    opts.headers = guardedHeaders(opts.headers);
+    return fetch(path, opts).then(function (response) {
+      return response
+        .json()
+        .catch(function () {
+          return {};
+        })
+        .then(function (body) {
+          // The server's own detail, verbatim. An error message invented here
+          // would be a second opinion about why the server refused something.
+          if (!response.ok) {
+            var error = new Error(body.detail || "request " + response.status);
+            error.status = response.status;
+            throw error;
+          }
+          return body;
+        });
+    });
+  }
+
+  function drawBoard(payload) {
+    if (!window.ForgeBoard || !board.el.container) return;
+    board.payload = payload;
+    var rendered = window.ForgeBoard.renderBoard(
+      document,
+      board.el.container,
+      payload,
+      { onOpen: openOrder }
+    );
+    fillPriorities(payload.priorities || []);
+
+    // One number, counted by the renderer from the columns it just drew. There
+    // is deliberately no comparison against the payload's own `total`: the
+    // backend derived that field from these same columns, so comparing them
+    // checks the backend against itself and can only ever report agreement.
+    // (It did exactly that, and reported a mismatch on every load of a healthy
+    // board, because the check was reading a field the renderer had computed.)
+    var model = rendered.model;
+    if (model.total === 0) {
+      boardNote("No orders yet. Create one above.");
+    } else {
+      boardNote(model.total + (model.total === 1 ? " order" : " orders"));
+    }
+  }
+
+  /* The priority control, built from the server's list.
+
+   * Filled once and only from `payload.priorities`, so the form cannot offer a
+   * value the backend would refuse. An empty list leaves the control with no
+   * options rather than a hard-coded fallback.
+   */
+  function fillPriorities(priorities) {
+    var select = board.el.priority;
+    if (!select || select.getAttribute("data-filled") === "yes") return;
+    while (select.firstChild) select.removeChild(select.firstChild);
+    priorities.forEach(function (priority) {
+      var option = document.createElement("option");
+      option.value = priority;
+      option.textContent = priority;
+      select.appendChild(option);
+    });
+    select.setAttribute("data-filled", "yes");
+  }
+
+  function refreshBoard() {
+    return boardRequest("/api/orders")
+      .then(drawBoard)
+      .catch(function (error) {
+        // A board that cannot be read is reported, not shown empty. An empty
+        // board here would read as "you have no orders", which is a different
+        // and much worse thing to believe.
+        boardNote("Could not read the board: " + error.message);
+      });
+  }
+
+  function openOrder(card) {
+    if (!board.el.detail) return;
+    window.ForgeBoard.renderDetail(
+      document,
+      board.el.detail,
+      {
+        order_id: card.orderId,
+        title: card.title,
+        status: card.status,
+        status_label: card.statusLabel,
+        priority: card.priority,
+        smith: card.smith,
+        description: card.description,
+        created_at: card.createdAt,
+        sequence: card.sequence,
+      },
+      // The backend's own status/label pairs, so a move button spells a state
+      // exactly as the column heading for it does.
+      (board.payload && board.payload.columns) || [],
+      { onMove: moveOrder }
+    );
+    board.el.overlay.hidden = false;
+  }
+
+  function closeOrder() {
+    board.el.overlay.hidden = true;
+    if (board.el.detail) {
+      while (board.el.detail.firstChild) {
+        board.el.detail.removeChild(board.el.detail.firstChild);
+      }
+    }
+  }
+
+  function moveOrder(orderId, status) {
+    return boardRequest("/api/orders/" + encodeURIComponent(orderId) + "/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: status }),
+    })
+      .then(function () {
+        closeOrder();
+        boardNote("Moved " + orderId + ".");
+        return refreshBoard();
+      })
+      .catch(function (error) {
+        boardNote("Could not move " + orderId + ": " + error.message);
+      });
+  }
+
+  function createOrder(event) {
+    event.preventDefault();
+    var title = board.el.title.value.trim();
+    if (!title) return;
+
+    var body = { title: title };
+    if (board.el.priority && board.el.priority.value) {
+      body.priority = board.el.priority.value;
+    }
+    if (board.el.smith && board.el.smith.value.trim()) {
+      body.smith = board.el.smith.value.trim();
+    }
+
+    return boardRequest("/api/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(function (order) {
+        board.el.title.value = "";
+        board.el.smith.value = "";
+        return refreshBoard().then(function () {
+          boardNote("Created " + order.order_id + ".");
+        });
+      })
+      .catch(function (error) {
+        boardNote("Could not create the order: " + error.message);
+      });
+  }
+
+  function selectView(name) {
+    board.open = name === "board";
+    board.el.workbench.hidden = board.open;
+    board.el.view.hidden = !board.open;
+    Array.prototype.forEach.call(
+      board.el.switcher.querySelectorAll(".view-button"),
+      function (button) {
+        button.setAttribute(
+          "aria-pressed",
+          button.getAttribute("data-view") === name ? "true" : "false"
+        );
+      }
+    );
+    // Read on open rather than on a timer: the board only changes when someone
+    // changes it, and a poll could only ever return the same answer.
+    if (board.open) refreshBoard();
+  }
+
+  if (board.el.form) {
+    board.el.form.addEventListener("submit", createOrder);
+  }
+  if (board.el.close) {
+    board.el.close.addEventListener("click", closeOrder);
+  }
+  if (board.el.switcher) {
+    board.el.switcher.addEventListener("click", function (event) {
+      var button = event.target.closest
+        ? event.target.closest(".view-button")
+        : null;
+      if (button) selectView(button.getAttribute("data-view"));
+    });
   }
 
   // -- wiring ----------------------------------------------------------
