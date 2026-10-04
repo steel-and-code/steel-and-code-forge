@@ -37,6 +37,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Mapping, Sequence, TextIO
 
 from ..tools.approval import (
@@ -73,9 +74,19 @@ DEFAULT_AGENT = "forge-cli"
 WORKSPACE_ENV = "FORGE_WORKSPACE"
 
 #: Model configuration. Byte has no fixed model by settled decision, so this is a
-#: default to be overridden, never a baked-in choice.
+#: default to be overridden, never a baked-in choice. There is deliberately no
+#: DEFAULT_MODEL constant: the default model now comes from the registry, and a
+#: fallback string here would be a second source of truth that silently wins
+#: whenever configuration is broken -- which is exactly the failure the registry
+#: was built to remove.
 DEFAULT_MODEL_ENV = "FORGE_MODEL"
-DEFAULT_MODEL = "anthropic/claude-sonnet-4"
+
+#: The task kind Byte's default routing asks about, and the difficulty it assumes.
+#: Named here because it is a statement about what Byte *is for*, not a model
+#: choice: Byte writes and fixes code. A different agent would name its own kind.
+#: Neither this pair nor any model id appears in an agent profile.
+BYTE_TASK_KIND = "coding"
+BYTE_TASK_DIFFICULTY = "standard"
 
 #: Model provider. OpenRouter remains the default, while local selects the
 #: llama.cpp gateway running on this machine.
@@ -296,8 +307,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID",
         default=None,
         help=(
-            f"provider model id (default: ${DEFAULT_MODEL_ENV}, else "
-            f"{DEFAULT_MODEL})"
+            "provider model id. Overrides ${DEFAULT_MODEL_ENV} and the model "
+            "registry; the default is resolved by routing."
         ),
     )
     byte_parser.add_argument(
@@ -467,8 +478,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ID",
         default=None,
         help=(
-            f"provider model id (default: ${DEFAULT_MODEL_ENV}, else "
-            f"{DEFAULT_MODEL})"
+            "provider model id. Overrides ${DEFAULT_MODEL_ENV} and the model "
+            "registry; the default is resolved by routing."
         ),
     )
     workbench_parser.add_argument(
@@ -809,20 +820,148 @@ def _read_task(args: argparse.Namespace, err: TextIO) -> str | None:
     )
     return None
 
+
+@dataclass(frozen=True)
+class ResolvedModel:
+    """The model one run will use, and where that decision came from.
+
+    A plain string is not enough at this boundary. Resolving the default now
+    means routing, and routing produces three things a caller genuinely needs:
+    the model id, the *provider* it belongs to, and the reason. Dropping the
+    provider would mean re-deriving it from ``$FORGE_MODEL_PROVIDER`` and
+    pairing a locally-routed model with a remote gateway.
+    """
+
+    model_id: str
+    provider: str
+    tier: str = ""
+    selection: str = ""
+    reason: str = ""
+    #: True when this came from the registry rather than an operator override.
+    routed: bool = False
+
+
+class ModelResolutionError(Exception):
+    """No usable model, or no usable configuration, for a run.
+
+    Separate from ``GatewayError`` because the honest response differs. A
+    gateway error is a provider that answered unusably; this is Forge declining
+    to start a run on a model it cannot justify. It carries an operator-readable
+    message and is caught at the CLI edge, where it becomes a usage error rather
+    than a traceback.
+    """
+
+
+def _resolve_default_model(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+) -> ResolvedModel:
+    """Decide which model a run uses, honouring overrides first.
+
+    Precedence, unchanged from before this function existed:
+
+    1. ``--model`` on the command line.
+    2. ``$FORGE_MODEL`` in the environment.
+    3. The configured registry, by routing.
+
+    Only the third step is new. An explicit override short-circuits before the
+    registry is read at all, so pinning a model keeps working when the
+    configuration is broken -- the escape hatch stays usable precisely when it is
+    needed.
+
+    An override also keeps the pre-existing provider behaviour: the provider
+    comes from ``$FORGE_MODEL_PROVIDER``, exactly as it always has. Only a
+    *routed* default takes its provider from the selected slot, because that is
+    the pairing configuration stated and mixing them would produce a model
+    addressed to the wrong endpoint.
+    """
+    explicit = getattr(args, "model", None)
+    if explicit:
+        return ResolvedModel(
+            model_id=explicit,
+            provider=(
+                environ.get(MODEL_PROVIDER_ENV, DEFAULT_MODEL_PROVIDER)
+                .strip()
+                .lower()
+            ),
+            reason="--model on the command line",
+            routed=False,
+        )
+
+    from_env = environ.get(DEFAULT_MODEL_ENV, "").strip()
+    if from_env:
+        return ResolvedModel(
+            model_id=from_env,
+            provider=(
+                environ.get(MODEL_PROVIDER_ENV, DEFAULT_MODEL_PROVIDER)
+                .strip()
+                .lower()
+            ),
+            reason=f"${DEFAULT_MODEL_ENV} in the environment",
+            routed=False,
+        )
+
+    from ..models.registry import RegistryConfigError, load_registry
+    from ..models.router import ModelRouter, RouteRequest
+
+    try:
+        registry = load_registry(environ=environ)
+    except RegistryConfigError as exc:
+        raise ModelResolutionError(str(exc)) from None
+
+    # Imported here for the same reason every other runtime import in this
+    # module is: `forge check` must not pay for the agent package, and the
+    # requester identity has to be a true statement about who is asking.
+    from ..agents.byte import BYTE
+
+    decision = ModelRouter(registry).route(
+        RouteRequest(
+            agent=BYTE.name,
+            task=BYTE_TASK_KIND,
+            difficulty=BYTE_TASK_DIFFICULTY,
+        )
+    )
+
+    if not decision.usable:
+        raise ModelResolutionError(
+            f"no usable model for Byte's default routing "
+            f"(task {BYTE_TASK_KIND!r}, difficulty {BYTE_TASK_DIFFICULTY!r}): "
+            f"{decision.reason}. Pass --model ID or set ${DEFAULT_MODEL_ENV} to "
+            f"choose one explicitly."
+        )
+
+    return ResolvedModel(
+        model_id=decision.model,
+        provider=decision.provider,
+        tier=decision.tier,
+        selection=decision.selection.value,
+        reason=decision.reason,
+        routed=True,
+    )
+
 def _build_model_gateway(
-    environ: dict[str, str],
+    environ: Mapping[str, str],
+    provider: str | None = None,
 ):
-    """Construct the configured model gateway."""
+    """Construct the model gateway for ``provider``.
+
+    ``provider`` is passed in rather than read from the environment, because a
+    routed default already decided it: a model selected out of a tier whose
+    provider is ``local`` must be served by the local gateway even when
+    ``$FORGE_MODEL_PROVIDER`` says otherwise. ``None`` keeps the old behaviour of
+    reading the environment, which is still what an operator override uses.
+    """
 
     from ..models.base import GatewayError
     from ..models.local import LocalLlamaGateway
     from ..models.openrouter import OpenRouterGateway
 
-    provider = (
-        environ.get(MODEL_PROVIDER_ENV, DEFAULT_MODEL_PROVIDER)
-        .strip()
-        .lower()
-    )
+    if provider is None:
+        provider = (
+            environ.get(MODEL_PROVIDER_ENV, DEFAULT_MODEL_PROVIDER)
+            .strip()
+            .lower()
+        )
 
     if provider == "local":
         # ``environ`` is the same injected mapping OpenRouter reads, so the
@@ -864,17 +1003,23 @@ def _run_byte(
     if task is None:
         return EXIT_USAGE
 
-    model_id = (
-        getattr(args, "model", None)
-        or environ.get(DEFAULT_MODEL_ENV)
-        or DEFAULT_MODEL
-    )
+    # Resolved before the gateway is built, because the decision names the
+    # provider. An operator override short-circuits inside the resolver without
+    # reading the registry, so a broken configuration never blocks a run that
+    # names its own model.
+    try:
+        resolved = _resolve_default_model(args, environ)
+    except ModelResolutionError as exc:
+        print(f"forge: {exc}", file=err)
+        return EXIT_USAGE
+
+    model_id = resolved.model_id
 
     # The provider key is read by the gateway layer alone, from the injected
     # mapping. It is never threaded through the profile, the state, or a tool
     # result, and the runtime is constructed before anything can reach it.
     try:
-        gateway = _build_model_gateway(environ)
+        gateway = _build_model_gateway(environ, provider=resolved.provider)
     except GatewayError as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_USAGE
@@ -963,18 +1108,25 @@ def _run_workbench(
         print(f"forge: port must be between 1 and 65535, not {port}", file=err)
         return EXIT_USAGE
 
-    model_id = (
-        getattr(args, "model", None)
-        or environ.get(DEFAULT_MODEL_ENV)
-        or DEFAULT_MODEL
-    )
+    # Resolved the same way `forge byte` resolves it, because the DEFAULT_MODEL
+    # constant this used to fall back on no longer exists -- and putting it back
+    # would reintroduce the hard-coded model id the registry exists to remove.
+    # The workbench is a browser surface onto the same Byte run, so it must not
+    # be able to start a run on a model `forge byte` would refuse.
+    try:
+        resolved = _resolve_default_model(args, environ)
+    except ModelResolutionError as exc:
+        print(f"forge: {exc}", file=err)
+        return EXIT_USAGE
+
+    model_id = resolved.model_id
 
     # The credential is read here, in this process, from the injected mapping.
     # It is never threaded into the session, the broker, the app, or a response
     # body -- a page that can read the provider key is a page that can spend the
     # operator's money.
     try:
-        gateway = _build_model_gateway(environ)
+        gateway = _build_model_gateway(environ, provider=resolved.provider)
     except GatewayError as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_USAGE
@@ -1018,6 +1170,11 @@ def _run_workbench(
     print(f"forge: workbench on http://{WORKBENCH_BIND_HOST}:{port}", file=out)
     print(f"forge: workspace {workspace.root}", file=out)
     print(f"forge: model {model_id}", file=out)
+    if resolved.routed:
+        print(
+            f"forge: tier {resolved.tier} ({resolved.selection}); {resolved.reason}",
+            file=out,
+        )
     print("forge: bound to loopback; approval-required operations need you", file=out)
 
     uvicorn.run(app, host=WORKBENCH_BIND_HOST, port=int(port), log_level="warning")

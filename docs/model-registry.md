@@ -316,14 +316,45 @@ primary or fallback, the reason, and the routing rule matched.
 an operation on a workspace, and the workspace root being an explicit safety
 decision should not be attached to an unrelated concern.
 
+## Overrides bypass routing
+
+Two overrides take precedence over the registry, and both **skip routing
+entirely**:
+
+| Source | Precedence |
+|---|---|
+| `--model ID` on `forge byte` / `forge workbench` | highest |
+| `$FORGE_MODEL` | second |
+| the registry, by routing | default |
+
+An override short-circuits before the registry is read. The registry is not
+consulted, not validated, and cannot fail the run -- so **pinning a model keeps
+working when the configuration file is broken**. That is deliberate: the escape
+hatch has to stay usable precisely when it is needed.
+
+An overridden model keeps the pre-existing provider behaviour, taking its
+provider from `$FORGE_MODEL_PROVIDER`. Only a *routed* default takes its
+provider from the selected slot, because that is the pairing configuration
+stated; mixing the two would address a model to the wrong endpoint.
+
+`forge byte` routes as task `coding`, difficulty `standard`. Both are named in
+`forge/cli/main.py` and neither is an agent concern -- `AgentProfile.model`
+remains `None` by settled decision.
+
+> **`$FORGE_MODEL` shadows the registry silently.** If it is exported in your
+> shell, `forge byte` will keep using it and registry edits will appear to be
+> ignored -- including a disabled primary or a RED tier. Run
+> `unset FORGE_MODEL` before testing registry behaviour, or check
+> `forge route` output, which is unaffected by the override.
+
 ## Not connected yet
 
-This foundation is **not wired to live execution**. `forge byte` and
-`forge workbench` still resolve `--model` and `$FORGE_MODEL` exactly as before;
-no existing execution behaviour changed. Wiring the router into the runtime is a
-separate, deliberate step.
+`forge byte` and `forge workbench` resolve their **default** model through the
+registry. Nothing else about execution changed: approvals, tool dispatch, the
+tool loop, and the workspace rules are untouched, and `AgentRuntime` still
+receives a plain `model_id` string.
 
-## CLI commands
-
-- `forge models status`
-- `forge route --agent byte --task coding --difficulty standard`
+What is deliberately not done: the registry is resolved **once, at the CLI
+edge**. It is not threaded into the runtime, no health probing happens, and no
+model call is retried on a different model mid-run. A run that starts on a
+fallback keeps that model; switching mid-run is a separate decision.
