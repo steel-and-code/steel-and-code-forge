@@ -37,7 +37,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Sequence, TextIO
+from typing import Mapping, Sequence, TextIO
 
 from ..tools.approval import (
     ApprovalChannel,
@@ -47,10 +47,12 @@ from ..tools.approval import (
 )
 from ..tools.commands import Command, CommandClassifier, CommandVerdict
 from ..tools.secrets import SecretClassifier, SecretVerdict
+from ..models.router import ModelRouter
 from ..tools.workspace import Classification, Workspace
 from . import render
 from .render import (
     EXIT_INTERNAL,
+    EXIT_MODEL_UNAVAILABLE,
     EXIT_NEEDS_APPROVAL,
     EXIT_OK,
     EXIT_REFUSED,
@@ -79,6 +81,11 @@ DEFAULT_MODEL = "anthropic/claude-sonnet-4"
 #: llama.cpp gateway running on this machine.
 MODEL_PROVIDER_ENV = "FORGE_MODEL_PROVIDER"
 DEFAULT_MODEL_PROVIDER = "openrouter"
+
+#: The model configuration file. Imported rather than duplicated: the CLI names
+#: no model and no configuration path of its own, it only tells the registry
+#: which path to prefer. See `forge.models.registry`.
+from ..models.registry import LOCAL_CONFIG_NAME, MODELS_CONFIG_ENV  # noqa: E402
 
 #: Where `forge byte` reads a long task from. A file rather than stdin, because a
 #: piped prompt collides awkwardly with `--workspace` and with a future chat mode.
@@ -317,6 +324,108 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="TASK",
         help="the task, as one argument",
+    )
+
+    route_parser = sub.add_parser(
+        "route",
+        help="report which model would serve a request, and why",
+        description=(
+            "Resolve a request to a model through the model registry and report "
+            "the decision: the capability tier, the model, the provider, "
+            "whether the primary or a fallback was selected, and the reason.\n\n"
+            "Decides nothing else and calls nothing. No gateway is built, no "
+            "network request is made, and no credential is read, so this is "
+            "safe to run offline and unauthenticated."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  forge route --agent byte --task coding --difficulty standard\n"
+            "  forge route --task coding --difficulty hard --json\n"
+            "  forge route --tier reasoning_heavy\n"
+        ),
+    )
+    route_parser.add_argument(
+        "--agent",
+        metavar="NAME",
+        default=DEFAULT_AGENT,
+        help=f"requester this routing decision is for (default: {DEFAULT_AGENT})",
+    )
+    route_parser.add_argument(
+        "--task",
+        metavar="KIND",
+        default=None,
+        help=(
+            "task kind, matched against routing.tasks in the model "
+            "configuration. An unlisted kind uses the default tier."
+        ),
+    )
+    route_parser.add_argument(
+        "--difficulty",
+        metavar="LEVEL",
+        default=None,
+        help="difficulty within the task kind; defaults to standard",
+    )
+    route_parser.add_argument(
+        "--tier",
+        metavar="NAME",
+        default=None,
+        help=(
+            "override the routing table and use this capability tier directly "
+            "(one of general_light, coding_standard, reasoning_heavy)"
+        ),
+    )
+    route_parser.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help=(
+            f"model configuration file. Defaults to ${MODELS_CONFIG_ENV}, then "
+            f"./{LOCAL_CONFIG_NAME}, then the packaged default."
+        ),
+    )
+    route_parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="emit one JSON object instead of human-readable text",
+    )
+
+    models_parser = sub.add_parser(
+        "models",
+        help="inspect the model registry",
+        description=(
+            "Inspect the model registry: which capability tiers exist, their "
+            "health, and the model each would use. Reads configuration only."
+        ),
+    )
+    models_sub = models_parser.add_subparsers(dest="leaf", metavar="SUBJECT")
+
+    models_status_parser = models_sub.add_parser(
+        "status",
+        help="show each capability tier's health",
+        description=(
+            "Show one line per capability tier: its health (GREEN when the "
+            "primary is usable, YELLOW when only a fallback is, RED when "
+            "nothing is), the model and provider that would serve it, and "
+            "whether that is the primary or a fallback."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    models_status_parser.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help=(
+            f"model configuration file. Defaults to ${MODELS_CONFIG_ENV}, then "
+            f"./{LOCAL_CONFIG_NAME}, then the packaged default."
+        ),
+    )
+    models_status_parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="emit one JSON object per tier, newline-delimited",
     )
 
     workbench_parser = sub.add_parser(
@@ -915,6 +1024,133 @@ def _run_workbench(
     return EXIT_OK
 
 
+
+
+# --------------------------------------------------------------------------
+# forge route / forge models status
+# --------------------------------------------------------------------------
+
+
+def _build_router(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    *,
+    err: TextIO,
+) -> ModelRouter | None:
+    """Load the registry and build a router, or explain why it could not.
+
+    Imported inside the function for the same reason the gateway imports are:
+    `forge check` must not pay for the model layer, and a model layer that
+    failed to import should surface as a usage error on the two commands that
+    need it rather than as a broken `forge` overall.
+
+    Returns ``None`` after printing, so the caller has one exit path.
+    """
+    from ..models.registry import RegistryConfigError, load_registry
+    from ..models.router import ModelRouter as _ModelRouter
+
+    try:
+        registry = load_registry(getattr(args, "config", None), environ=environ)
+    except RegistryConfigError as exc:
+        print(f"forge: {exc}", file=err)
+        return None
+
+    return _ModelRouter(registry)
+
+
+def _run_route(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    *,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Report which model would serve a request, and why.
+
+    Executes nothing and builds no gateway. The exit code tells a script whether
+    a model was available, which is the only thing here a caller might want to
+    branch on: EXIT_MODEL_UNAVAILABLE when the tier cannot serve, EXIT_USAGE when
+    the configuration itself is unusable.
+    """
+    from ..models.router import RouteRequest
+
+    router = _build_router(args, environ, err=err)
+    if router is None:
+        return EXIT_USAGE
+
+    if not (args.task or args.difficulty or args.tier):
+        print(
+            "forge: nothing to route. Name a task, a tier, or both, for\n"
+            "example:\n"
+            "  forge route --agent byte --task coding --difficulty standard",
+            file=err,
+        )
+        return EXIT_USAGE
+
+    decision = router.route(
+        RouteRequest(
+            agent=args.agent,
+            task=args.task,
+            difficulty=args.difficulty,
+            tier=args.tier,
+        )
+    )
+
+    if args.as_json:
+        print(render.render_route_json(decision), file=out)
+    else:
+        print(
+            render.render_route(decision, source=router.registry.source), file=out
+        )
+
+    return EXIT_OK if decision.usable else EXIT_MODEL_UNAVAILABLE
+
+
+def _run_models_status(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    *,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """One line per capability tier.
+
+    Exit code reflects the worst tier: OK when every tier is GREEN, and
+    EXIT_MODEL_UNAVAILABLE when any tier is RED. A RED capability is a real
+    operational problem, so a script polling status should be able to notice
+    without parsing the table.
+
+    YELLOW does not affect the exit code. Traffic still flows on a degraded
+    tier, and a command that failed on a working -- if not ideal -- capability
+    would train an operator to ignore it.
+    """
+    router = _build_router(args, environ, err=err)
+    if router is None:
+        return EXIT_USAGE
+
+    entries = router.status()
+
+    if args.as_json:
+        print(render.render_model_status_json(entries), file=out)
+    else:
+        print(
+            render.render_model_status(
+                tiers=entries,
+                source=router.registry.source,
+                verified=router.registry.availability.verified,
+            ),
+            file=out,
+        )
+
+    from ..models.tiers import Health
+
+    return (
+        EXIT_MODEL_UNAVAILABLE
+        if any(entry["health"] == Health.RED.value for entry in entries)
+        else EXIT_OK
+    )
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -1020,6 +1256,15 @@ def main(
                 environ=env,
                 channel=channel,
             )
+
+        if args.subcommand == "route":
+            return _run_route(args, env, out=out_stream, err=err_stream)
+
+        if args.subcommand == "models":
+            if getattr(args, "leaf", None) is None:
+                parser.parse_args(["models", "--help"])
+                return EXIT_USAGE
+            return _run_models_status(args, env, out=out_stream, err=err_stream)
 
         if args.subcommand == "workbench":
             workspace, problem = _resolve_workspace(

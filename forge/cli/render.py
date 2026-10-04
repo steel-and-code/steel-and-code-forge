@@ -48,6 +48,7 @@ from ..tools.workspace import Classification
 
 __all__ = [
     "EXIT_OK",
+    "EXIT_MODEL_UNAVAILABLE",
     "EXIT_REFUSED",
     "EXIT_USAGE",
     "EXIT_NEEDS_APPROVAL",
@@ -65,6 +66,11 @@ __all__ = [
     "render_verdict",
     "render_outcome",
     "render_json",
+    "render_route",
+    "render_route_json",
+    "render_model_status",
+    "render_model_status_json",
+    "UNVERIFIED_NOTE",
 ]
 
 # --------------------------------------------------------------------------
@@ -85,6 +91,14 @@ EXIT_REFUSED = 1
 EXIT_USAGE = 2
 EXIT_NEEDS_APPROVAL = 3
 EXIT_INTERNAL = 4
+
+#: No model in the requested capability tier could serve the request. A sixth
+#: code rather than a reuse of EXIT_REFUSED, because "the policy said no" and
+#: "there was nothing to run" are different facts: the first is a decision, the
+#: second is a capability gap. A script branching on either would silently
+#: conflate them if they shared a code. Shares EXIT_REFUSED's *class* -- both
+#: mean "this did not happen" -- while staying distinguishable.
+EXIT_MODEL_UNAVAILABLE = 5
 
 # --------------------------------------------------------------------------
 # States
@@ -441,3 +455,155 @@ def render_json(
         ),
         sort_keys=False,
     )
+
+# --------------------------------------------------------------------------
+# Model routing
+# --------------------------------------------------------------------------
+#
+# Presentation only, like everything above: these take a decision the registry
+# and router already produced and format it. Neither module is imported here, so
+# the reasoning about what is healthy cannot leak into how it is spelled, and a
+# reworded label cannot change a health value.
+#
+# Field widths follow the rest of this module rather than being chosen per
+# function, so a `forge route` block and a `forge check` block read as the same
+# interface to the same operator.
+
+#: Said plainly when nobody checked. A GREEN tier printed next to the word
+#: "unverified" must not read as a confirmed-working model, because nothing
+#: contacted the provider. Deliberately a whole word rather than a symbol.
+UNVERIFIED_NOTE = "unverified"
+
+
+def render_route(decision, *, source: str | None = None) -> str:
+    """Render one routing decision.
+
+    The first line is the health state, matching ``forge check``'s convention
+    that the thing an operator scans for comes first. A routing failure renders
+    the same way -- RED, reason underneath -- so a RED capability and a refused
+    command look like the same kind of event: something is unavailable, and here
+    is why.
+
+    "selected" names primary or fallback and, for a fallback, its position.
+    Position is worth showing: the first fallback and the third are different
+    cost and behaviour, and an operator reading this after an incident wants to
+    know which one was used.
+    """
+    lines = [decision.health.value]
+
+    pairs: list[tuple[str, str]] = [("agent", decision.agent), ("tier", decision.tier)]
+
+    if decision.usable:
+        pairs.append(("model", decision.model))
+        pairs.append(("provider", decision.provider))
+        selected = decision.selection.value
+        if decision.fallback_index:
+            selected = f"{selected} #{decision.fallback_index}"
+        pairs.append(("selected", selected))
+    else:
+        pairs.append(("model", "none selected"))
+
+    pairs.append(("reason", decision.reason))
+    if decision.tier_reason:
+        pairs.append(("routing", decision.tier_reason))
+    if source:
+        pairs.append(("config", source))
+
+    lines.extend(f"  {name:<12} {value}" for name, value in pairs)
+    return "\n".join(lines)
+
+
+def render_route_json(decision) -> str:
+    """One JSON object for ``forge route --json``."""
+    return json.dumps(decision.to_json(), sort_keys=False)
+
+
+#: Column widths for the status table. Fixed and generous enough for the longest
+#: shipped model id, so the provider column stays aligned rather than wrapping
+#: into a shape an operator has to re-read per row.
+_STATUS_TIER = 18
+_STATUS_HEALTH = 7
+_STATUS_MODEL = 34
+_STATUS_PROVIDER = 12
+_STATUS_FALLBACKS = 30
+
+
+def render_model_status(
+    *,
+    tiers: list,
+    source: str,
+    verified: bool,
+) -> str:
+    """Render every capability tier's health as a table.
+
+    A table rather than a set of labelled blocks because the question an
+    operator actually has is "which of my three capabilities is red", and that
+    is a column-reading task. Each row carries the model that would be used, so
+    a GREEN next to an unexpected id is visible without a second command.
+
+    ``tiers`` is the router's status list. This function decides nothing about
+    it -- not the health, not the model, not the slot position.
+    """
+    header = (
+        f"{'TIER':<{_STATUS_TIER}} {'HEALTH':<{_STATUS_HEALTH}} "
+        f"{'MODEL':<{_STATUS_MODEL}} {'PROVIDER':<{_STATUS_PROVIDER}} "
+        f"{'SELECTED':<11} FALLBACKS"
+    )
+
+    rows = [header]
+    for entry in tiers:
+        model = entry["model"] or "-"
+        provider = entry["provider"] or "-"
+        rows.append(
+            f"{entry['tier']:<{_STATUS_TIER}} "
+            f"{entry['health']:<{_STATUS_HEALTH}} "
+            f"{model:<{_STATUS_MODEL}} "
+            f"{provider:<{_STATUS_PROVIDER}} "
+            f"{entry['slot']:<11} {_fallback_list(entry)}"
+        )
+
+    lines = ["\n".join(rows), ""]
+    lines.append(f"  config        {source}")
+
+    if verified:
+        lines.append(
+            "  availability  reported by an injected source; health is verified"
+        )
+    else:
+        lines.append(
+            f"  availability  {UNVERIFIED_NOTE}: no availability source was "
+            "supplied, so no provider was contacted. Health reflects "
+            "configuration and gateway availability only."
+        )
+
+    return "\n".join(lines)
+
+
+def _fallback_list(entry: dict) -> str:
+    """The tier's fallback models, in declaration order.
+
+    Shown even when the primary is healthy. That is the whole point of the
+    column: when the primary does go down, the operator wants to see what is
+    standing behind it without running a second command to find out.
+    """
+    fallbacks = [
+        slot
+        for slot in entry.get("slots", [])
+        if slot.get("position", 0) > 0
+    ]
+    if not fallbacks:
+        return "-"
+    return ", ".join(
+        f"{slot['model']}{'' if slot.get('enabled', True) else ' (disabled)'}"
+        for slot in fallbacks
+    )
+
+
+def render_model_status_json(entries: list) -> str:
+    """One JSON object per tier, newline-delimited.
+
+    Newline-delimited rather than a list under a wrapper key: ``forge check path
+    --json`` already emits one object per line, so a consumer learns one format
+    for the CLI. Insertion order is preserved, matching ``render_json``.
+    """
+    return "\n".join(json.dumps(entry, sort_keys=False) for entry in entries)

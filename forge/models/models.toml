@@ -1,0 +1,84 @@
+# Forge model registry: the default configuration.
+#
+# Every model identifier Forge uses is named in this file. An agent asks for a
+# capability tier; this file says which model serves it. Replacing a model is
+# therefore a configuration edit, never a code change.
+#
+# Resolution order, first match wins:
+#   1. $FORGE_MODELS_CONFIG
+#   2. ./models.toml   (this file, copied next to your project)
+#   3. this packaged default
+#
+# `enabled = false` is the operator's switch and nothing can override it. Health
+# is GREEN only when a model could actually serve a request right now, so a tier
+# pointing at a provider with no gateway yet is RED rather than reassuring.
+
+[providers]
+# Only the credential variable NAME is configuration. Values are read by the
+# gateway layer alone and never appear in a status view, a log, or a UI panel.
+
+[providers.openrouter]
+credential_env = "FORGE_OPENROUTER_API_KEY"
+
+[providers.local]
+credential_env = ""
+
+# Declared so configuration naming them validates and status can show them.
+# Neither has a gateway implementation yet, so a slot using one is RED.
+
+[providers.openai]
+credential_env = "FORGE_OPENAI_API_KEY"
+
+[providers.anthropic]
+credential_env = "FORGE_ANTHROPIC_API_KEY"
+
+
+[tiers.general_light]
+# Cheap, fast, enough for summarising, triage, and drafting.
+primary = { model = "anthropic/claude-sonnet-4", provider = "openrouter" }
+fallbacks = [
+    { model = "qwen2.5-coder:14b", provider = "local" },
+    { model = "openai/gpt-4o-mini", provider = "openrouter" },
+]
+
+[tiers.coding_standard]
+# The workhorse: editing code, running tests, following the tool loop.
+primary = { model = "anthropic/claude-sonnet-4", provider = "openrouter" }
+fallbacks = [
+    { model = "openai/gpt-4o", provider = "openrouter" },
+    { model = "qwen2.5-coder:14b", provider = "local" },
+]
+
+[tiers.reasoning_heavy]
+# Architecture, debugging across a system, and anything needing depth.
+primary = { model = "openai/o3", provider = "openrouter" }
+fallbacks = [
+    { model = "anthropic/claude-opus-4", provider = "openrouter" },
+]
+
+
+[routing]
+# Used whenever no task entry matches. An unanticipated task still routes.
+default_tier = "general_light"
+
+# Task kind, then difficulty. Add a task or a difficulty here to change routing;
+# no code change is involved.
+[routing.tasks.coding]
+light = "general_light"
+standard = "coding_standard"
+hard = "reasoning_heavy"
+
+[routing.tasks.analysis]
+light = "general_light"
+standard = "coding_standard"
+hard = "reasoning_heavy"
+
+[routing.tasks.conversation]
+light = "general_light"
+standard = "general_light"
+hard = "coding_standard"
+
+[routing.tasks.review]
+light = "general_light"
+standard = "coding_standard"
+hard = "reasoning_heavy"

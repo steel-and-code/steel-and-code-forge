@@ -41,13 +41,16 @@ forge = "forge.cli.main:main"
 [tool.setuptools.packages.find]
 include = ["forge*"]
 
-# The Workbench page, its script, and its stylesheet are served from the
-# installed package, not from the source tree. Without this, an editable
-# install works and a real wheel silently ships a page with no CSS or JS --
-# because `[tool.setuptools.packages.find]` collects modules, and a bare
-# `static/` directory is not one.
+# The Workbench page, its script, its stylesheet, and the default model
+# registry are served from the installed package, not from the source tree.
+# Without this, an editable install works and a real wheel silently ships a page
+# with no CSS or JS -- because `[tool.setuptools.packages.find]` collects
+# modules, and a bare `static/` directory is not one. `models.toml` fails the
+# same way and more quietly: `forge route` would have no registry to load and
+# fail at first use rather than at install.
 [tool.setuptools.package-data]
 "forge.ui" = ["static/*"]
+"forge.models" = ["*.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
