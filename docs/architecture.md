@@ -139,6 +139,45 @@ Static assets are served directly; no template engine and no multipart form
 handling is involved. The optional dependency set is `fastapi` and `uvicorn`,
 and the Forge core remains dependency-free.
 
+**The route surface, and what each route is allowed to do.** Six routes, and the
+distinction that matters between them is observation versus command:
+
+| Route | Method | Kind | Guard |
+| --- | --- | --- | --- |
+| `/api/status` | GET | observation | token + read-only same-origin pair |
+| `/api/models` | GET | observation | token + read-only same-origin pair |
+| `/api/models/verify` | POST | command | token + exact `Origin` |
+| `/api/run` | POST | command | token + exact `Origin` |
+| `/api/approvals/{id}` | POST | command | token + exact `Origin` |
+| `/api/events` | GET | observation | single-use stream ticket + read-only pair |
+
+`/api/health` is a seventh, deliberately outside this table: unauthenticated,
+capability-free liveness that reveals nothing.
+
+**Model health is an observation, and re-checking it is a command.** The
+Workbench shows one indicator per capability tier, fed by `ModelRouter.status()`
+verbatim. `GET /api/models` returns a server-side cached snapshot and *never*
+probes: a page load, a refresh, or a reload cannot spend a provider request or
+present a credential, because a browser-reachable read that opened sockets would
+make "open the tab" a billable action. `POST /api/models/verify` is the only way
+to make the server contact a provider after startup, and it is a command for the
+same reason it is a POST — it reaches providers, so it takes the strict
+exact-Origin rule and cannot be triggered from a page Forge did not serve. It
+also refuses while a run is in flight: a verification pass opening sockets from
+inside a process that is already executing would be an incidental side effect of
+running Byte, and health checking must never be one.
+
+`forge workbench` performs one verified health pass at startup so the first page
+load shows a checked answer. After that there is no polling anywhere — the page
+re-reads the cache on load and on visibility change, and only the operator's
+Re-check presses anything. Credentials live in the server process and in the
+verifier factories; no response, and no browser state, carries one.
+
+The frontend does not decide health. `forge/ui/static/health.js` maps the
+backend's health string to a glyph and a word, and structural tests fail if it
+ever compares a health value, assigns one, or names a model or provider. See
+[model-registry.md](model-registry.md) for the full contract.
+
 ### 4. Provider-agnostic core
 
 The core stays provider-agnostic. Forge does not embed vendor assumptions in

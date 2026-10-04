@@ -499,13 +499,57 @@ string. A status line wants the conclusion; a routing audit wants the
 derivation. Concatenating them produced the same fact twice in two vocabularies.
 
 `forge models status --json` emits these objects newline-delimited, and the
-Workbench indicator should bind to the same shape rather than introducing a
-second format. The renderer decides nothing: it reads these fields and formats
-them, so presentation cannot change a health value.
+Workbench indicator binds to the same shape rather than introducing a second
+format. `GET /api/models` returns these entries verbatim. The renderer decides
+nothing: it reads these fields and formats them, so presentation cannot change a
+health value.
 
 Health is defined once, in `ModelRegistry.health`. The router recomputes nothing
 and `render.py` imports neither module -- presentation cannot change a health
 value.
+
+## The Workbench indicator consumes this, and decides nothing
+
+The Workbench's model-health indicator is the first UI consumer of this contract,
+and it is bound by the rule above in a way a test enforces rather than a comment
+promises.
+
+`forge/ui/static/health.js` maps the backend's `health` string to a glyph and a
+word and does nothing else. It has no `GREEN`/`YELLOW`/`RED` comparison, no
+arithmetic over slot states, and no model id or provider name anywhere in the
+file. Two structural tests in `tests/test_ui_model_health_ui.py` hold that: one
+fails if the frontend compares a health value or assigns one, the other fails if
+a provider or tier name appears in the source.
+
+Three consequences the indicator is built around:
+
+**Unverified is its own state, not a GREEN.** An offline registry reports
+configured-but-unchecked slots, and `ModelRegistry.health` calls that GREEN --
+correctly, because "usable" means "configured and routable", not "checked". The
+snapshot's own `verified` flag is therefore rendered as a distinct visual state
+(`○`, "unverified") rather than folded into the health colour. Painting an
+unchecked configuration as a healthy green dot would claim a check that never
+happened, which is the same confusion `forge models status --verify`'s VERIFIED
+column exists to prevent. An unknown health string also renders as its own
+"unknown" state rather than defaulting to a colour.
+
+**A failed optional slot does not darken its tier.** A dead fallback is a fact
+about one slot, reported in that tier's details with the provider's own
+`verify_reason` and `verify_code`. The tier indicator keeps showing the health
+value the registry computed. A frontend that recomposed a tier's health from its
+slots would be a second opinion about routing, and two opinions about whether a
+model can serve are worse than one.
+
+**Operational facts read as operational.** A stopped local llama.cpp reports
+`verify_code: unreachable` with the transport's own reason, presented as a
+property of that provider. It is not dressed as a Forge application failure,
+because it is not one and an operator's next action -- start the service --
+differs completely.
+
+Accessibility is a property of the indicator, not a garnish: every tier carries a
+per-state glyph, a visible word, and an `aria-label` naming the tier, the
+backend's health word, and its plain-language meaning. Colour is never the only
+signal.
 
 ## Commands
 
@@ -576,23 +620,69 @@ remains `None` by settled decision.
 > `unset FORGE_MODEL` before testing registry behaviour, or check
 > `forge route` output, which is unaffected by the override.
 
-## Not connected yet
+## Still not connected
 
 `forge byte` and `forge workbench` resolve their **default** model through the
-registry. Nothing else about execution changed: approvals, tool dispatch, the
-tool loop, and the workspace rules are untouched, and `AgentRuntime` still
-receives a plain `model_id` string.
+registry. Nothing about execution changed: approvals, tool dispatch, the tool
+loop, and the workspace rules are untouched, and `AgentRuntime` still receives a
+plain `model_id` string.
 
-What is deliberately not done: the registry is resolved **once, at the CLI
+What is deliberately still not done: the registry is resolved **once, at the CLI
 edge**. It is not threaded into the runtime, and no model call is retried on a
 different model mid-run. A run that starts on a fallback keeps that model;
-switching mid-run is a separate decision.
+switching mid-run is a separate decision. A workbench snapshot going stale is
+likewise not corrected mid-run -- the indicator shows the last checked answer and
+says when it was checked, and correcting it is the operator's explicit act.
 
-Health probing now exists, but **only** as an explicit operator command. It is
-never run during a run, never run implicitly, and its results are not persisted
-to the configuration file. A RED tier still fails to start, exactly as before;
-`--verify` tells you *before* you start what would have happened.
+### Health is checked at startup, and on request only
 
-Not changed by verification: `forge byte`, `forge workbench`, the agent runtime,
-tool dispatch, approvals, the workspace rules, command classification, and
-routing policy.
+`forge workbench` performs **one** verified health pass before it serves, so the
+first page load shows a checked answer rather than asking the operator whether
+the indicator has been checked yet. One pass, at startup. Not on a timer.
+
+From there, the operator drives every subsequent check:
+
+| Route | Method | What it does |
+|---|---|---|
+| `/api/models` | GET | Returns the cached snapshot. **Never probes.** |
+| `/api/models/verify` | POST | One bounded verification pass, then the new snapshot. |
+
+`GET /api/models` is strictly read-only. It returns
+`ModelRouter.status()` entries verbatim -- no renamed fields, no derived
+booleans, no filtering -- so it cannot disagree with `forge models status` about
+what a tier's health is. A page load, a refresh, or an operator hammering F5
+cannot spend a provider request or present a credential, and the test asserts a
+probe call count rather than trusting the intent.
+
+`POST /api/models/verify` is the only way to make the server contact a provider
+after startup. It is a command, not an observation, so it takes the same
+exact-Origin and token guards as every other state-changing route on that
+surface, and it **refuses while a run is in flight** (409). That refusal is the
+point: a verification pass opening sockets from inside a process that is already
+executing would be an incidental side effect of running Byte, and health
+checking must never be one. Not queued either -- the operator asked a question,
+and an answer from after the run is a different answer.
+
+Its bounds are the verifier layer's own and nothing else: one attempt per
+distinct `provider/model`, no retries, five seconds per attempt. `ModelHealth`
+holds no timeout constant, so a more generous one cannot appear for the
+indicator without editing the single place that defines the policy.
+
+### No polling, and no incidental verification
+
+There is no timer anywhere in this path. The page reads the cache on load and
+when the tab becomes visible again, and `POST`s only when the operator presses
+Re-check. A backgrounded tab that re-checked on focus would turn a refocus into a
+repeating credential-bearing request.
+
+A configuration that will not load does not stop the workbench from serving. An
+operator who passed `--model` over a broken registry still gets a working
+surface, and `/api/models` answers 503 with the registry's own error -- which
+names a table and a rule and carries no file contents. An empty indicator would
+read as "nothing configured and nothing wrong", which is a different statement
+from "Forge could not read your configuration".
+
+Not changed by any of this: `forge byte`, the agent runtime, tool dispatch,
+approvals, the workspace rules, command classification, and routing policy. A RED
+tier still fails to start a run, exactly as before; the indicator tells you
+*before* you start what would have happened.

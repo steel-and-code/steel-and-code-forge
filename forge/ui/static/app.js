@@ -3,6 +3,8 @@
  * Four endpoints and one stream:
  *
  *   GET  /api/status           token + same-origin -> current state, approval
+ *   GET  /api/models           token + same-origin -> cached model health
+ *   POST /api/models/verify    token + origin      -> one bounded re-check
  *   POST /api/run              token + origin      -> 202, run id
  *   POST /api/events-ticket    token + origin      -> one-shot stream ticket
  *   GET  /api/events?ticket=   ticket + same-origin -> SSE activity stream
@@ -30,6 +32,18 @@
  * - THE SERVER IS THE ONLY SOURCE OF STATE. Nothing here decides anything. A
  *   click posts a decision and then waits to be told what happened; if the
  *   answer is 409, the card says so rather than pretending it worked.
+ *
+ * - MODEL HEALTH IS DRAWN, NEVER DECIDED. This file fetches the cached
+ *   snapshot and hands it to ForgeHealth, which maps the backend's health
+ *   strings to glyphs and words. No health value is computed, compared, or
+ *   inferred here, and no model or provider name appears in either file -- those
+ *   live in models.toml. `tests/test_ui_model_health_ui.py` enforces that.
+ *
+ * - REFRESHING HEALTH DOES NOT RE-CHECK IT. `refreshModels` reads the cached
+ *   snapshot. Only the explicit Re-check button POSTs, because that is the one
+ *   request that makes the server contact providers and present credentials. A
+ *   page that re-checked on load or on visibility would turn a backgrounded tab
+ *   into a repeating credential-bearing request.
  */
 
 (function () {
@@ -44,6 +58,9 @@
     model: document.getElementById("model"),
     stateChip: document.getElementById("state-chip"),
     stateLabel: document.getElementById("state-label"),
+    models: document.getElementById("models"),
+    modelsRecheck: document.getElementById("models-recheck"),
+    modelsNote: document.getElementById("models-note"),
     streamHint: document.getElementById("stream-hint"),
     thread: document.getElementById("thread"),
     feed: document.getElementById("feed"),
@@ -247,6 +264,113 @@
       });
   }
 
+  // -- model health -----------------------------------------------------
+  //
+  // Two requests, and the difference between them is the whole design of this
+  // panel: one reads a value the server already holds, the other makes the
+  // server go and ask a provider. Nothing here decides what health is.
+
+  function showModelsNote(message) {
+    if (!message) {
+      el.modelsNote.hidden = true;
+      el.modelsNote.textContent = "";
+      return;
+    }
+    el.modelsNote.textContent = message;
+    el.modelsNote.hidden = false;
+  }
+
+  function drawModels(payload) {
+    if (!window.ForgeHealth || !el.models) return;
+    window.ForgeHealth.renderHealth(document, el.models, payload, function (tier) {
+      // Opening a tier is an operator asking "what is this one?". The answer is
+      // already in the panel; this is only for a console-friendly trace of the
+      // same thing, which costs nothing and makes a screenshot explainable.
+      if (window.console && window.console.debug) {
+        window.console.debug("forge model tier", tier.tier, tier.healthWord);
+      }
+    });
+    // A successful read clears a previous failure note, but not the re-check
+    // button's disabled state -- that is re-enabled by the re-check itself.
+    showModelsNote("");
+  }
+
+  /* Read the cached snapshot. Never probes.
+   *
+   * Called on load, after a re-check, and when the tab becomes visible again. A
+   * 503 is a reportable state -- an unreadable configuration -- so it is shown
+   * as a note rather than swallowed: an operator looking at an empty indicator
+   * would otherwise have no way to tell "nothing configured" from "Forge could
+   * not read your configuration".
+   */
+  function refreshModels() {
+    return guardedFetch("/api/models")
+      .then(function (response) {
+        if (response.status === 503) {
+          return response.json().then(function (body) {
+            showModelsNote(
+              "Model health unavailable: " + (body.detail || "no registry loaded")
+            );
+            return null;
+          });
+        }
+        if (!response.ok) throw new Error("models " + response.status);
+        return response.json();
+      })
+      .then(function (payload) {
+        if (payload) drawModels(payload);
+      })
+      .catch(function () {
+        showModelsNote("Could not read model health from the workbench.");
+      });
+  }
+
+  /* Re-check: the one request that makes the server contact providers.
+   *
+   * Disabled while in flight so a second click cannot queue a second pass, and
+   * the 409 from a run in flight is stated rather than treated as a failure --
+   * the server refusing is the correct answer there, not an error to retry.
+   */
+  function recheckModels() {
+    el.modelsRecheck.disabled = true;
+    el.modelsRecheck.textContent = "Checking…";
+
+    return guardedFetch("/api/models/verify", { method: "POST" })
+      .then(function (response) {
+        if (response.status === 409) {
+          return response.json().then(function (body) {
+            showModelsNote(
+              "Not re-checked: " +
+                (body.detail || "a run is in progress in this process.")
+            );
+            return null;
+          });
+        }
+        if (response.status === 503) {
+          return response.json().then(function (body) {
+            showModelsNote(
+              "Model health unavailable: " + (body.detail || "no registry loaded")
+            );
+            return null;
+          });
+        }
+        if (!response.ok) throw new Error("verify " + response.status);
+        return response.json();
+      })
+      .then(function (payload) {
+        if (payload) drawModels(payload);
+        return payload;
+      })
+      .catch(function (error) {
+        showModelsNote("Could not re-check model health: " + error.message);
+      })
+      .then(function (result) {
+        el.modelsRecheck.disabled = false;
+        el.modelsRecheck.textContent = "Re-check models";
+        return result;
+      });
+  }
+
   function submit(task) {
     el.send.disabled = true;
     guardedFetch("/api/run", {
@@ -435,13 +559,27 @@
   el.approve.addEventListener("click", function () { decide(true); });
   el.reject.addEventListener("click", function () { decide(false); });
 
+  if (el.modelsRecheck) {
+    el.modelsRecheck.addEventListener("click", function () { recheckModels(); });
+  }
+
   el.feed.innerHTML = '<li class="empty">no activity yet</li>';
   refreshStatus().then(connect);
+  // Health is read once on load and never polled. The snapshot only changes
+  // when the operator asks for it, so re-fetching on a timer would be a request
+  // that can only ever return the same answer.
+  refreshModels();
 
   // A reconnection after the tab was backgrounded: the stream may have been
   // dropped, and the server may have moved on. Asking is cheap and keeps the
   // header honest.
+  //
+  // The health refresh here re-reads the *cached* snapshot. It must never
+  // re-check: a tab left open in the background would otherwise send a
+  // credential-bearing request every time it was focused.
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) refreshStatus();
+    if (document.hidden) return;
+    refreshStatus();
+    refreshModels();
   });
 })();

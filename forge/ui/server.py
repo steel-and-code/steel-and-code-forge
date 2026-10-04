@@ -1,6 +1,7 @@
 """The Workbench HTTP surface: SSE for activity, POST for decisions.
 
-Four routes, and the split between them is the design:
+Six routes, and the split between them is the design: an **observation** reads
+state the server already holds, a **command** changes something.
 
 ``GET  /api/status``
     Everything true right now, including any pending approval. Token plus the
@@ -9,6 +10,19 @@ Four routes, and the split between them is the design:
     check is a *pair*: exact ``Origin`` when the browser sent one, else
     ``Sec-Fetch-Site: same-origin``, because a same-origin GET carries no
     ``Origin`` at all. See :mod:`forge.ui.security` for the measurement.
+
+``GET  /api/models``
+    The cached model-health snapshot, one entry per capability tier, taken from
+    ``ModelRouter.status()`` verbatim. **Strictly read-only and never probing**:
+    a page load, a refresh, or an operator reloading cannot spend a provider
+    request or present a credential. Same read-only guard as ``GET /api/status``,
+    because it is an observation like that one.
+
+``POST /api/models/verify``
+    One bounded verification pass, then the new snapshot. A **command**, so it
+    takes the strict exact-Origin and token guards rather than the read-only
+    pair, and refuses while a run is in flight. See
+    :meth:`create_app`'s route for why that refusal is load-bearing.
 
 ``GET  /api/events``
     The activity stream. Read-only, and gated by a short-lived single-use
@@ -69,6 +83,7 @@ from .security import (
     check_origin,
     check_same_origin,
 )
+from .models import HealthUnavailable, ModelHealth
 from .session import SessionBusy, UiSessionState, WorkbenchSession
 
 __all__ = ["create_app", "STATIC_DIR", "TOKEN_PLACEHOLDER"]
@@ -126,6 +141,7 @@ def create_app(
     gateway: ModelGateway,
     token: UiToken,
     port: int,
+    health: ModelHealth | None = None,
 ) -> FastAPI:
     """Build the Workbench application.
 
@@ -139,6 +155,11 @@ def create_app(
         token: The per-process UI token, injected into the served page.
         port: The port this process is bound to, which is what an exact
             ``Origin`` must equal.
+        health: The cached model-health snapshot the page's indicator reads.
+            Optional, so a surface built without a model registry still serves
+            the page. ``GET /api/models`` then answers 503 with the reason
+            rather than the indicator showing an empty row an operator would
+            read as healthy.
 
     Deliberately constructed with explicit arguments rather than read from
     ``os.environ`` or a global: a test needs to build two independent
@@ -182,6 +203,9 @@ def create_app(
     # rather than against a store it constructed itself.
     app.state.stream_tickets = tickets
     app.state.workbench_session = session
+    app.state.model_health = (
+        health if health is not None else ModelHealth(None)
+    )
 
     # -- guards ---------------------------------------------------------
 
@@ -283,6 +307,79 @@ def create_app(
     ) -> JSONResponse:
         """Current state, including any pending approval."""
         return JSONResponse(session.status())
+
+    @app.get("/api/models")
+    async def api_models(
+        request: Request, _: None = Depends(guarded_read)
+    ) -> JSONResponse:
+        """The cached model-health snapshot, one entry per capability tier.
+
+        **Strictly read-only.** This route returns what
+        :class:`~forge.ui.models.ModelHealth` already holds and never calls
+        into a probe, so a page load, a refresh, or an operator hammering F5
+        cannot spend a provider request or present a credential. Refreshing the
+        indicator re-reads this; it never re-checks.
+
+        The entries are ``ModelRouter.status()`` verbatim -- no renamed fields,
+        no derived booleans, no filtering -- so this cannot disagree with
+        ``forge models status`` about what a tier's health is.
+
+        503 when no registry was loaded, with the reason. An empty indicator
+        would read as "no models configured and nothing wrong", which is a
+        different statement from "Forge could not read your configuration".
+        """
+        model_health: ModelHealth = app.state.model_health
+        if not model_health.available:
+            return JSONResponse({"detail": model_health.error}, status_code=503)
+        return JSONResponse(model_health.status())
+
+    @app.post("/api/models/verify")
+    async def api_models_verify(
+        request: Request, _: None = Depends(guarded)
+    ) -> JSONResponse:
+        """Re-check model health: one bounded verification pass, then the new snapshot.
+
+        A POST because it is a command, not an observation. It reaches providers
+        and presents credentials, so it takes the strict exact-Origin and token
+        guards rather than the read-only pair -- and a browser cannot trigger it
+        from a page it did not load.
+
+        Three behaviours worth stating:
+
+        *   **Refused while a run is in flight** (409). A verification pass
+            opens sockets from inside a process that is already executing; that
+            would be an incidental side effect of running Byte, and health
+            checking must never be one. Not queued either: the operator asked a
+            question, and an answer from after the run is a different answer.
+        *   **Bounded by the verifier layer, not here.** One attempt per
+            distinct model, no retries, five seconds per attempt. This route
+            holds no timeout of its own.
+        *   **Credentials never leave the server.** The ``environ`` mapping lives
+            in :class:`~forge.ui.models.ModelHealth` and is read only by the
+            verifier factories. The response is the same status payload the read
+            route returns.
+        """
+        if session.busy:
+            return JSONResponse(
+                {
+                    "detail": (
+                        "a run is in progress; re-check model health while the "
+                        "workbench is idle"
+                    )
+                },
+                status_code=409,
+            )
+
+        model_health: ModelHealth = app.state.model_health
+        try:
+            # Off the event loop: the probe blocks for as long as its own
+            # timeout allows, and an operator waiting on it must still be able
+            # to read status and answer an approval.
+            body = await asyncio.to_thread(model_health.verify)
+        except HealthUnavailable as unavailable:
+            return JSONResponse({"detail": str(unavailable)}, status_code=503)
+
+        return JSONResponse(body)
 
     @app.post("/api/run")
     async def api_run(

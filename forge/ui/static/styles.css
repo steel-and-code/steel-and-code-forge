@@ -303,6 +303,192 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 #send { background: #2a2118; border-color: #6b4a20; color: var(--hot); }
 
+/* -- model health ----------------------------------------------------- */
+
+/* Persistent, compact, and out of the way until it is wrong. The collapsed
+   form is `Models ● ◐ ●` -- the whole of it -- because the operator's question
+   is "is anything degraded", and an answer that takes a click to see is not
+   persistent. */
+.models {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.health-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.health-label { color: var(--ink-faint); }
+
+.health-dots { display: inline-flex; align-items: center; gap: 2px; }
+
+/* A tier button is a target, not a label: comfortably tappable on a phone
+   without turning the collapsed strip into a row of boxes. The glyph carries
+   the state; the accessible name carries it too. */
+.health-tier {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 2px 3px;
+  border-radius: var(--radius);
+  color: var(--ink-faint);
+  line-height: 1;
+}
+
+.health-tier:hover { background: rgba(255, 255, 255, 0.04); }
+
+.health-tier:focus-visible {
+  outline: 2px solid var(--steel);
+  outline-offset: 1px;
+}
+
+.health-dot { font-size: 13px; }
+
+/* Colour is a second signal here, never the only one: the glyph differs per
+   state and the word is in the accessible name. These three rules colour a
+   state an operator who cannot distinguish them can still read. */
+.health-tier[data-health="GREEN"][data-verified="yes"] { color: var(--good); }
+.health-tier[data-health="YELLOW"][data-verified="yes"] { color: var(--warn); }
+.health-tier[data-health="RED"][data-verified="yes"] { color: var(--bad); }
+
+/* Unverified is deliberately grey whatever the backend's health string says. An
+   offline registry reports configured slots as GREEN; painting that green would
+   claim a check that never happened. */
+.health-tier[data-verified="no"] { color: var(--ink-faint); opacity: 0.8; }
+
+.health-stamp {
+  color: var(--ink-faint);
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+/* The panel is anchored under the strip rather than centred, so the tier an
+   operator clicked is the tier the details sit under. */
+.health-detail {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 15;
+  width: min(420px, calc(100vw - 32px));
+  margin-top: 6px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--edge-hot);
+  border-radius: 8px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+  color: var(--ink-dim);
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: normal;
+}
+
+.health-detail[hidden] { display: none; }
+
+.health-fields {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.health-fields dt {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.health-fields dd { margin: 0; word-break: break-word; }
+
+.health-slots {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--edge);
+}
+
+.health-slot { padding: 6px 0; border-bottom: 1px solid rgba(42, 49, 56, 0.6); }
+.health-slot:last-child { border-bottom: 0; }
+
+.health-slot-head {
+  margin: 0 0 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.health-slot-facts {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 2px 12px;
+  margin: 0;
+}
+
+.health-slot-facts dt {
+  color: var(--ink-faint);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.health-slot-facts dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-word;
+}
+
+/* A slot verification confirmed unusable is called out, because that is the row
+   an operator is looking for after a provider starts failing. */
+.health-slot[data-verified="no"] .health-slot-head { color: var(--warn); }
+.health-slot[data-probed="no"] .health-slot-head { color: var(--ink-dim); }
+
+.models-recheck {
+  align-self: flex-start;
+  padding: 4px 10px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: transparent;
+  color: var(--ink-faint);
+}
+
+.models-recheck:hover:not(:disabled) { color: var(--steel); }
+
+.models-note {
+  margin: 0;
+  max-width: 42ch;
+  padding: 6px 8px;
+  border: 1px solid var(--edge-hot);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--ink-dim);
+}
+
+.models-note[hidden] { display: none; }
+
 /* -- activity feed --------------------------------------------------- */
 
 .feed .event {
@@ -409,4 +595,53 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 @media (max-width: 900px) {
   .split { grid-template-columns: minmax(0, 1fr); }
   .conversation { border-right: 0; border-bottom: 1px solid var(--edge); }
+}
+
+/* Phone and narrow tablet. The header stops being a single row: the workspace
+   and agent facts are the first things an operator on a phone does not need
+   next to the model strip, so they go, and the strip gets the whole width with
+   its panel aligned to the same edge.
+
+   The indicator itself is NOT hidden at any width. It is the one header element
+   that answers "can I trust this run", and dropping it on the smallest screen
+   would remove it exactly where a stale provider is most likely to bite. */
+@media (max-width: 720px) {
+  .bar {
+    height: auto;
+    min-height: 60px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 10px 16px;
+    padding: 10px 14px;
+  }
+
+  .facts { display: none; }
+
+  .state {
+    margin-left: auto;
+    align-self: center;
+  }
+
+  .models {
+    order: 3;
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .health-strip { flex-wrap: wrap; white-space: normal; }
+
+  .health-detail {
+    left: auto;
+    right: 0;
+    width: min(420px, calc(100vw - 28px));
+  }
+
+  /* Bigger tap targets than the desktop 28px, and a visible pressed state,
+     because a thumb cannot hover and a finger cannot see a focus ring it did
+     not earn by tabbing. */
+  .health-tier { min-width: 40px; min-height: 40px; }
+
+  .health-tier:active { background: rgba(255, 255, 255, 0.07); }
+
+  .models-recheck { align-self: stretch; text-align: center; }
 }

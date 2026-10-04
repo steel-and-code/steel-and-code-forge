@@ -1109,6 +1109,7 @@ def _run_workbench(
     from ..models.base import GatewayError
     from ..ui import UiUnavailable
     from ..ui.broker import SseBroker
+    from ..ui.models import ModelHealth
     from ..ui.runner import runtime_factory
     from ..ui.security import UiToken
     from ..ui.server import create_app
@@ -1166,6 +1167,50 @@ def _run_workbench(
         broker=broker,
     )
 
+    # The health snapshot comes from the same resolution order `forge route` and
+    # `forge models status` use -- `load_registry` reads `$FORGE_MODELS_CONFIG`,
+    # then `./models.toml`, then the packaged default -- rather than from a
+    # second parse beside it. Two loads could disagree if the file changed
+    # between them, and an indicator disagreeing with the run it reports on is
+    # worse than no indicator.
+    #
+    # Not `_build_router`, deliberately: that helper prints the reason to stderr
+    # and returns `None`, which would leave the page's 503 with a generic string
+    # while the actual reason scrolled past in the terminal. An operator reading
+    # the indicator is often not looking at the terminal.
+    #
+    # A configuration that will not load does NOT stop the workbench. An
+    # operator who passed `--model` over a broken config still gets a surface
+    # they can read and use, and the indicator reports why health is absent --
+    # more useful than refusing to start with no diagnostic available.
+    from ..models.registry import RegistryConfigError, load_registry
+
+    try:
+        health_router = ModelRouter(load_registry(environ=environ))
+    except RegistryConfigError as exc:
+        # Registry errors name a table and a rule and carry no file contents,
+        # which is what makes this message safe to hand to a browser.
+        health = ModelHealth(None, error=str(exc))
+        print(f"forge: model health unavailable: {exc}", file=out)
+    else:
+        health = ModelHealth(health_router, environ=environ)
+        # One verified pass at startup, before anything is served. The ruling is
+        # that the operator does not have to ask "is it actually up?" -- the
+        # first page load shows a checked answer. Once, never on a timer, and
+        # never during a run: an operator re-checks explicitly from the page,
+        # and the route refuses while a run is in flight.
+        try:
+            health.verify()
+        except Exception as exc:  # noqa: BLE001 - startup must still serve
+            # A provider failure is already a reported health value rather than
+            # an exception, so reaching this means something structural went
+            # wrong. Serving the offline snapshot beats refusing to start.
+            print(
+                f"forge: model health could not be checked ({exc}); showing "
+                "configuration only",
+                file=out,
+            )
+
     token = UiToken()
     try:
         app = create_app(
@@ -1174,6 +1219,7 @@ def _run_workbench(
             gateway=gateway,
             token=token,
             port=int(port),
+            health=health,
         )
     except ImportError as exc:  # pragma: no cover - guarded above
         raise UiUnavailable(str(exc)) from exc

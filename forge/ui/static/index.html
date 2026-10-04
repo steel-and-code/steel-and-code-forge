@@ -40,6 +40,19 @@
         <dd id="model" class="mono">&mdash;</dd>
       </div>
     </dl>
+    <div class="models" id="models">
+      <!--
+        The model-health indicator lives here, drawn by health.js from
+        GET /api/models. It holds no state: every value shown is the backend's
+        own, and a refresh re-reads the cached snapshot rather than re-checking
+        anything. The re-check button below is the only thing that can make the
+        server contact a provider.
+      -->
+      <button type="button" id="models-recheck" class="models-recheck">
+        Re-check models
+      </button>
+      <p class="models-note" id="models-note" role="status" aria-live="polite" hidden></p>
+    </div>
     <div class="state" id="state-chip" data-state="idle" role="status" aria-live="polite">
       <span class="dot" aria-hidden="true"></span>
       <span id="state-label">connecting</span>
@@ -96,6 +109,7 @@
     </section>
   </div>
 
+  <script src="/static/health.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
