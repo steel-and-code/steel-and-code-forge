@@ -38,7 +38,13 @@ import os
 import sys
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Mapping, Sequence, TextIO
+from typing import TYPE_CHECKING, Mapping, Sequence, TextIO
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    # Type-only so `forge check` still does not pay for the agent package. The
+    # concrete profiles are imported inside the functions that need them, for
+    # the same reason the gateway and registry imports are deferred.
+    from ..agents.profile import AgentProfile
 
 from ..tools.approval import (
     ApprovalChannel,
@@ -81,12 +87,22 @@ WORKSPACE_ENV = "FORGE_WORKSPACE"
 #: was built to remove.
 DEFAULT_MODEL_ENV = "FORGE_MODEL"
 
-#: The task kind Byte's default routing asks about, and the difficulty it assumes.
-#: Named here because it is a statement about what Byte *is for*, not a model
-#: choice: Byte writes and fixes code. A different agent would name its own kind.
-#: Neither this pair nor any model id appears in an agent profile.
+#: The task kind each agent's default routing asks about, and the difficulty it
+#: assumes. Named here because it is a statement about what an agent *is for*,
+#: not a model choice: Byte writes and fixes code, Neighbor advises and
+#: carries out requested work. Neither this pair nor any model id appears in an
+#: agent profile -- a task kind is a statement about purpose, and purpose is
+#: known by the surface invoking the agent, not by the agent's configuration.
 BYTE_TASK_KIND = "coding"
 BYTE_TASK_DIFFICULTY = "standard"
+
+#: Neighbor's pair. ``conversation`` already exists in the packaged
+#: ``models.toml``, so this is a reuse of a configured task kind rather than a
+#: new one: an unlisted kind would still route, but it would route to
+#: ``default_tier`` by falling through rather than by being configured, and
+#: routing-by-accident is not a decision worth making on an agent's behalf.
+NEIGHBOR_TASK_KIND = "conversation"
+NEIGHBOR_TASK_DIFFICULTY = "standard"
 
 #: Model provider. OpenRouter remains the default, while local selects the
 #: llama.cpp gateway running on this machine.
@@ -102,7 +118,6 @@ from ..models.registry import LOCAL_CONFIG_NAME, MODELS_CONFIG_ENV  # noqa: E402
 #: piped prompt collides awkwardly with `--workspace` and with a future chat mode.
 TASK_FILE_FLAG = "--task-file"
 
-#: The Workbench bind address is fixed, and not configurable. Stated as a
 #: constant rather than merely omitted from the parser so that a future edit
 #: adding a `--host` flag has to delete a named safety property rather than
 #: just supply a new argument.
@@ -137,6 +152,11 @@ Forge terminal interface — current state
 
 `forge check` classifies and asks; it executes nothing.
 `forge byte` runs an agent and does execute -- through the same pipeline.
+`forge neighbor` does the same for Neighbor, on the same pipeline and the same
+model routing.
+`forge hermes` invokes the external Hermes Agent as a subprocess, text-only:
+Forge cannot classify its internal tool calls, so it grants it no capabilities.
+Hermes picks its own model; Forge only reports it.
 `forge workbench` serves a local browser view of one Byte run on loopback.
 
 Usage:
@@ -144,6 +164,10 @@ Usage:
   forge check path --workspace DIR PATH [PATH...]
   forge byte --workspace DIR [--model ID] [--max-turns N] "task"
   forge byte --workspace DIR --task-file PATH
+  forge neighbor --workspace DIR [--model ID] [--max-turns N] "task"
+  forge neighbor --workspace DIR --task-file PATH
+  forge hermes --workspace DIR [--max-turns N] [--timeout SECONDS] "task"
+  forge hermes --workspace DIR --task-file PATH
   forge workbench --workspace DIR [--model ID] [--port 8765]
 """
 
@@ -330,6 +354,90 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     byte_parser.add_argument(
+        "task",
+        nargs="?",
+        default=None,
+        metavar="TASK",
+        help="the task, as one argument",
+    )
+
+    # `forge neighbor` is deliberately a second subcommand rather than a
+    # `--agent` flag on `forge byte`. A flag would mean `forge byte --agent
+    # neighbor`, which names two agents in one command and makes the eventual
+    # `forge run --agent X` form look like a bugfix rather than the shape it
+    # should have been. One verb per agent keeps every existing spelling of
+    # `forge byte` exactly as it was, and the parser mirrors the runner: two
+    # thin wrappers over one `_run_agent`.
+    #
+    # The options are the same six Byte's are, and that is a decision rather
+    # than a copy: an agent is permitted to be configured narrower than the
+    # baseline but the baseline is otherwise identical for every agent, so a
+    # divergent option set here would be Forge inventing a per-agent permission
+    # surface. `--model` is an operator override on the run, not a property of
+    # the agent, and is present for the same reason it is on `forge byte`.
+    neighbor_parser = sub.add_parser(
+        "neighbor",
+        help="run the Neighbor agent on a task",
+        description=(
+            "Run Neighbor on one task. Neighbor calls Forge tools, and every "
+            "call is classified by Forge exactly as Byte's are: the model "
+            "decides what to attempt, Forge decides whether it is allowed.\n\n"
+            "Neighbor is collaborative and general-purpose -- it advises and "
+            "carries out requested work rather than fixing what it notices. "
+            "That difference is in its instructions, not in its permissions: "
+            "the tool set and the safety stack are Byte's."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  forge neighbor --workspace . \"what does this project do?\"\n"
+            "  forge neighbor --workspace . --task-file task.md\n"
+            "  forge neighbor --workspace . --max-turns 10 \"explain this module\"\n"
+        ),
+    )
+    neighbor_parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        default=None,
+        help=(
+            "explicit workspace root (required; may also be set via "
+            f"{WORKSPACE_ENV}). Not inferred from the current directory."
+        ),
+    )
+    neighbor_parser.add_argument(
+        "--task-file",
+        metavar="PATH",
+        default=None,
+        help="read the task from a file instead of argv",
+    )
+    neighbor_parser.add_argument(
+        "--model",
+        metavar="ID",
+        default=None,
+        help=(
+            "provider model id. Overrides ${DEFAULT_MODEL_ENV} and the model "
+            "registry; the default is resolved by routing."
+        ),
+    )
+    neighbor_parser.add_argument(
+        "--max-turns",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "cap model round-trips for this run. May lower the ceiling, never "
+            "raise it."
+        ),
+    )
+    neighbor_parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "run with no interactive approval channel. Anything "
+            "approval-required fails closed as denied unattended."
+        ),
+    )
+    neighbor_parser.add_argument(
         "task",
         nargs="?",
         default=None,
@@ -866,6 +974,10 @@ class ModelResolutionError(Exception):
 def _resolve_default_model(
     args: argparse.Namespace,
     environ: Mapping[str, str],
+    *,
+    profile: AgentProfile | None = None,
+    task_kind: str = BYTE_TASK_KIND,
+    difficulty: str = BYTE_TASK_DIFFICULTY,
 ) -> ResolvedModel:
     """Decide which model a run uses, honouring overrides first.
 
@@ -885,9 +997,17 @@ def _resolve_default_model(
     *routed* default takes its provider from the selected slot, because that is
     the pairing configuration stated and mixing them would produce a model
     addressed to the wrong endpoint.
+
+    The keyword arguments exist so a second agent routes by its own purpose
+    rather than inheriting Byte's. They default to Byte's values, so every
+    existing caller -- including the workbench, which is a browser surface onto
+    a Byte run -- is byte-for-byte unchanged, and ``task_kind`` is a parameter
+    precisely because it is not a profile field: it describes what the *caller*
+    believes the agent is for, and a profile cannot assert its own purpose.
     """
     explicit = getattr(args, "model", None)
     if explicit:
+        _warn_about_override(explicit, environ, warn)
         return ResolvedModel(
             model_id=explicit,
             provider=(
@@ -901,6 +1021,7 @@ def _resolve_default_model(
 
     from_env = environ.get(DEFAULT_MODEL_ENV, "").strip()
     if from_env:
+        _warn_about_override(from_env, environ, warn)
         return ResolvedModel(
             model_id=from_env,
             provider=(
@@ -923,20 +1044,23 @@ def _resolve_default_model(
     # Imported here for the same reason every other runtime import in this
     # module is: `forge check` must not pay for the agent package, and the
     # requester identity has to be a true statement about who is asking.
-    from ..agents.byte import BYTE
+    if profile is None:
+        from ..agents.byte import BYTE
+
+        profile = BYTE
 
     decision = ModelRouter(registry).route(
         RouteRequest(
-            agent=BYTE.name,
-            task=BYTE_TASK_KIND,
-            difficulty=BYTE_TASK_DIFFICULTY,
+            agent=profile.name,
+            task=task_kind,
+            difficulty=difficulty,
         )
     )
 
     if not decision.usable:
         raise ModelResolutionError(
-            f"no usable model for Byte's default routing "
-            f"(task {BYTE_TASK_KIND!r}, difficulty {BYTE_TASK_DIFFICULTY!r}): "
+            f"no usable model for {profile.name}'s default routing "
+            f"(task {task_kind!r}, difficulty {difficulty!r}): "
             f"{decision.reason}. Pass --model ID or set ${DEFAULT_MODEL_ENV} to "
             f"choose one explicitly."
         )
@@ -988,23 +1112,35 @@ def _build_model_gateway(
         "expected 'openrouter' or 'local'"
     )
 
-def _run_byte(
+def _run_agent(
     args: argparse.Namespace,
     workspace: Workspace,
     *,
+    profile: AgentProfile,
+    task_kind: str,
+    difficulty: str,
     out: TextIO,
     err: TextIO,
     environ: dict[str, str],
     channel: ApprovalChannel | None,
 ) -> int:
-    """Run Byte on one task.
+    """Run one agent on one task.
 
     This is the first place in Forge that executes, and it does so through the
     dispatcher -- the same pipeline `forge check` stops short of. Nothing here
     classifies, approves, or executes directly; the CLI holds no policy, exactly
     as it did before the runtime existed.
+
+    The function takes a profile rather than naming one, because the runtime
+    already does: it holds a profile and never learns which agent it is serving,
+    so a second agent needs a different *argument* here and not a different
+    pipeline. Every permission decision below still belongs to
+    ``forge/tools/dispatcher.py`` and the layers beneath it, and the
+    ``agent_name`` handed to the dispatcher is the profile's real name, so the
+    approval prompt cannot claim a request belongs to an agent that did not
+    make it.
     """
-    from ..agents.byte import BYTE, assemble_system_prompt
+    from ..agents.registry import system_prompt_for
     from ..agents.runtime import AgentRuntime, MaxTurnsExceeded, summarise
     from ..models.base import GatewayError
     from ..tools.dispatcher import ToolDispatcher
@@ -1019,7 +1155,13 @@ def _run_byte(
     # reading the registry, so a broken configuration never blocks a run that
     # names its own model.
     try:
-        resolved = _resolve_default_model(args, environ)
+        resolved = _resolve_default_model(
+            args,
+            environ,
+            profile=profile,
+            task_kind=task_kind,
+            difficulty=difficulty,
+        )
     except ModelResolutionError as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_USAGE
@@ -1048,14 +1190,15 @@ def _run_byte(
         workspace,
         approver=Approver(approver_channel),
         executor=Executor(workspace),
-        # The request genuinely is Byte's here, so the approval prompt says so.
-        agent_name=BYTE.name,
-        allowed_tools=BYTE.allowed_tools,
-        system_prompt=assemble_system_prompt(BYTE, str(workspace.root)),
+        # The request genuinely is this agent's here, so the approval prompt
+        # says so.
+        agent_name=profile.name,
+        allowed_tools=profile.allowed_tools,
+        system_prompt=system_prompt_for(profile, str(workspace.root)),
     )
 
     runtime = AgentRuntime(
-        BYTE,
+        profile,
         gateway=gateway,
         dispatcher=dispatcher,
         model_id=model_id,
@@ -1077,6 +1220,67 @@ def _run_byte(
     print("", file=out)
     print(result.text, file=out)
     return EXIT_OK
+
+
+def _run_byte(
+    args: argparse.Namespace,
+    workspace: Workspace,
+    *,
+    out: TextIO,
+    err: TextIO,
+    environ: dict[str, str],
+    channel: ApprovalChannel | None,
+) -> int:
+    """Run Byte on one task.
+
+    Kept as its own function rather than folded into ``_run_agent`` so the
+    Byte path is unchanged at the call site and in the parser: `forge byte`
+    still means exactly what it meant before Neighbor existed.
+    """
+    from ..agents.byte import BYTE
+
+    return _run_agent(
+        args,
+        workspace,
+        profile=BYTE,
+        task_kind=BYTE_TASK_KIND,
+        difficulty=BYTE_TASK_DIFFICULTY,
+        out=out,
+        err=err,
+        environ=environ,
+        channel=channel,
+    )
+
+
+def _run_neighbor(
+    args: argparse.Namespace,
+    workspace: Workspace,
+    *,
+    out: TextIO,
+    err: TextIO,
+    environ: dict[str, str],
+    channel: ApprovalChannel | None,
+) -> int:
+    """Run Neighbor on one task.
+
+    Identical in shape to ``_run_byte`` and for the same reasons. The two differ
+    only in which profile is passed and which task kind that profile's purpose
+    routes under -- everything about how a call is classified, approved, or
+    executed is the shared pipeline's business and neither function touches it.
+    """
+    from ..agents.neighbor import NEIGHBOR
+
+    return _run_agent(
+        args,
+        workspace,
+        profile=NEIGHBOR,
+        task_kind=NEIGHBOR_TASK_KIND,
+        difficulty=NEIGHBOR_TASK_DIFFICULTY,
+        out=out,
+        err=err,
+        environ=environ,
+        channel=channel,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1245,7 +1449,6 @@ def _run_workbench(
 
 
 # --------------------------------------------------------------------------
-# forge route / forge models status
 # --------------------------------------------------------------------------
 
 
@@ -1551,7 +1754,7 @@ def main(
             print(f"forge: unknown check subject: {args.leaf!r}", file=err_stream)
             return EXIT_USAGE
 
-        if args.subcommand == "byte":
+        if args.subcommand in ("byte", "neighbor"):
             workspace, problem = _resolve_workspace(
                 getattr(args, "workspace", None), env
             )
@@ -1559,7 +1762,16 @@ def main(
                 print(f"forge: {problem}", file=err_stream)
                 return EXIT_USAGE
 
-            return _run_byte(
+            # Two names, two runners, one shared pipeline. The dispatch is a
+            # table rather than an `if` chain so that adding a third agent is a
+            # new entry here and a new wrapper, rather than a third branch
+            # someone has to remember to widen.
+            runner = {
+                "byte": _run_byte,
+                "neighbor": _run_neighbor,
+            }[args.subcommand]
+
+            return runner(
                 args,
                 workspace,
                 out=out_stream,
@@ -1568,7 +1780,6 @@ def main(
                 channel=channel,
             )
 
-        if args.subcommand == "route":
             return _run_route(args, env, out=out_stream, err=err_stream)
 
         if args.subcommand == "models":

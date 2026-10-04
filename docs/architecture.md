@@ -359,6 +359,46 @@ only acceptable shape for a future one are in
 only what the dispatcher decided was permitted. `forge check` still stops at the
 approval step.
 
+### 4b. Agents — configuration, and a registry of them
+
+Forge has more than one agent. Byte is the reference *shape*; Neighbor is the
+second instance, and it is the one that proves the shape generalises: it
+answers every contract field differently and lands in the same runtime.
+
+**An agent is a value.** `forge/agents/profile.py` holds `AgentProfile`, a
+frozen dataclass. Byte (`byte.py`) and Neighbor (`neighbor.py`) are each one
+instance. There is no `Agent` base class, no subclass, and no per-agent branch
+in the runtime — `AgentRuntime` holds a profile and never learns which agent it
+is serving. Adding an agent costs a profile, not a class and a conditional.
+
+`forge/agents/registry.py` is the single place a name becomes a profile.
+
+Three properties, each a decision:
+
+* **Explicit membership, not discovery.** No entry-point scan, no directory
+  walk. An agent that appears because something happened to be imported is an
+  agent nobody chose. Adding one is an edit to `AGENTS`.
+* **Unknown name is a value, not an exception.** `get_agent` returns `None`, so
+  a typo and a broken install are different failures.
+* **No routing intent in the registry.** The registry holds profiles, never a
+  model, a tier, or a task kind.
+
+**A task kind is not a profile field, and this is the load-bearing
+distinction.** A profile cannot assert its own purpose: the *caller* knows what
+it is asking the agent to do, and the same profile could legitimately be routed
+differently by two surfaces. So `AgentProfile` carries `model: str | None` and
+nothing else model-shaped, and it is `None` for every agent. Byte's task kind
+is `coding`; Neighbor's is `conversation`; both live in `forge/cli/main.py`
+beside the surface that knows them, and both are resolved through
+`forge/models/` at run time.
+
+**One verb per agent.** `forge byte` and `forge neighbor` are separate
+subcommands rather than a `--agent` flag, so every existing spelling of
+`forge byte` is unchanged and a third agent does not force a redesign of the
+first. Both are thin wrappers over one shared `_run_agent`; they differ only in
+the profile passed and the task kind it routes under.
+
+
 ### OpenRouter — model gateway
 
 Single point of access to language models. Forge talks to a model gateway and

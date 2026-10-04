@@ -215,6 +215,13 @@ CONTRACT_PATH = pathlib.Path(__file__).resolve().parent.parent / "docs" / "agent
 #: a renamed or reordered block fails rather than silently re-pairing.
 BLOCK_HEADING = re.compile(r"^#### Block ([A-G])\b")
 
+#: ``## Agent: Byte`` and ``## Agent: Neighbor``. The contract documents one
+#: agent per section, and each section carries its own seven blocks -- so once
+#: a second agent exists, a document-wide scan keyed only by block letter would
+#: silently pair Neighbor's Block B with Byte's constants. The section is
+#: therefore captured, and every comparison is scoped to one agent.
+AGENT_SECTION = re.compile(r"^## Agent: (\w+)\s*$")
+
 #: Dashes that mean the same punctuation in both representations. The contract
 #: is prose and uses a real em dash; ``byte.py`` is source and uses ``--``
 #: because the em dash is not ASCII and the module is read by people as well as
@@ -222,16 +229,62 @@ BLOCK_HEADING = re.compile(r"^#### Block ([A-G])\b")
 DASHES = str.maketrans({"—": "--", "–": "--", "―": "--"})
 
 
-def parse_contract_blocks(text: str) -> dict[str, str]:
-    """Pull the quoted Block A-G text out of the contract, keyed by letter.
+def contract_section(text: str, agent: str) -> str:
+    """The ``## Agent: <agent>`` section of the contract, as text.
+
+    Scoped by heading rather than by slicing on a phrase, because the phrase
+    approach re-points silently when an earlier section is edited. Raises
+    rather than returning an empty string: a missing section means the contract
+    and the runtime disagree about which agents exist, and an empty slice would
+    turn that into seven vacuous passes.
+
+    **End of document terminates a section.** A section need not be followed by
+    another agent -- when Neighbor was the last documented agent, its section ran
+    to the end of the file, and requiring a following heading made that a parse
+    failure. Treating EOF as a boundary is also what a reader expects: it is what
+    makes "the last agent" work without the document having to know it is last.
+    """
+    start: int | None = None
+    end: int | None = None
+    for index, line in enumerate(text.splitlines()):
+        match = AGENT_SECTION.match(line)
+        if match is None:
+            continue
+        if match.group(1) == agent:
+            start = index
+        elif start is not None:
+            end = index
+            break
+    assert start is not None, f"contract has no '## Agent: {agent}' section"
+    lines = text.splitlines()
+    if end is None:
+        end = len(lines)
+    return "\n".join(lines[start:end])
+
+
+def parse_contract_blocks(
+    text: str, agent: str = "Byte", *, require_blocks: bool = True
+) -> dict[str, str]:
+    """Pull the quoted Block A-G text out of one agent's contract section.
 
     The contract holds two kinds of prose per block: the block itself, in a
     Markdown blockquote, and commentary underneath explaining why the block
     says what it says. Only the blockquote is the instruction, so parsing stops
     at the first line that is not a quote. This is what lets the test compare
-    against the contract instead of holding a second copy of the wording --
-    a second copy is precisely the thing that drifts.
+    against the contract instead of holding a second copy of the wording -- a
+    second copy is precisely the thing that drifts.
+
+    Args:
+        text: The whole contract document.
+        agent: The ``## Agent:`` section to read. Defaults to Byte, because
+            every caller that predates Neighbor is about Byte and defaulting
+            keeps them reading Byte's blocks rather than whichever agent happens
+            to be documented last.
+        require_blocks: Assert that all seven letters were found. True for every
+            real agent. Pass ``False`` only for a documented placeholder, whose
+            empty result is the honest answer rather than a defect.
     """
+    text = contract_section(text, agent)
     blocks: dict[str, list[str]] = {}
     current: str | None = None
     after_break = False
@@ -265,7 +318,15 @@ def parse_contract_blocks(text: str) -> dict[str, str]:
         after_break = False
         blocks[current].append(quoted)
 
-    assert sorted(blocks) == list("ABCDEFG"), f"contract blocks found: {sorted(blocks)}"
+    # Strict by default, and the default is what every real agent uses. A
+    # documented placeholder (Ember, Fin) has a section and no blocks, so
+    # `require_blocks=False` is an explicit request to accept an empty result --
+    # it is never inferred, because inferring it would mean Byte's section
+    # silently losing all seven blocks and passing.
+    if require_blocks:
+        assert sorted(blocks) == list("ABCDEFG"), (
+            f"contract blocks found: {sorted(blocks)}"
+        )
     # One entry per line, with an empty string standing in for a paragraph
     # break, so joining with a single newline yields the paragraph structure
     # ``normalise`` then re-reads.
