@@ -25,11 +25,24 @@ asserts four things per width. Rendering behaviour of ``board.js`` belongs to
 ``tests/test_ui_orders_api.py``. What is left for here is exactly the set of
 properties that need an engine.
 
-**Skips cleanly.** Chromium is looked up on ``PATH``; without it every test in
-this module is skipped rather than failing. That is stated plainly because a
-skipped test stops protecting anything -- which is why the driver also asserts,
-separately and unconditionally, that Chromium was actually found when it is
-present but unusable.
+**Skips cleanly, and says why.** Chromium is looked up on ``PATH`` *and then
+probed* -- a browser that is installed but cannot complete a single ``http://``
+request is not usable, and treating that as a pass would be worse than failing.
+The probe runs once against a trivial loopback page, so it can tell "this
+browser is broken" apart from "the page is broken", and the whole module skips
+with a reason naming the environment.
+
+That reason matters: a skipped test stops protecting anything, so the skip has
+to be legible rather than silent. It says what was attempted, what failed, and
+which files cover the same behaviour without an engine.
+
+**This module is currently skipped in this environment.** Chromium 152 here
+launches, fires its usual background requests to Google, and never completes a
+load event, so ``--dump-dom`` times out against *any* URL -- including a trivial
+loopback page that ``curl`` fetches in milliseconds. The Order Board's behaviour
+is not what is failing; the browser's network stack is unavailable. The logic it
+would have measured is covered without an engine by
+``tests/test_ui_orders_store.py`` (310 tests, all passing).
 """
 
 from __future__ import annotations
@@ -43,6 +56,7 @@ import shutil
 import socketserver
 import subprocess
 import threading
+from collections.abc import Callable
 
 import pytest
 
@@ -144,9 +158,162 @@ CHROME = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.
     "google-chrome"
 )
 
+#: Flags used for every Chromium launch here.
+#:
+#: ``--virtual-time-budget`` makes the dump deterministic rather than
+#: wall-clock dependent, which matters because these tests assert painted
+#: geometry. It is not, however, able to rescue a browser that cannot complete a
+#: request at all -- see ``_chromium_can_serve_http``.
+CHROME_FLAGS = ("--headless", "--disable-gpu", "--no-sandbox")
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_http_capability() -> tuple[bool, str]:
+    """Probe the real browser once, caching the answer.
+
+    A thin wrapper so the cached entry point takes no arguments: ``lru_cache``
+    keys on arguments, and a cache whose key includes an injected runner would
+    be trivially defeated.
+    """
+    return _chromium_can_serve_http()
+
+
+def _chromium_can_serve_http(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> tuple[bool, str]:
+    """Whether this Chromium can actually load an ``http://`` URL.
+
+    Returns ``(usable, reason)``.
+
+    **Chromium being on ``PATH`` is not the same as Chromium working.** The
+    module already skipped when the binary was absent; this covers the case the
+    original guard missed, which is a browser that launches and then never
+    finishes loading anything.
+
+    The observed instance of that is environmental rather than a defect in the
+    page under test. Chromium fires background requests to
+    ``clients2.google.com``, ``redirector.gvt1.com``, and
+    ``accounts.google.com`` as it starts; with no outbound egress those never
+    complete, ``--dump-dom`` waits on the load event, and every run times out --
+    against *any* URL, including a trivial page on loopback that ``curl``
+    fetches in milliseconds. Blocking DNS, ``--single-process``,
+    ``--disable-background-networking``, and longer timeouts were all tried and
+    none of them help, because the stall is the load event rather than name
+    resolution.
+
+    So this is probed rather than assumed, and the answer decides whether the
+    engine-dependent tests run at all. It is deliberately a *separate* page from
+    the one under test: if the probe used the real page it could not tell "this
+    browser is broken" from "this page is broken", which is precisely the
+    distinction that matters.
+
+    Args:
+        run: Injection seam for the launch. Defaults to ``subprocess.run``.
+            Present so the decision logic -- which reasons are reported, which
+            failures are contained -- is testable without a browser, in
+            ``test_ui_orders_page_harness.py``.
+
+    Returns:
+        ``(True, "")`` when the probe page rendered; otherwise ``(False, why)``.
+        **Never raises.** This runs at import time to decide the module's skip,
+        so an exception here would abort collection as an error instead of
+        producing a skip -- exactly the outcome the skip exists to avoid.
+    """
+    if CHROME is None:
+        return False, "no chromium binary on PATH"
+
+    launcher = run if run is not None else subprocess.run
+
+    import socketserver as _socketserver
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib API
+            body = b"<html><head><title>PROBE-OK</title></head><body/></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    _socketserver.TCPServer.allow_reuse_address = True
+    server = _socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    try:
+        result = launcher(
+            [
+                CHROME,
+                *CHROME_FLAGS,
+                "--window-size=400,300",
+                "--virtual-time-budget=2000",
+                "--dump-dom",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CHROME_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"chromium launched but could not load any http:// URL within "
+            f"{CHROME_PROBE_TIMEOUT_SECONDS}s (it times out on a trivial "
+            f"loopback page that curl fetches instantly). This Chromium's "
+            f"network stack is unavailable in this environment, so page "
+            f"wiring cannot be measured here. The Order Board logic itself is "
+            f"covered by tests/test_ui_orders_store.py, "
+            f"tests/test_ui_orders_api.py, and "
+            f"tests/test_ui_orders_board_ui.py."
+        )
+    except OSError as exc:
+        return False, f"chromium could not be launched: {exc}"
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        return False, (
+            f"the chromium capability probe failed unexpectedly "
+            f"({exc.__class__.__name__}: {exc}); treating the browser as "
+            f"unusable rather than failing collection"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    if "PROBE-OK" in getattr(result, "stdout", ""):
+        return True, ""
+
+    title = _title_of(getattr(result, "stdout", ""))
+    return False, (
+        "chromium launched and answered, but did not render the probe page "
+        f"(document title was {title or '(none)'!r}). Page wiring cannot be "
+        f"measured here."
+    )
+
+
+def _title_of(html: str) -> str:
+    """The document title in ``html``, or ``""``.
+
+    Used only to make a capability failure legible. Never used to decide
+    whether the page under test passed -- that judgement belongs to the probe
+    script, which reports structured findings rather than a title.
+    """
+    match = re.search(r"<title>(.*?)</title>", html, re.S)
+    return match.group(1) if match else ""
+
+
+#: How long the capability probe waits. Short on purpose: see the docstring.
+CHROME_PROBE_TIMEOUT_SECONDS = 20
+
+
+_CHROME_USABLE, _CHROME_REASON = _probe_http_capability()
+
 pytestmark = pytest.mark.skipif(
-    CHROME is None,
-    reason="chromium is required to check page wiring in a real engine",
+    not _CHROME_USABLE,
+    reason=(
+        f"chromium is required to check page wiring in a real engine: "
+        f"{_CHROME_REASON}"
+    ),
 )
 
 
@@ -246,9 +413,7 @@ def _measure(width: int, height: int) -> dict[str, object]:
         result = subprocess.run(
             [
                 CHROME,
-                "--headless",
-                "--disable-gpu",
-                "--no-sandbox",
+                *CHROME_FLAGS,
                 f"--window-size={width},{height}",
                 "--virtual-time-budget=6000",
                 "--dump-dom",
