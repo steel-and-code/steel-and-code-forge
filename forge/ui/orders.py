@@ -5,7 +5,7 @@ surface stays thin, the same way :mod:`forge.ui.models` exists for model health:
 the routes validate nothing, decide nothing, and hold no workflow vocabulary of
 their own.
 
-Five decisions live here, and each is a decision rather than a detail:
+Six decisions live here, and each is a decision rather than a detail:
 
 **A JSON file in the workspace, not a database.** ``.forge/orders.json``, relative
 to the workspace root, rewritten whole on every mutation. ``docs/architecture.md``
@@ -44,6 +44,14 @@ writes ``status``. There is deliberately no way to change an order's status as a
 side effect of editing its title, which leaves room for transition rules,
 approvals, or agent automation to attach to movement without changing the edit
 contract at all.
+
+**Deletion is hard, singular, and leaves the sequence alone.**
+:meth:`OrderStore.delete` removes exactly one order and returns what it removed.
+No archive, no soft delete, no restore: an order leaves no trace in the document.
+The one property that is not obvious is the counter -- a delete writes back
+``board.next_id`` exactly as it loaded it, rather than recounting what is left, so
+a number an operator has already seen can never be issued to a second order. A gap
+in the sequence after a deletion is normal and is not a defect.
 
 The workflow vocabulary here -- ``orders_received`` through ``finished_goods`` --
 is a set of **stable identifiers**, not a UI theme. The blacksmith wording an
@@ -625,6 +633,45 @@ class OrderStore:
             )
             self._store_locked(orders, board.next_id)
         return moved
+
+    def delete(self, order_id: str) -> Order:
+        """Remove one order, permanently, and answer with what was removed.
+
+        A **hard** delete, and deliberately the whole of it. There is no archive,
+        no soft delete, and no history: an Order leaves no trace in the document,
+        which is what makes the next decision -- whether to keep one -- a real one
+        rather than a question of which bin to look in. The boundaries this was
+        ruled with are no bulk delete and no restore, so this method takes exactly
+        one id and there is no way to undo it.
+
+        Two properties are load-bearing and are inherited rather than reimplemented
+        here. The write goes through :meth:`_store_locked`, so it is atomic and
+        holds the lock across the whole read-modify-write; and a file that cannot
+        be read raises before this method writes anything, so a corrupt board is
+        never overwritten with the empty board a delete would otherwise produce.
+
+        **The counter is written back exactly as it was loaded.** This is the whole
+        of the no-reuse guarantee on the delete path: the reconciled next number
+        comes from ``max(stored counter, highest id present + 1)``, so dropping the
+        order does not lower it. Recomputing the counter from what is left -- or
+        deriving it from ``len(orders)`` -- would mint the number of the order just
+        deleted, and an id an operator has already seen would answer to two
+        different Orders over the life of the board.
+
+        Raises :class:`UnknownOrder` for an id that is not on the board, which the
+        server answers 404. Deleting the same order twice is a refusal rather than
+        an idempotent success, so a stale page is told its order is gone instead of
+        being handed a green answer for a deletion that already happened.
+        """
+        with self._lock:
+            board = self._load_locked()
+            removed = self._find(board, order_id)
+            orders = tuple(
+                order for order in board.orders if order.order_id != order_id
+            )
+            # `board.next_id`, not a recount: see the docstring.
+            self._store_locked(orders, board.next_id)
+        return removed
 
     # -- the file ------------------------------------------------------
 

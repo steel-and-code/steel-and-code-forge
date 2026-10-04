@@ -152,6 +152,7 @@ const container = doc.createElement("div");
 
 const opened = [];
 const moved = [];
+const deleted = [];
 const rendered = board.renderBoard(doc, container, payload, {{
   onOpen: function (value) {{ opened.push(value.orderId); }},
 }});
@@ -162,22 +163,52 @@ if (process.argv[2] === "click") {{
   rendered.cards[ids[Number(process.argv[3] || 0)]].click();
 }}
 
-// Render the detail dialog for one order, if asked. `--detail` with no order
-// passes `null`, so the "no order" case is reachable rather than defaulted away.
-// `states` is the backend's own status/label pairs, so the buttons carry
-// the same words as the column headings.
+/* The delete control, which lives only in the detail dialog.
+ *
+ * `--detail` builds the dialog; an optional second step drives the two-step
+ * confirmation: `confirm` clicks the destructive button and reads the prompt it
+ * reveals, `cancel` clicks it and then the cancel button, `destroy` clicks it and
+ * then the confirming button. Recording `deleted` rather than performing a
+ * request is what lets "cancel leaves the order alone" be asserted at all.
+ */
 let detail = null;
 if (process.argv[2] === "detail") {{
   const holder = doc.createElement("div");
   detail = board.renderDetail(doc, holder, order, payload.columns, {{
     onMove: function (id, status) {{ moved.push(id + ":" + status); }},
+    onDelete: function (id, title) {{ deleted.push(id + ":" + title); }},
   }});
-  if (process.argv[3]) {{
+  if (process.argv[3] && process.argv[3] !== "confirm" &&
+      process.argv[3] !== "destroy" && process.argv[3] !== "cancel") {{
     const buttons = detail.move ? detail.move.findAll(function (el) {{
       return el.getAttribute("data-target-status") !== null;
     }}) : [];
     buttons[Number(process.argv[3])].click();
   }}
+  var step = ["confirm", "destroy", "cancel"].indexOf(process.argv[3]) >= 0
+    ? process.argv[3]
+    : process.argv[4];
+  if (step) {{
+    detail.deleteButton.click();
+    if (step === "destroy") detail.confirmDelete.click();
+    if (step === "cancel") detail.cancelDelete.click();
+  }}
+}}
+
+function findDelete(el) {{
+  return el.findAll(function (node) {{
+    return String(node.className).split(/\\s+/).indexOf("order-delete") >= 0;
+  }});
+}}
+
+function describeButton(el) {{
+  return el ? {{
+    text: el.textContent,
+    label: el.getAttribute("aria-label"),
+    type: el.type,
+    hidden: el.getAttribute("hidden"),
+    destructive: el.getAttribute("data-destructive"),
+  }} : null;
 }}
 
 function describeCard(button) {{
@@ -239,6 +270,13 @@ process.stdout.write(JSON.stringify({{
   }}),
   opened: opened,
   moved: moved,
+  deleted: deleted,
+  cardsWithDeleteControl: rendered.cards &&
+    Object.keys(rendered.cards).filter(function (id) {{
+      const card = rendered.cards[id];
+      return String(card.className).split(/\\s+/).indexOf("order-delete") >= 0 ||
+        card.byClass("order-delete").length > 0;
+    }}),
   detail: detail && detail.model && {{
     label: detail.dialog.getAttribute("aria-labelledby"),
     modal: detail.dialog.getAttribute("aria-modal"),
@@ -246,6 +284,22 @@ process.stdout.write(JSON.stringify({{
     text: detail.dialog.text(),
     role: detail.dialog.getAttribute("role"),
     moveLabel: detail.move.getAttribute("aria-label"),
+    deleteControls: findDelete(detail.dialog).map(describeButton),
+    deleteButton: describeButton(detail.deleteButton),
+    confirmDelete: describeButton(detail.confirmDelete),
+    cancelDelete: describeButton(detail.cancelDelete),
+    confirmRegionHidden: detail.confirm
+      ? detail.confirm.getAttribute("hidden")
+      : "(no confirm region)",
+    confirmPrompt: detail.confirm
+      ? detail.confirm.text()
+      : "(no confirm region)",
+    confirmLabel: detail.confirm
+      ? detail.confirm.getAttribute("aria-label")
+      : "(no confirm region)",
+    confirmDescribed: detail.deleteButton
+      ? detail.deleteButton.getAttribute("aria-describedby")
+      : null,
     moveButtons: detail.move.findAll(function (el) {{
       return el.getAttribute("data-target-status") !== null;
     }}).map(function (b) {{
@@ -270,11 +324,14 @@ process.stdout.write(JSON.stringify({{
 _DEFAULT_ORDER = "--fixture-order"
 
 
-def render(payload=None, *, order: object = _DEFAULT_ORDER, action=None, index=None):
+def render(
+    payload=None, *, order: object = _DEFAULT_ORDER, action=None, index=None, step=None
+):
     """Run board.js in Node against the stub DOM and return its report.
 
     Omitting ``order`` uses the populated fixture; ``order=None`` reaches the
-    renderer's own empty path.
+    renderer's own empty path. ``step`` is the confirmation step -- ``"destroy"``
+    or ``"cancel"`` -- and is only meaningful with ``action="detail"``.
     """
     script = HARNESS.format(
         stub=str(STUB),
@@ -290,6 +347,8 @@ def render(payload=None, *, order: object = _DEFAULT_ORDER, action=None, index=N
         argv.append(action)
         if index is not None:
             argv.append(str(index))
+        if step is not None:
+            argv.append(step)
 
     result = subprocess.run(
         argv, capture_output=True, text=True, timeout=60, cwd=str(STUB.parent)
@@ -760,11 +819,168 @@ def test_the_frontend_writes_no_storage() -> None:
         assert banned not in source
 
 
-def test_the_frontend_offers_no_delete() -> None:
-    """No delete in this MVP."""
+def test_no_card_offers_a_delete_control() -> None:
+    """Ruling: delete lives in the dialog, never on a Kanban card.
 
+    A card is the one control an operator can hit while scanning, and a delete
+    reachable from there is a delete one stray click away from every order on the
+    board.
+    """
+    report = render(populated())
+
+    assert report["cardsWithDeleteControl"] == []
+
+
+def test_the_board_offers_no_delete_outside_the_dialog() -> None:
+    """The board itself must build no destructive control at all.
+
+    Scanned over code only, so this file's own comments explaining the absence
+    cannot fire it.
+    """
+    source = _js_code()
+    card_body = source.split("function card(", 1)[1].split("function column(", 1)[0]
+    assert "order-delete" not in card_body, (
+        "board.js builds a delete control inside a card"
+    )
+
+
+# --------------------------------------------------------------------------
+# Delete, in the details dialog
+# --------------------------------------------------------------------------
+
+
+def test_the_dialog_offers_a_delete_control() -> None:
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["deleteButton"] is not None
+
+
+def test_the_delete_control_names_the_order_it_would_delete() -> None:
+    """The destructive verb is never offered on a bare "Delete"."""
+    report = render(populated(), action="detail")
+
+    assert "ORD-0001" in report["detail"]["deleteButton"]["label"]
+
+
+def test_the_delete_control_says_delete_as_a_word() -> None:
+    """Not colour alone: the button carries the word, not just a red fill."""
+    report = render(populated(), action="detail")
+
+    assert "Delete" in report["detail"]["deleteButton"]["text"]
+
+
+def test_the_delete_control_is_marked_destructive() -> None:
+    """A hook for the stylesheet and for a test, so the distinction is declared."""
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["deleteButton"]["destructive"] == "yes"
+
+
+def test_the_delete_control_is_a_real_button() -> None:
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["deleteButton"]["type"] == "button"
+
+
+def test_the_confirmation_is_hidden_until_it_is_asked_for() -> None:
+    """One click on Delete must not delete anything."""
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["confirmRegionHidden"] == "true"
+
+
+def test_the_confirmation_names_the_order_number_and_its_title() -> None:
+    """The ruling, verbatim: an operator must read back exactly what goes.
+
+    "Delete that order?" is not enough -- with a board of a dozen orders, an
+    unlabelled confirmation is a coin flip on which one is removed.
+    """
+    report = render(populated(), action="detail")
+
+    prompt = report["detail"]["confirmPrompt"]
+    # The stub joins subtree text with spaces, so the prompt is leading-spaced.
+    assert "Delete ORD-0001 — Straighten the tongs?" in prompt, prompt
+
+
+def test_the_confirmation_offers_a_delete_and_a_cancel() -> None:
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["confirmDelete"]["text"] == "Delete"
+    assert report["detail"]["cancelDelete"]["text"] == "Cancel"
+
+
+def test_the_confirming_button_is_marked_destructive() -> None:
+    """The step that actually destroys carries the same marking, not just the
+    first click."""
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["confirmDelete"]["destructive"] == "yes"
+
+
+def test_the_cancelling_button_is_not_marked_destructive() -> None:
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["cancelDelete"]["destructive"] is None
+
+
+def test_the_confirmation_is_a_named_group() -> None:
+    report = render(populated(), action="detail")
+
+    assert "ORD-0001" in report["detail"]["confirmLabel"]
+
+
+def test_the_confirmation_is_announced_as_a_description_of_the_delete_button() -> None:
+    """So a screen reader reaches the question before the answer is clicked."""
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["confirmDescribed"] == "order-delete-confirm"
+
+
+def test_the_confirmation_carries_a_stable_id_to_be_described_by() -> None:
+    report = render(populated(), action="detail")
+
+    assert report["detail"]["confirmRegionHidden"] == "true"
+    assert report["detail"]["confirmLabel"], "the confirm region must be nameable"
+
+
+def test_confirming_the_deletion_reports_the_order_and_its_title() -> None:
+    """The handler receives both, so the page can name what it removed."""
+    report = render(populated(), action="detail", step="destroy")
+
+    assert report["deleted"] == ["ORD-0001:Straighten the tongs"]
+
+
+def test_opening_the_confirmation_alone_deletes_nothing() -> None:
+    report = render(populated(), action="detail", step="confirm")
+
+    assert report["deleted"] == []
+
+
+def test_cancelling_deletes_nothing() -> None:
+    """The requirement, and the reason the confirmation is a second step."""
+    report = render(populated(), action="detail", step="cancel")
+
+    assert report["deleted"] == []
+
+
+def test_no_order_is_rendered_without_one_so_there_is_nothing_to_delete() -> None:
+    report = render(populated(), action="detail", order=None)
+
+    assert report["detail"] is None
+
+
+def test_the_frontend_implements_no_bulk_delete() -> None:
+    """Ruling: one order at a time. No plural control, no select-many path."""
     source = _js_code().lower()
-    assert "delete" not in source, "board.js must not offer a delete"
+    for banned in ("deletemany", "deleteall", "bulkdelete", "deletefiltered"):
+        assert banned not in source, f"board.js introduces {banned}"
+
+
+def test_the_frontend_offers_no_archive_or_restore() -> None:
+    """Ruling: no archive yet, and no soft delete. There is no way back."""
+    source = _js_code().lower()
+    for banned in ("archive", "restore", "undelete", "trash"):
+        assert banned not in source, f"board.js introduces {banned}"
 
 
 def test_the_frontend_implements_no_drag_and_drop() -> None:
@@ -973,6 +1189,7 @@ def test_every_hidden_board_element_has_an_explicit_rule() -> None:
         ".board-view[hidden]",
         ".order-overlay[hidden]",
         ".split[hidden]",
+        ".order-delete-confirm[hidden]",
     ):
         assert re.search(rf"^{re.escape(selector)} \{{[^}}]*display: none", css, flags=re.M), (
             f"no explicit {selector} rule"
@@ -996,6 +1213,42 @@ def test_each_board_column_is_a_containing_block_for_its_own_summary() -> None:
     assert "position: relative" in column_rule.group(1), (
         "without a positioned column, the per-column sr-only summary widens the "
         "document instead of staying inside the scroll container"
+    )
+
+
+def test_the_destructive_control_is_not_distinguished_by_colour_alone() -> None:
+    """The board's own rule, applied to the one destructive control.
+
+    Priority already carries a glyph because an orange and a red card are the same
+    rectangle to a colour-blind operator. Delete is signalled by the *word* on the
+    button (asserted in the rendering tests) and here by a border -- so a
+    stylesheet that reduced it to a coloured fill and nothing else fails.
+    """
+    css = STYLES_CSS.read_text(encoding="utf-8")
+
+    destructive = re.search(
+        r"^\.order-delete-trigger,\s*\n\.order-delete-confirm-button \{([^}]*)\}",
+        css,
+        flags=re.M,
+    )
+    assert destructive, "no rule for the destructive delete buttons"
+    assert "border:" in destructive.group(1), (
+        "the destructive control is distinguished by colour alone"
+    )
+    assert "font-weight: 600" in destructive.group(1), (
+        "the destructive control carries no non-colour emphasis"
+    )
+
+
+def test_the_cancelling_button_is_styled_apart_from_the_destructive_one() -> None:
+    """Cancel must not read as equally weighted next to the button that destroys."""
+    css = STYLES_CSS.read_text(encoding="utf-8")
+
+    cancel = re.search(r"^\.order-delete-cancel \{([^}]*)\}", css, flags=re.M)
+    assert cancel, "no rule for the cancel button"
+    assert "var(--hot)" not in cancel.group(1), (
+        "cancel is styled as destructive; the safe answer must not look like the "
+        "one that removes the order"
     )
 
 

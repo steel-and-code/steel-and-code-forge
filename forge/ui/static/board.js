@@ -28,8 +28,9 @@
  *
  *  - NO STORAGE AND NO INVENTED STATE. Nothing here is written anywhere; a
  *    refresh re-reads `GET /api/orders` and draws the server's answer. There is
- *    no drag-and-drop and no delete: movement is an explicit control, and there
- *    is no delete in this MVP.
+ *    no drag-and-drop. Movement is an explicit control, and the one destructive
+ *    control -- delete -- exists only inside the details dialog, behind a
+ *    confirmation that names the order.
  */
 
 (function (root, factory) {
@@ -419,8 +420,99 @@
     });
     dialog.appendChild(move);
 
+    /* The delete control, which lives here and nowhere else.
+     *
+     * Two clicks, on purpose. The first reveals a confirmation that names both the
+     * order number and its title -- "Delete ORD-0004 — Slate?" -- because a board
+     * of a dozen orders makes an unlabelled confirmation a coin flip on which one
+     * goes. Only the second click reports `onDelete`; opening the confirmation
+     * deletes nothing.
+     *
+     * Not on a card. A card is the control an operator hits while scanning, and a
+     * delete reachable from there is one stray click away from every order on the
+     * board. This is the only destructive control `board.js` builds, and
+     * `card()` builds none.
+     *
+     * "Destructive" is carried by the word Delete, a `data-destructive` attribute,
+     * and the border treatment in the stylesheet -- never by colour alone, for the
+     * same reason priority carries a glyph.
+     */
+    var trigger = node(doc, "button", "order-delete-trigger", "Delete order");
+    trigger.type = "button";
+    trigger.setAttribute("data-destructive", "yes");
+    trigger.setAttribute(
+      "aria-label",
+      "Delete " + model.orderId + ", " + model.title
+    );
+    // Points at the confirmation region, so assistive tech reaches the question
+    // before the answer is available to click.
+    trigger.setAttribute("aria-describedby", "order-delete-confirm");
+
+    var confirm = node(doc, "div", "order-delete-confirm");
+    confirm.setAttribute("id", "order-delete-confirm");
+    confirm.setAttribute("role", "group");
+    confirm.setAttribute("hidden", "true");
+    confirm.setAttribute(
+      "aria-label",
+      "Confirm deleting " + model.orderId + ", " + model.title
+    );
+
+    confirm.appendChild(
+      node(
+        doc,
+        "p",
+        "order-delete-prompt",
+        "Delete " + model.orderId + " — " + model.title + "?"
+      )
+    );
+
+    var confirmDelete = node(doc, "button", "order-delete-confirm-button", "Delete");
+    confirmDelete.type = "button";
+    confirmDelete.setAttribute("data-destructive", "yes");
+    confirmDelete.setAttribute(
+      "aria-label",
+      "Confirm delete " + model.orderId + ", " + model.title
+    );
+
+    var cancelDelete = node(doc, "button", "order-delete-cancel", "Cancel");
+    cancelDelete.type = "button";
+    cancelDelete.setAttribute(
+      "aria-label",
+      "Keep " + model.orderId + ", " + model.title
+    );
+
+    if (handlers && typeof handlers.onDelete === "function") {
+      trigger.addEventListener("click", function () {
+        confirm.removeAttribute("hidden");
+      });
+      confirmDelete.addEventListener("click", function () {
+        handlers.onDelete(model.orderId, model.title);
+      });
+      cancelDelete.addEventListener("click", function () {
+        // Back to where it was, so a second attempt starts from the question
+        // rather than from an answer already half given.
+        confirm.setAttribute("hidden", "true");
+      });
+    }
+
+    confirm.appendChild(cancelDelete);
+    confirm.appendChild(confirmDelete);
+
+    var danger = node(doc, "div", "order-danger");
+    danger.appendChild(trigger);
+    danger.appendChild(confirm);
+    dialog.appendChild(danger);
+
     container.appendChild(dialog);
-    return { model: model, dialog: dialog, move: move };
+    return {
+      model: model,
+      dialog: dialog,
+      move: move,
+      deleteButton: trigger,
+      confirm: confirm,
+      confirmDelete: confirmDelete,
+      cancelDelete: cancelDelete,
+    };
   }
 
   return {

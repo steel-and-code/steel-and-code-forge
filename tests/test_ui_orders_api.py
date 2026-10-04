@@ -85,6 +85,11 @@ class Harness:
     def store(self) -> OrderStore:
         return OrderStore(self.root)
 
+    @property
+    def orders_path(self) -> pathlib.Path:
+        """Where the board lives, so a test can corrupt it deliberately."""
+        return orders_path(self.root)
+
     # -- headers -------------------------------------------------------
 
     def headers(self, *, token: str | None = None, origin: str | None = ORIGIN, **extra):
@@ -146,6 +151,11 @@ class Harness:
             f"/api/orders/{order_id}/move",
             json={"status": status},
             headers=self.auth(**overrides),
+        )
+
+    def delete_order(self, order_id: str, **overrides):
+        return self.client.delete(
+            f"/api/orders/{order_id}", headers=self.auth(**overrides)
         )
 
 
@@ -593,6 +603,222 @@ def test_two_apps_sharing_a_workspace_share_one_board(
 
 
 # --------------------------------------------------------------------------
+# Delete
+# --------------------------------------------------------------------------
+#
+# A command, so it takes the strict exact-Origin + token guard pair, answers the
+# deleted Order rather than a bare 200, and never turns an unreadable board into
+# an empty one.
+
+
+def test_deleting_an_order_returns_200_and_the_deleted_order(harness: Harness) -> None:
+    order = one_order(harness)
+
+    response = harness.delete_order(order["order_id"])
+
+    assert response.status_code == 200
+    assert response.json()["order_id"] == order["order_id"]
+    assert response.json()["title"] == order["title"]
+
+
+def test_the_deleted_order_carries_the_full_published_shape(harness: Harness) -> None:
+    """The same nine fields a create returns, so a client can name what it removed."""
+
+    order = one_order(harness)
+
+    assert set(harness.delete_order(order["order_id"]).json()) == set(order)
+
+
+def test_a_deleted_order_is_gone_over_the_api(harness: Harness) -> None:
+    order = one_order(harness)
+
+    harness.delete_order(order["order_id"])
+
+    assert harness.get_order(order["order_id"]).status_code == 404
+
+
+def test_a_deleted_order_leaves_the_board_over_the_api(harness: Harness) -> None:
+    kept = one_order(harness, title="Keep")
+    doomed = one_order(harness, title="Slate")
+
+    harness.delete_order(doomed["order_id"])
+
+    listed = harness.list_orders().json()
+    assert listed["total"] == 1
+    assert [o["order_id"] for c in listed["columns"] for o in c["orders"]] == [
+        kept["order_id"]
+    ]
+
+
+def test_deleting_an_unknown_order_is_404(harness: Harness) -> None:
+    assert harness.delete_order("ORD-0404").status_code == 404
+
+
+def test_deleting_an_already_deleted_order_is_404(harness: Harness) -> None:
+    """Deleting twice is a refusal, not an idempotent success.
+
+    A second 200 would tell a client its delete worked when the order it named
+    had already been gone -- and would hide a stale page behind a green answer.
+    """
+    order = one_order(harness)
+    assert harness.delete_order(order["order_id"]).status_code == 200
+
+    assert harness.delete_order(order["order_id"]).status_code == 404
+
+
+def test_a_refused_delete_leaves_the_order_on_the_board(harness: Harness) -> None:
+    order = one_order(harness)
+
+    assert harness.delete_order("ORD-0404").status_code == 404
+
+    assert harness.get_order(order["order_id"]).status_code == 200
+
+
+def test_a_delete_persists_through_the_file(harness: Harness) -> None:
+    """Asserted on the file, not on the next read of the same store.
+
+    A route that deleted from a cache would answer 200 and leave the order in
+    ``.forge/orders.json``, which is the only copy that survives a restart.
+    """
+    order = one_order(harness)
+
+    harness.delete_order(order["order_id"])
+
+    document = json.loads(orders_path(harness.root).read_text(encoding="utf-8"))
+    assert [entry["order_id"] for entry in document["orders"]] == []
+
+
+def test_a_delete_survives_a_fresh_store_over_the_same_workspace(
+    workspace_root: pathlib.Path,
+) -> None:
+    """The reload case, through the app: a new store sees the deletion."""
+    first = Harness(workspace_root)
+    created = first.create_order(title="Slate").json()
+
+    assert first.delete_order(created["order_id"]).status_code == 200
+
+    second = Harness(workspace_root)
+    assert second.get_order(created["order_id"]).status_code == 404
+
+
+def test_deleting_the_highest_order_over_the_api_does_not_reuse_its_number(
+    harness: Harness,
+) -> None:
+    for n in range(3):
+        one_order(harness, title=f"Blade {n}")
+
+    assert harness.delete_order("ORD-0003").status_code == 200
+
+    assert one_order(harness, title="Four")["order_id"] == "ORD-0004"
+
+
+def test_deleting_a_middle_order_over_the_api_does_not_reuse_a_number(
+    harness: Harness,
+) -> None:
+    for n in range(3):
+        one_order(harness, title=f"Blade {n}")
+
+    assert harness.delete_order("ORD-0002").status_code == 200
+
+    assert one_order(harness, title="Four")["order_id"] == "ORD-0004"
+
+
+def test_the_board_reports_a_monotonic_next_id_after_a_delete(harness: Harness) -> None:
+    one_order(harness)
+    one_order(harness)
+
+    harness.delete_order("ORD-0002")
+
+    assert harness.list_orders().json()["next_id"] == "ORD-0003"
+
+
+def test_a_delete_over_a_corrupt_board_answers_500_and_keeps_the_file(
+    harness: Harness,
+) -> None:
+    """The ruling the board was built on, on the new route.
+
+    A delete that treated an unreadable file as an empty board would answer 200,
+    report the board clean, and leave the operator with a corrupt file and no
+    orders -- the exact outcome the empty-board refusal exists to prevent.
+    """
+    order = one_order(harness)
+    harness.orders_path.write_text("{not json", encoding="utf-8")
+
+    response = harness.delete_order(order["order_id"])
+
+    assert response.status_code == 500
+    assert "detail" in response.json()
+    assert harness.orders_path.read_text(encoding="utf-8") == "{not json"
+
+
+def test_a_corrupt_board_is_not_reported_as_empty_after_a_failed_delete(
+    harness: Harness,
+) -> None:
+    one_order(harness)
+    harness.orders_path.write_text("{not json", encoding="utf-8")
+
+    harness.delete_order("ORD-0001")
+
+    assert harness.list_orders().status_code == 500
+
+
+# --------------------------------------------------------------------------
+# Delete: authorization
+# --------------------------------------------------------------------------
+
+
+def test_deleting_an_order_requires_the_token(harness: Harness) -> None:
+    order = one_order(harness)
+
+    response = harness.client.delete(
+        f"/api/orders/{order['order_id']}", headers=harness.headers(origin=None)
+    )
+
+    assert response.status_code == 403
+
+
+def test_deleting_an_order_refuses_a_forged_token(harness: Harness) -> None:
+    order = one_order(harness)
+
+    assert harness.delete_order(order["order_id"], token="nope").status_code == 403
+
+
+def test_a_delete_refuses_a_cross_origin_request(harness: Harness) -> None:
+    """The forged-submission case, on the most destructive verb the surface has.
+
+    A ``fetch`` DELETE is a non-simple method, so the browser attaches ``Origin``
+    on it exactly as it does on a POST -- which is why this route can take the
+    strict exact-Origin check without refusing the Workbench's own page.
+    """
+    order = one_order(harness)
+
+    response = harness.delete_order(order["order_id"], origin="http://evil.example")
+
+    assert response.status_code == 403
+
+
+def test_a_refused_delete_does_not_remove_the_order(harness: Harness) -> None:
+    """The guard must run before the store, not after.
+
+    Asserted rather than assumed: a route that deleted and then answered 403
+    would pass every other guard test in this module.
+    """
+    order = one_order(harness)
+
+    harness.delete_order(order["order_id"], origin="http://evil.example")
+
+    assert harness.get_order(order["order_id"]).status_code == 200
+
+
+def test_a_delete_without_any_origin_is_refused(harness: Harness) -> None:
+    """Absence fails closed, the same rule the read routes hold."""
+
+    order = one_order(harness)
+
+    assert harness.delete_order(order["order_id"], origin=None).status_code == 403
+
+
+# --------------------------------------------------------------------------
 # Authorization
 # --------------------------------------------------------------------------
 
@@ -757,16 +983,42 @@ def test_the_board_is_not_readable_without_a_token_from_a_fresh_process(
 # --------------------------------------------------------------------------
 
 
-def test_there_is_no_route_to_delete_an_order(harness: Harness) -> None:
-    """Ruling: no delete feature in this MVP."""
+def test_there_is_no_bulk_delete_route(harness: Harness) -> None:
+    """Ruling: one order at a time, and no way to ask for more.
+
+    ``DELETE /api/orders`` would be the bulk door, so it has to be a refusal.
+    """
+    one_order(harness)
+
+    assert harness.client.delete("/api/orders", headers=harness.auth()).status_code >= 400
+
+
+def test_there_is_no_put_route(harness: Harness) -> None:
+    """PUT stays refused; the edit verb is PATCH and deletion is DELETE."""
 
     order = one_order(harness)
 
-    for method in ("delete", "put", "patch"):
-        response = getattr(harness.client, method)(
-            f"/api/orders/{order['order_id']}", headers=harness.auth()
-        )
-        assert response.status_code != 200, f"{method} changed an order"
+    response = harness.client.put(
+        f"/api/orders/{order['order_id']}", json={"title": "x"}, headers=harness.auth()
+    )
+
+    assert response.status_code >= 400
+
+
+def test_no_route_archives_or_soft_deletes_an_order(harness: Harness) -> None:
+    """Ruling: no archive, no soft delete, no history. The delete is a hard one.
+
+    Asserted on the stored document rather than on a status code: a route that
+    answered 200 while marking the order deleted-in-place would pass every other
+    assertion in this module.
+    """
+    order = one_order(harness)
+
+    assert harness.delete_order(order["order_id"]).status_code == 200
+
+    document = json.loads(orders_path(harness.root).read_text(encoding="utf-8"))
+    assert document["orders"] == [], "the order was not actually removed"
+    assert "deleted" not in json.dumps(document).lower()
 
 
 def test_an_order_carries_no_model_cost_or_git_field(harness: Harness) -> None:

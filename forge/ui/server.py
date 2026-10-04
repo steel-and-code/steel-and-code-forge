@@ -38,11 +38,12 @@ state the server already holds, a **command** changes something.
     The decision. A command, not an event, so it is a POST rather than a frame
     on the stream.
 
-Five more routes serve the Order Board, and they follow the same line between an
+Six more routes serve the Order Board, and they follow the same line between an
 observation and a command -- ``GET /api/orders`` and ``GET /api/orders/{id}``
-take the read-only guard pair, and the three writes take the strict exact-Origin
+take the read-only guard pair, and the four writes take the strict exact-Origin
 guard. Movement is ``POST /api/orders/{id}/move`` and is deliberately *not* a
-field of the edit body: see :mod:`forge.ui.orders`.
+field of the edit body: see :mod:`forge.ui.orders`. Deletion is
+``DELETE /api/orders/{id}``, one order at a time and permanently.
 
 Three properties of the whole surface, each of which is a decision:
 
@@ -557,16 +558,17 @@ def create_app(
 
     # -- the Order Board ------------------------------------------------
     #
-    # Five routes, and the split follows the same observation/command line as the
+    # Six routes, and the split follows the same observation/command line as the
     # rest of the surface: the two GETs read state the server already holds and
-    # take the read-only guard pair; the three writes change something and take
+    # take the read-only guard pair; the four writes change something and take
     # the strict exact-Origin guard.
     #
-    # Nothing here reaches the session, the dispatcher, or a gateway. Creating
-    # and moving orders leaves the run exactly as it found it -- no model is
-    # called and no approval is consumed. That is the "no automatic execution"
-    # boundary, and it is enforced by the absence of an import rather than by a
-    # flag.
+    # Nothing here reaches the session, the dispatcher, or a gateway. Creating,
+    # moving, and deleting orders leaves the run exactly as it found it -- no
+    # model is called and no approval is consumed. That is the "no automatic
+    # execution" boundary, and it is enforced by the absence of an import rather
+    # than by a flag. Deleting an Order in particular triggers nothing: no agent
+    # behaviour hangs off it.
 
     def board_errors(exc: Exception) -> JSONResponse:
         """Map a store failure onto the status code it deserves.
@@ -741,6 +743,47 @@ def create_app(
             return order.as_dict()
 
         return await read_board(move)
+
+    @app.delete("/api/orders/{order_id}")
+    async def api_delete_order(
+        order_id: str,
+        request: Request,
+        _: None = Depends(guarded),
+    ) -> JSONResponse:
+        """Remove one order permanently.
+
+        A command like the other three writes, so it takes the strict exact-Origin
+        and token guards rather than the read-only pair. ``DELETE`` is a non-simple
+        method, so a browser attaches ``Origin`` to it exactly as it does to a
+        POST -- which is what lets this route demand an exact one without refusing
+        the Workbench's own page.
+
+        ``200`` with the deleted order, not a bare ``200`` or a ``204``. The client
+        then names what it removed from the server's own answer rather than from
+        what it hoped it had, which is the same reason the create route answers
+        201 with the order it made.
+
+        Three outcomes:
+
+        * ``200`` -- gone. Persisted through the store, atomically.
+        * ``404`` -- no such order, including one already deleted. A second delete
+          of the same id is a refusal rather than an idempotent success, so a stale
+          page is told its order is gone instead of being handed a green answer
+          for a deletion that already happened.
+        * ``500`` -- the board could not be read or written, with the reason. Never
+          an empty board over a corrupt file: a delete that degraded a malformed
+          file to "nothing here" would write that emptiness back and destroy every
+          order on the board while reporting a clean removal.
+
+        No bulk form, no archive, no soft delete, and no restore. One id, once.
+        """
+        store: OrderStore = app.state.orders
+
+        async def delete() -> dict[str, object]:
+            order = await asyncio.to_thread(store.delete, order_id)
+            return order.as_dict()
+
+        return await read_board(delete)
 
     @app.get("/api/health")
     async def api_health() -> JSONResponse:

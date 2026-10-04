@@ -55,6 +55,19 @@ StubElement.prototype.getAttribute = function (name) {
     : null;
 };
 
+/* `removeAttribute` is modelled because the board's delete confirmation reveals
+ * itself by removing `hidden`, and a stub that quietly ignored the call would
+ * leave the confirmation permanently hidden -- every test below would then pass
+ * against a prompt no operator could ever see.
+ */
+StubElement.prototype.removeAttribute = function (name) {
+  delete this.attributes[name];
+};
+
+StubElement.prototype.hasAttribute = function (name) {
+  return Object.prototype.hasOwnProperty.call(this.attributes, name);
+};
+
 StubElement.prototype.appendChild = function (child) {
   child.parentNode = this;
   this.children.push(child);

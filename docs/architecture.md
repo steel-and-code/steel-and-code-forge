@@ -155,6 +155,7 @@ distinction that matters between them is observation versus command:
 | `/api/orders` | POST | command | token + exact `Origin` |
 | `/api/orders/{id}` | PATCH | command | token + exact `Origin` |
 | `/api/orders/{id}/move` | POST | command | token + exact `Origin` |
+| `/api/orders/{id}` | DELETE | command | token + exact `Origin` |
 
 `/api/health` is a seventh, deliberately outside this table: unauthenticated,
 capability-free liveness that reveals nothing.
@@ -237,7 +238,7 @@ field in its body at all, so a title edit cannot become a transition by
 accident. There is exactly one place to hang transition rules, approvals, or agent
 automation later, without changing what an edit means.
 
-The five routes, each split by whether it observes or commands:
+The six routes, each split by whether it observes or commands:
 
 | Route | Method | Changes an Order |
 | --- | --- | --- |
@@ -246,11 +247,32 @@ The five routes, each split by whether it observes or commands:
 | `POST /api/orders` | POST | yes — creates one, answering 201 |
 | `PATCH /api/orders/{id}` | PATCH | yes — title, priority, smith, description |
 | `POST /api/orders/{id}/move` | POST | yes — status only |
+| `DELETE /api/orders/{id}` | DELETE | yes — removes one Order permanently, answering 200 with it |
 
 The guards are the ones in the route table in section 3a: the two GETs take the
-read-only same-origin pair, the three writes take exact `Origin`. Neither half of
+read-only same-origin pair, the four writes take exact `Origin`. Neither half of
 the split is a formality — a forged `Origin` on a write is refused, and a read
-with neither an `Origin` nor `Sec-Fetch-Site: same-origin` is refused too.
+with neither an `Origin` nor `Sec-Fetch-Site: same-origin` is refused too. A
+`fetch` `DELETE` is a non-simple method, so the browser attaches `Origin` to it
+as it does to a `POST`, which is why the delete route can demand an exact one
+without refusing the Workbench's own page.
+
+**Deletion is a hard delete of exactly one Order, and it never reuses a number.**
+`DELETE /api/orders/{id}` removes the Order permanently and answers `200` with
+it, so the page names what it removed from the server's own answer. Three
+outcomes: `200` gone, `404` for an unknown id *or* one already deleted — deleting
+twice is a refusal rather than an idempotent success, so a stale page is told its
+Order is gone instead of being handed a green answer — and `500` with the reason
+when the board file cannot be read or written. The counter is written back
+exactly as it was loaded rather than recounted, so the number just freed is never
+minted again; a **gap** in the sequence after a deletion is normal. There is
+**no bulk delete**, **no archive**, **no soft delete**, and no restore: one id,
+once, with no way back. In the UI the control lives only in the Order details
+dialog — never on a Kanban card — and it opens a confirmation naming both the
+order number and its title (`Delete ORD-0004 — Slate?`) with a Delete and a
+Cancel button. The destructive action is marked with the word and with
+`data-destructive`, never with colour alone; a refused delete leaves the card on
+the board and puts the server's own reason in the board note.
 
 The workflow states are stable snake_case identifiers
 (`orders_received`, `at_the_forge`, …); the blacksmith wording an operator reads
@@ -265,11 +287,12 @@ one starts no run, calls no model, spends nothing, and consumes no approval.
 `forge/ui/orders.py` imports nothing from `forge/models/`, `forge/tools/`, or
 `forge/ui/session.py`, and that is asserted on the module's import graph rather
 than left as a comment. The board is inert by construction, not by a flag. There
-is also deliberately **no delete, no drag-and-drop, and no history** — no
-activity log, no blockers, no approvals, no model cost, no Git metadata, and no
-test counts on an Order. Movement is an explicit set of buttons, one per state
-the backend published, because a control reachable only by pointer gesture is
-unusable by keyboard.
+is also deliberately **no drag-and-drop, and no history** — no activity log, no
+blockers, no approvals, no model cost, no Git metadata, and no test counts on an
+Order. Deletion exists and is a hard delete of one Order, but it triggers no
+agent behaviour and leaves no history behind. Movement is an explicit set of
+buttons, one per state the backend published, because a control reachable only by
+pointer gesture is unusable by keyboard.
 
 ### 4. Provider-agnostic core
 
@@ -397,199 +420,6 @@ subcommands rather than a `--agent` flag, so every existing spelling of
 `forge byte` is unchanged and a third agent does not force a redesign of the
 first. Both are thin wrappers over one shared `_run_agent`; they differ only in
 the profile passed and the task kind it routes under.
-
-
-### OpenRouter — model gateway
-
-Single point of access to language models. Forge talks to a model gateway and
-to nothing else when it needs an LLM call.
-
-Why a gateway: one API surface, one place to switch or fall back between models,
-and centralized usage and cost tracking. It also gives Forge one place to
-enforce provider-agnosticism — nothing above this boundary knows a vendor name.
-
-OpenRouter is the current intended gateway. The abstraction is the point, not
-the vendor: no OpenRouter client exists yet, and when one is added it goes
-behind the interface in `forge/models/` so the rest of Forge never depends on
-that SDK. A different provider should be reachable by changing configuration.
-
-### n8n — automation and triggers
-
-Owns *when* things happen. Scheduled jobs, inbound webhooks, third-party events.
-
-n8n does not run agents and does not hold business logic. It decides that
-something should be triggered and hands the payload to Forge. Forge does not
-schedule its own work.
-
-n8n reaches Forge over a secondary HTTP surface, because webhooks and schedules
-are HTTP by nature. That surface carries no capability the terminal lacks.
-
-Integration direction is inbound (n8n calls Forge). Outbound notification from
-Forge back into n8n is possible later but undecided.
-
-### Byte, Ember, Fin — agents
-
-Agents are the workers Forge orchestrates. Each is a role, not a separate
-service.
-
-| Agent | Role | Surface |
-| --- | --- | --- |
-| Byte | Software engineering agent. Builds and maintains code. | Terminal, primary |
-| Ember | TBD. | TBD |
-| Fin | TBD. | TBD |
-
-All three run on the same Forge runtime and differ by configuration: model,
-tools, instructions, permissions, workspace, and memory scope. Byte is the only
-one specified so far; Ember and Fin are planned names with no agreed scope.
-
-**Permissions are not part of that per-agent freedom.** Every agent runs under
-one Forge-wide safety baseline — the workspace boundary, the two-tier secret
-classification, and the command classifier, with automatic / approval-required /
-denied decided by an explicit rule table and approval-required as the default for
-anything unrecognised. Byte is its reference configuration. An agent may be
-configured **narrower** than the baseline; nothing in the configuration path can
-widen it, and there is no agent-level "allow extra" or trust override in v1. Any
-future widening is a change to the baseline itself, reviewed like any other
-policy change.
-
-The per-agent fields are defined in [agent-contract.md](agent-contract.md). No
-agent logic, prompt, or executable definition exists.
-
-### Steel & Code website — external client
-
-The public-facing site. It consumes Forge; Forge does not own it and does not
-depend on its internals.
-
-The website is an external client of a secondary Forge interface. It cannot
-hold an SSH session, so it arrives over HTTP — but it gets no capability that
-the terminal does not also expose. The interface is not defined yet; defining
-it is one of the next steps, because it fixes the contract everything else is
-built behind.
-
-## Data flow
-
-Illustrative, for the intended shape. None of this exists yet.
-
-Primary path, a person at a terminal:
-
-1. The operator invokes an agent from the command line, or starts a TUI
-   session, on a local machine or a Forge host over SSH.
-2. Forge resolves the agent contract: model, tools, permissions, workspace,
-   memory scope.
-3. The agent requests a model call; Forge calls the model gateway.
-4. The model returns; the agent may call a permitted tool or continue looping.
-5. Memory and workflow state are updated; output is rendered for the operator.
-
-Secondary path, software driving Forge over HTTP:
-
-1. A trigger fires (n8n schedule, webhook, or website request).
-2. Forge receives the request and picks an agent from its contract.
-3. Steps 3 through 5 proceed as above, minus the human rendering step.
-4. The result returns to the caller as structured data.
-
-The two paths converge on the same orchestration core. Only entry and rendering
-differ.
-
-## Explicitly out of scope for this pass
-
-- OpenRouter integration, or any model provider client.
-- n8n wiring.
-- Agent logic, prompts, or execution.
-- A **database**. The one durable store in Forge is the Order Board's
-  workspace-scoped JSON file (section 3b), which is deliberately not a database
-  and deliberately not general-purpose. A shared multi-user store, a server-side
-  database, or a background job runner is still out of scope.
-- Public API and its schema.
-- Python classes for the agent contract.
-- Tool implementations.
-- Dependency installation by agents. Forge v1 assumes the project environment
-  is already provisioned.
-- Unattended approval over HTTP. Deferred approval with resume exists only in
-  `forge workbench`, where a human is present; see section 3a.
-- Execution triggered by an Order, and any history on an Order. See section 3b.
-
-## Consequences worth stating
-
-These are consequences of terminal-first, not preferences.
-
-- Testing favours plain functions over framework objects. The contract can be
-  validated from a shell without standing up a server.
-- Debugging favours readable logs and inspectable session state over dashboards.
-- Deployment stays small. A VPS running a CLI is a smaller operational surface
-  than a service with a web tier.
-- Network access is optional, not assumed. A Forge host with no inbound HTTP
-  reachable is still fully usable over SSH.
-- Secrets live at the orchestration layer, not in the agent's reach. An agent
-  gets capability without getting values, which is what makes it safe to run
-  unattended.
-
-## Design decisions recorded
-
-Decisions taken during design that are not obvious from the surface list, and
-would otherwise be re-litigated:
-
-- Terminal-first, HTTP secondary (see Interaction surfaces).
-- One binary, agent name as a subcommand — `forge byte`, later `forge ember`.
-  Not one binary per agent.
-- The terminal entry point classifies and asks; `forge check` still executes
-  nothing.
-- Execution lives in exactly one module and requires a claimed approval. There
-  is no second path to `subprocess`, and no `forge exec` in v1.
-- An approved outcome is a single-spend capability, and it is bound to the exact
-  invocation it approved.
-- Permissions are a Forge-wide baseline, not a per-agent choice. Agents may be
-  narrower; nothing may widen the baseline in v1.
-- Automatic is an explicit rule. An unrecognised command is approval-required,
-  so a classifier miss produces a prompt rather than silent execution.
-- Executing repository code is approval-required — test runners and workspace
-  scripts alike, because a repository is not a trust boundary.
-- Model access behind one gateway interface; no vendor names above it.
-- Agents are configuration, not classes or services. Byte is an `AgentProfile`
-  value, and the runtime that serves it does not know its name.
-- The model decides what it wants to attempt; Forge decides whether it is
-  allowed. The runtime holds no classifier, `Approver`, or `Executor`.
-- Agents may use credentials but never see them.
-- Approval is per-operation; no blanket approval in v1.
-- Approval-required operations fail closed when unattended.
-- `forge workbench` is a local interactive human surface, not a secondary
-  machine-driven one. It fails closed exactly as the terminal does, and it
-  creates no unattended approval route (see section 3a).
-- Server -> browser activity travels over SSE, not WebSockets. Approvals
-  arrive as a POST, because a decision is a command rather than an event.
-- Observational events are emitted through one optional `EventSink` hook and
-  carry bounded, sanitised data. A sink observes; it decides nothing, and no
-  surface scrapes logs or reaches into runtime internals to find out what
-  happened.
-- The UI dependency set is optional and minimal (`fastapi`, `uvicorn`); the
-  Forge core stays dependency-free.
-- Memory is a Forge-wide architecture, not a per-agent choice.
-- Memory is session-only in v1; durable project memory designed, disabled.
-- The project environment is provisioned by a human, not by the agent.
-
-## Open questions
-
-- What is the session model: persistent resumable sessions, or one-shot runs?
-- Does the website get a different interface from n8n, or one shared secondary
-  surface with per-consumer credentials?
-- Are Ember and Fin single agents or families of agents?
-- Which model capability levels should the gateway expose as configuration, and
-  which model does each agent default to?
-- Does Forge ever call out to n8n, or only receive from it?
-- Are the security classification lists in
-  [byte-security-classification.md](byte-security-classification.md) accepted
-  as written? Settled: two-tier secret sources, wildcard deletes denied, inline
-  code approval-gated without analysis, network commands approval-gated,
-  Linux-only scope, and — from the permission-model pass — an explicit ALLOW
-  table with approval-required as the default for unrecognised commands, plus
-  approval-required for workspace-local executables and for anything executing
-  repository code. **The code has not caught up to the last three yet**; see the
-  gap table in [byte-tools.md](byte-tools.md).
-
-**Resolved:** memory scope is a single Forge-wide decision, not a per-agent one,
-with Byte as the reference agent. Session memory in v1; durable project memory
-designed and disabled; personal memory out of scope. Ember, Fin, and future
-agents inherit the architecture unless a future contract explicitly changes it.
-The full model is in [agent-contract.md](agent-contract.md).
 
 ### 4c. Four model mechanisms, deliberately distinct
 
@@ -783,3 +613,194 @@ visible form of respecting that ownership.
 *   **This is an MVP.** Streaming events to the operator, session resume, and any
    capability beyond "none" are all deliberately absent.
 
+### OpenRouter — model gateway
+
+Single point of access to language models. Forge talks to a model gateway and
+to nothing else when it needs an LLM call.
+
+Why a gateway: one API surface, one place to switch or fall back between models,
+and centralized usage and cost tracking. It also gives Forge one place to
+enforce provider-agnosticism — nothing above this boundary knows a vendor name.
+
+OpenRouter is the current intended gateway. The abstraction is the point, not
+the vendor: no OpenRouter client exists yet, and when one is added it goes
+behind the interface in `forge/models/` so the rest of Forge never depends on
+that SDK. A different provider should be reachable by changing configuration.
+
+### n8n — automation and triggers
+
+Owns *when* things happen. Scheduled jobs, inbound webhooks, third-party events.
+
+n8n does not run agents and does not hold business logic. It decides that
+something should be triggered and hands the payload to Forge. Forge does not
+schedule its own work.
+
+n8n reaches Forge over a secondary HTTP surface, because webhooks and schedules
+are HTTP by nature. That surface carries no capability the terminal lacks.
+
+Integration direction is inbound (n8n calls Forge). Outbound notification from
+Forge back into n8n is possible later but undecided.
+
+### Byte, Ember, Fin — agents
+
+Agents are the workers Forge orchestrates. Each is a role, not a separate
+service.
+
+| Agent | Role | Surface |
+| --- | --- | --- |
+| Byte | Software engineering agent. Builds and maintains code. | Terminal, primary |
+| Ember | TBD. | TBD |
+| Fin | TBD. | TBD |
+
+All three run on the same Forge runtime and differ by configuration: model,
+tools, instructions, permissions, workspace, and memory scope. Byte is the only
+one specified so far; Ember and Fin are planned names with no agreed scope.
+
+**Permissions are not part of that per-agent freedom.** Every agent runs under
+one Forge-wide safety baseline — the workspace boundary, the two-tier secret
+classification, and the command classifier, with automatic / approval-required /
+denied decided by an explicit rule table and approval-required as the default for
+anything unrecognised. Byte is its reference configuration. An agent may be
+configured **narrower** than the baseline; nothing in the configuration path can
+widen it, and there is no agent-level "allow extra" or trust override in v1. Any
+future widening is a change to the baseline itself, reviewed like any other
+policy change.
+
+The per-agent fields are defined in [agent-contract.md](agent-contract.md). No
+agent logic, prompt, or executable definition exists.
+
+### Steel & Code website — external client
+
+The public-facing site. It consumes Forge; Forge does not own it and does not
+depend on its internals.
+
+The website is an external client of a secondary Forge interface. It cannot
+hold an SSH session, so it arrives over HTTP — but it gets no capability that
+the terminal does not also expose. The interface is not defined yet; defining
+it is one of the next steps, because it fixes the contract everything else is
+built behind.
+
+## Data flow
+
+Illustrative, for the intended shape. None of this exists yet.
+
+Primary path, a person at a terminal:
+
+1. The operator invokes an agent from the command line, or starts a TUI
+   session, on a local machine or a Forge host over SSH.
+2. Forge resolves the agent contract: model, tools, permissions, workspace,
+   memory scope.
+3. The agent requests a model call; Forge calls the model gateway.
+4. The model returns; the agent may call a permitted tool or continue looping.
+5. Memory and workflow state are updated; output is rendered for the operator.
+
+Secondary path, software driving Forge over HTTP:
+
+1. A trigger fires (n8n schedule, webhook, or website request).
+2. Forge receives the request and picks an agent from its contract.
+3. Steps 3 through 5 proceed as above, minus the human rendering step.
+4. The result returns to the caller as structured data.
+
+The two paths converge on the same orchestration core. Only entry and rendering
+differ.
+
+## Explicitly out of scope for this pass
+
+- OpenRouter integration, or any model provider client.
+- n8n wiring.
+- Agent logic, prompts, or execution.
+- A **database**. The one durable store in Forge is the Order Board's
+  workspace-scoped JSON file (section 3b), which is deliberately not a database
+  and deliberately not general-purpose. A shared multi-user store, a server-side
+  database, or a background job runner is still out of scope.
+- Public API and its schema.
+- Python classes for the agent contract.
+- Tool implementations.
+- Dependency installation by agents. Forge v1 assumes the project environment
+  is already provisioned.
+- Unattended approval over HTTP. Deferred approval with resume exists only in
+  `forge workbench`, where a human is present; see section 3a.
+- Execution triggered by an Order, and any history on an Order. See section 3b.
+
+## Consequences worth stating
+
+These are consequences of terminal-first, not preferences.
+
+- Testing favours plain functions over framework objects. The contract can be
+  validated from a shell without standing up a server.
+- Debugging favours readable logs and inspectable session state over dashboards.
+- Deployment stays small. A VPS running a CLI is a smaller operational surface
+  than a service with a web tier.
+- Network access is optional, not assumed. A Forge host with no inbound HTTP
+  reachable is still fully usable over SSH.
+- Secrets live at the orchestration layer, not in the agent's reach. An agent
+  gets capability without getting values, which is what makes it safe to run
+  unattended.
+
+## Design decisions recorded
+
+Decisions taken during design that are not obvious from the surface list, and
+would otherwise be re-litigated:
+
+- Terminal-first, HTTP secondary (see Interaction surfaces).
+- One binary, agent name as a subcommand — `forge byte`, later `forge ember`.
+  Not one binary per agent.
+- The terminal entry point classifies and asks; `forge check` still executes
+  nothing.
+- Execution lives in exactly one module and requires a claimed approval. There
+  is no second path to `subprocess`, and no `forge exec` in v1.
+- An approved outcome is a single-spend capability, and it is bound to the exact
+  invocation it approved.
+- Permissions are a Forge-wide baseline, not a per-agent choice. Agents may be
+  narrower; nothing may widen the baseline in v1.
+- Automatic is an explicit rule. An unrecognised command is approval-required,
+  so a classifier miss produces a prompt rather than silent execution.
+- Executing repository code is approval-required — test runners and workspace
+  scripts alike, because a repository is not a trust boundary.
+- Model access behind one gateway interface; no vendor names above it.
+- Agents are configuration, not classes or services. Byte is an `AgentProfile`
+  value, and the runtime that serves it does not know its name.
+- The model decides what it wants to attempt; Forge decides whether it is
+  allowed. The runtime holds no classifier, `Approver`, or `Executor`.
+- Agents may use credentials but never see them.
+- Approval is per-operation; no blanket approval in v1.
+- Approval-required operations fail closed when unattended.
+- `forge workbench` is a local interactive human surface, not a secondary
+  machine-driven one. It fails closed exactly as the terminal does, and it
+  creates no unattended approval route (see section 3a).
+- Server -> browser activity travels over SSE, not WebSockets. Approvals
+  arrive as a POST, because a decision is a command rather than an event.
+- Observational events are emitted through one optional `EventSink` hook and
+  carry bounded, sanitised data. A sink observes; it decides nothing, and no
+  surface scrapes logs or reaches into runtime internals to find out what
+  happened.
+- The UI dependency set is optional and minimal (`fastapi`, `uvicorn`); the
+  Forge core stays dependency-free.
+- Memory is a Forge-wide architecture, not a per-agent choice.
+- Memory is session-only in v1; durable project memory designed, disabled.
+- The project environment is provisioned by a human, not by the agent.
+
+## Open questions
+
+- What is the session model: persistent resumable sessions, or one-shot runs?
+- Does the website get a different interface from n8n, or one shared secondary
+  surface with per-consumer credentials?
+- Are Ember and Fin single agents or families of agents?
+- Which model capability levels should the gateway expose as configuration, and
+  which model does each agent default to?
+- Does Forge ever call out to n8n, or only receive from it?
+- Are the security classification lists in
+  [byte-security-classification.md](byte-security-classification.md) accepted
+  as written? Settled: two-tier secret sources, wildcard deletes denied, inline
+  code approval-gated without analysis, network commands approval-gated,
+  Linux-only scope, and — from the permission-model pass — an explicit ALLOW
+  table with approval-required as the default for unrecognised commands, plus
+  approval-required for workspace-local executables and for anything executing
+  repository code. **The code has not caught up to the last three yet**; see the
+  gap table in [byte-tools.md](byte-tools.md).
+
+**Resolved:** memory scope is a single Forge-wide decision, not a per-agent one,
+with Byte as the reference agent. Session memory in v1; durable project memory
+designed and disabled; personal memory out of scope. Ember, Fin, and future
+agents inherit the architecture unless a future contract explicitly changes it.
+The full model is in [agent-contract.md](agent-contract.md).

@@ -17,6 +17,7 @@
  *   POST /api/orders           token + origin      -> create, 201
  *   PATCH /api/orders/{id}     token + origin      -> edit title/priority/smith
  *   POST /api/orders/{id}/move token + origin      -> move between states
+ *   DELETE /api/orders/{id}   token + origin      -> delete one order, 200
  *
  * Movement is its own route and is deliberately not a field of the edit body:
  * an edit must not be able to become a transition by accident.
@@ -558,7 +559,7 @@
 
   // -- the Order Board -------------------------------------------------
   //
-  // Five endpoints, one pure renderer, and no state of its own. `board.js` holds
+  // Six endpoints, one pure renderer, and no state of its own. `board.js` holds
   // every decision about how an order looks; this section only fetches, calls the
   // renderer, and posts. The rules it keeps:
   //
@@ -573,10 +574,11 @@
   //
   //  - A REFUSED COMMAND SAYS SO. A 422 or 404 puts the server's own detail in
   //    the board note rather than optimistically moving a card the server did not
-  //    move.
+  //    move. A refused delete in particular leaves the card exactly where it was.
   //
   //  - ORDERS DO NOT RUN ANYTHING. Nothing here starts a run or reaches the
-  //    conversation pane. The board is inert by construction, not by a flag.
+  //    conversation pane, and deleting an Order triggers no agent behaviour. The
+  //    board is inert by construction, not by a flag.
 
   var board = {
     el: {
@@ -700,7 +702,7 @@
       // The backend's own status/label pairs, so a move button spells a state
       // exactly as the column heading for it does.
       (board.payload && board.payload.columns) || [],
-      { onMove: moveOrder }
+      { onMove: moveOrder, onDelete: deleteOrder }
     );
     board.el.overlay.hidden = false;
   }
@@ -727,6 +729,34 @@
       })
       .catch(function (error) {
         boardNote("Could not move " + orderId + ": " + error.message);
+      });
+  }
+
+  function deleteOrder(orderId, title) {
+    /* Remove one order, permanently.
+
+     * Two things this deliberately does not do. It does not touch the card before
+     * the server has answered -- a card that vanishes on click and comes back when
+     * the delete is refused is worse than one that never moved. And it does not
+     * re-read the board to decide whether the delete worked: the server's answer
+     * is the only authority, so a 200 that removed a different order still leaves
+     * the board showing the server's truth.
+     */
+    return boardRequest("/api/orders/" + encodeURIComponent(orderId), {
+      method: "DELETE",
+    })
+      .then(function (order) {
+        closeOrder();
+        // The server's own payload, not the title we were handed: an order edited
+        // in another tab is deleted by the name it had when it went.
+        return refreshBoard().then(function () {
+          boardNote("Deleted " + (order && order.order_id ? order.order_id : orderId) + ".");
+        });
+      })
+      .catch(function (error) {
+        // The dialog stays open and the card stays on the board, so the operator
+        // can read the reason against the order it belongs to and try again.
+        boardNote("Could not delete " + orderId + ": " + error.message);
       });
   }
 

@@ -992,6 +992,86 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .order-move-button:disabled { opacity: 0.85; }
 
+/* Deletion. The only destructive control in the board, and it lives at the bottom
+   of the details dialog with space above it, so it cannot be reached by a pointer
+   travelling from the move buttons.
+
+   Destructive is signalled three ways, never by colour alone: the word "Delete" on
+   the button, a boxed border rather than the flat fill the move buttons use, and
+   the hot accent. A colour-blind operator, an operator on a dimmed screen, and a
+   screen reader all get the same information from the first two. */
+.order-danger {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--edge);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.order-delete-trigger,
+.order-delete-confirm-button,
+.order-delete-cancel {
+  font: inherit;
+  font-size: 12px;
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  cursor: pointer;
+  background: transparent;
+}
+
+/* The trigger and the confirming button: a border, so the control reads as
+   outlined-and-separate rather than as another member of the button row. */
+.order-delete-trigger,
+.order-delete-confirm-button {
+  border: 1px solid var(--hot);
+  color: var(--hot);
+  font-weight: 600;
+}
+
+.order-delete-trigger:hover,
+.order-delete-confirm-button:hover { background: var(--hot-soft); color: var(--hot); }
+
+.order-delete-trigger:focus-visible,
+.order-delete-confirm-button:focus-visible,
+.order-delete-cancel:focus-visible {
+  outline: 2px solid var(--hot);
+  outline-offset: 1px;
+}
+
+/* Cancel is deliberately plain: it is the safe answer, and it must not look like
+   the other half of a two-button pair where both halves are equally weighted. */
+.order-delete-cancel {
+  border: 1px solid var(--edge);
+  color: var(--ink-dim);
+}
+
+.order-delete-cancel:hover { color: var(--ink); border-color: var(--edge-hot); }
+
+/* The question. Hidden until asked for, and given its own explicit rule: a
+   `display` declaration on .order-delete-confirm would otherwise beat the user
+   agent's `[hidden]` and leave the confirmation painted over the dialog. */
+.order-delete-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  border: 1px dashed var(--edge-hot);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.order-delete-confirm[hidden] { display: none; }
+
+.order-delete-prompt {
+  margin: 0;
+  flex: 1 1 100%;
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
 .order-close {
   position: absolute;
   top: 10px;

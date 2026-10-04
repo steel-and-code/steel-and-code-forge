@@ -601,6 +601,83 @@ def test_the_probe_reports_no_failures(request: pytest.FixtureRequest, view: str
     )
 
 
+def test_the_delete_confirmation_names_the_order_and_its_title(
+    laptop: dict[str, object],
+) -> None:
+    """The requirement, measured in the engine rather than read off the markup.
+
+    The stub DOM test proves the renderer builds the text; this proves the page
+    actually shows that text, which is the property an operator depends on.
+    """
+    assert "ORD-0002" in str(laptop["deletePrompt"])
+    assert "Draw out the bar" in str(laptop["deletePrompt"])
+
+
+def test_the_delete_confirmation_starts_hidden(laptop: dict[str, object]) -> None:
+    """One click on Delete must not delete anything, so the question is asked first."""
+    assert laptop["confirmationHiddenBeforeClick"] is True
+
+
+def test_cancelling_the_delete_leaves_the_order_on_the_board(
+    laptop: dict[str, object],
+) -> None:
+    assert laptop["cancelIssuedNothing"] is True, (
+        f"cancelling issued a request: {laptop.get('deleteRequests')}"
+    )
+
+
+def test_a_confirmed_delete_removes_the_card_from_the_board(
+    laptop: dict[str, object],
+) -> None:
+    assert laptop["deletedCardGone"] is True
+
+
+def test_a_confirmed_delete_issues_exactly_one_request_for_that_order(
+    laptop: dict[str, object],
+) -> None:
+    """One DELETE per confirmation, each naming the order it was asked to remove.
+
+    Two requests in total, and both are correct: the first is the delete the stub
+    refused, which has to reach the server to be refused at all, and the second is
+    the confirmed one. Cancelling issued none -- that is
+    :func:`test_cancelling_the_delete_leaves_the_order_on_the_board`.
+    """
+    assert laptop["deleteRequests"] == [
+        "DELETE /api/orders/ORD-0002",
+        "DELETE /api/orders/ORD-0003",
+    ]
+
+
+def test_a_confirmed_delete_closes_the_dialog(laptop: dict[str, object]) -> None:
+    assert laptop["overlayHidden"] is True
+
+
+def test_a_failed_delete_leaves_the_card_on_the_board(
+    laptop: dict[str, object],
+) -> None:
+    """The requirement: a refused delete must not remove anything."""
+    assert laptop["failedDeleteCardVisible"] is True
+
+
+def test_a_failed_delete_reports_the_servers_own_reason(
+    laptop: dict[str, object],
+) -> None:
+    note = str(laptop["failedDeleteNote"])
+
+    assert note.startswith("Could not delete")
+    assert "ORD-0002" in note
+    assert "not valid JSON" in note, (
+        f"the board note invented its own reason: {note!r}"
+    )
+
+
+def test_a_confirmed_delete_says_what_it_removed(laptop: dict[str, object]) -> None:
+    note = str(laptop["deleteNote"])
+
+    assert "ORD-0003" in note
+    assert "Could not" not in note
+
+
 def test_the_probe_file_is_where_the_driver_expects_it() -> None:
     """A moved probe would skip rather than fail, silently checking nothing."""
     assert PROBE_JS.exists(), f"probe script missing at {PROBE_JS}"

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures
+import contextlib
 import json
 import pathlib
 import sys
@@ -275,8 +276,10 @@ def test_the_next_id_ignores_a_deleted_order_rather_than_reusing_it(
 ) -> None:
     """Deleting the last order must not make the next one its number.
 
-    There is no delete feature in the MVP, but the file is hand-editable, and
-    the counter has to be safe against an operator doing exactly this.
+    Originally written against a board with no delete feature, back when the only
+    way to remove an order was for an operator to edit the file by hand. The file
+    is still hand-editable, and :meth:`OrderStore.delete` now does the same thing
+    through the store -- so this remains the rule for both paths.
     """
     store = OrderStore(workspace)
     store.create(title="One")
@@ -972,6 +975,351 @@ def test_an_unwritable_location_is_reported_rather_than_swallowed(
 
 
 # --------------------------------------------------------------------------
+# Delete
+# --------------------------------------------------------------------------
+#
+# A hard delete of one order, and nothing else: no archive, no soft delete, no
+# history. The three properties that make it safe are checked here rather than
+# assumed -- it is atomic like every other write, it fails visibly over a corrupt
+# file, and it never reuses a number.
+
+
+def test_an_order_can_be_deleted(store: OrderStore) -> None:
+    created = store.create(title="Slate")
+
+    deleted = store.delete(created.order_id)
+
+    assert deleted.order_id == created.order_id
+    assert deleted.title == "Slate"
+
+
+def test_a_deleted_order_is_gone_from_the_board(store: OrderStore) -> None:
+    store.create(title="Slate")
+    store.create(title="Tongs")
+
+    store.delete("ORD-0001")
+
+    assert [order.order_id for order in store.board().orders] == ["ORD-0002"]
+
+
+def test_a_deleted_order_is_not_found_afterwards(store: OrderStore) -> None:
+    store.create(title="Slate")
+
+    store.delete("ORD-0001")
+
+    with pytest.raises(UnknownOrder):
+        store.get("ORD-0001")
+
+
+def test_deleting_an_unknown_order_is_reported(store: OrderStore) -> None:
+    store.create(title="Slate")
+
+    with pytest.raises(UnknownOrder):
+        store.delete("ORD-0404")
+
+
+def test_a_refused_delete_writes_nothing(store: OrderStore) -> None:
+    store.create(title="Slate")
+    before = store.path.read_text(encoding="utf-8")
+
+    with pytest.raises(UnknownOrder):
+        store.delete("ORD-0404")
+
+    assert store.path.read_text(encoding="utf-8") == before
+
+
+def test_a_delete_leaves_the_other_orders_alone(store: OrderStore) -> None:
+    store.create(title="Slate")
+    store.create(title="Tongs")
+    store.create(title="Bar", smith="Byte", description="Flatten to 6mm")
+
+    store.delete("ORD-0002")
+
+    remaining = {order.order_id: order for order in store.board().orders}
+    assert set(remaining) == {"ORD-0001", "ORD-0003"}
+    assert remaining["ORD-0003"].smith == "Byte"
+    assert remaining["ORD-0003"].description == "Flatten to 6mm"
+
+
+def test_deleting_every_order_leaves_an_empty_board(store: OrderStore) -> None:
+    store.create(title="One")
+    store.create(title="Two")
+
+    store.delete("ORD-0001")
+    store.delete("ORD-0002")
+
+    assert store.board().orders == ()
+
+
+def test_a_delete_survives_a_reload(workspace: pathlib.Path) -> None:
+    """The file, not the store object, is what remembers a deletion.
+
+    Checked with a brand-new store over the same path, so a delete that only
+    mutated an in-memory board would fail here.
+    """
+    store = OrderStore(workspace)
+    store.create(title="Slate")
+    store.create(title="Tongs")
+
+    store.delete("ORD-0001")
+
+    assert [order.order_id for order in OrderStore(workspace).board().orders] == [
+        "ORD-0002"
+    ]
+
+
+def test_a_delete_leaves_no_temporary_file_behind(store: OrderStore) -> None:
+    store.create(title="Slate")
+
+    store.delete("ORD-0001")
+
+    assert sorted(p.name for p in store.path.parent.iterdir()) == ["orders.json"]
+
+
+# --------------------------------------------------------------------------
+# Ids after a delete
+# --------------------------------------------------------------------------
+
+
+def test_deleting_the_highest_order_does_not_reuse_its_number(
+    store: OrderStore,
+) -> None:
+    """The dangerous direction: the deleted id was the highest one present.
+
+    A counter derived from ``len(orders)`` would mint this exact number again, so
+    the operator would see two different orders answer to one id over time.
+    """
+    for n in range(3):
+        store.create(title=f"Blade {n}")
+
+    store.delete("ORD-0003")
+
+    assert store.create(title="Four").order_id == "ORD-0004"
+
+
+def test_deleting_a_middle_order_does_not_reuse_a_number(store: OrderStore) -> None:
+    store.create(title="One")
+    store.create(title="Two")
+    store.create(title="Three")
+
+    store.delete("ORD-0002")
+
+    assert store.create(title="Four").order_id == "ORD-0004"
+
+
+def test_deleting_an_order_does_not_lower_the_stored_counter(store: OrderStore) -> None:
+    """The counter is written back unchanged, not recomputed from what is left."""
+    store.create(title="One")
+    store.create(title="Two")
+
+    store.delete("ORD-0002")
+
+    assert document_of(store)["next_id"] == "ORD-0003"
+
+
+def test_the_counter_stays_monotonic_across_a_run_of_deletes(store: OrderStore) -> None:
+    for n in range(4):
+        store.create(title=f"Blade {n}")
+
+    for order_id in ("ORD-0004", "ORD-0001", "ORD-0003"):
+        store.delete(order_id)
+
+    minted = [store.create(title=f"Later {n}").order_id for n in range(3)]
+    assert minted == ["ORD-0005", "ORD-0006", "ORD-0007"], (
+        "numbering walked backwards or closed a gap after deletions"
+    )
+
+
+def test_deleting_every_order_does_not_restart_the_sequence(store: OrderStore) -> None:
+    for n in range(3):
+        store.create(title=f"Blade {n}")
+    for order_id in ("ORD-0001", "ORD-0002", "ORD-0003"):
+        store.delete(order_id)
+
+    assert store.create(title="Fresh").order_id == "ORD-0004"
+
+
+def test_a_deleted_id_is_not_reissued_after_a_restart(workspace: pathlib.Path) -> None:
+    store = OrderStore(workspace)
+    for n in range(3):
+        store.create(title=f"Blade {n}")
+    store.delete("ORD-0003")
+
+    assert OrderStore(workspace).create(title="Four").order_id == "ORD-0004"
+
+
+def test_the_ids_left_on_the_board_stay_unique_after_deletes(store: OrderStore) -> None:
+    for n in range(5):
+        store.create(title=f"Blade {n}")
+
+    store.delete("ORD-0002")
+    store.delete("ORD-0004")
+    store.create(title="Six")
+
+    ids = [order.order_id for order in store.board().orders]
+    assert len(set(ids)) == len(ids), f"a duplicate id survived: {ids}"
+
+
+# --------------------------------------------------------------------------
+# Delete is fail-visible
+# --------------------------------------------------------------------------
+
+
+def test_a_delete_over_a_corrupt_file_is_refused_rather_than_replacing_it(
+    store: OrderStore,
+) -> None:
+    """The ruling the board was built on, applied to the new mutation.
+
+    A delete that loaded a corrupt file as an empty board and wrote it back would
+    discard every order on the board, and would do it while looking like a
+    successful cleanup.
+    """
+    store.create(title="Slate")
+    store.path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(OrderStoreError):
+        store.delete("ORD-0001")
+
+    assert store.path.read_text(encoding="utf-8") == "{not json"
+
+
+def test_a_delete_of_an_order_in_a_corrupt_board_is_refused(
+    store: OrderStore,
+) -> None:
+    store.create(title="Slate")
+    store.path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(OrderStoreError):
+        store.delete("ORD-0404")
+
+    assert store.path.read_text(encoding="utf-8") == "{not json"
+
+
+def test_a_delete_into_an_unwritable_location_is_reported(tmp_path: pathlib.Path) -> None:
+    blocked = tmp_path / "blocked"
+    (blocked / ".forge" / "orders.json").mkdir(parents=True)
+
+    with pytest.raises(OrderStoreError):
+        OrderStore(blocked).delete("ORD-0001")
+
+
+# --------------------------------------------------------------------------
+# Delete under contention
+# --------------------------------------------------------------------------
+
+
+def test_a_create_racing_a_delete_leaves_a_whole_board(workspace: pathlib.Path) -> None:
+    """The lost-update case between the two mutations that rewrite the document.
+
+    A delete that read before a create landed would write back a board without
+    the new order; a create that read before the delete landed would resurrect
+    the deleted one. Both hold the same lock, so exactly one of the two orders
+    must be on the board afterwards -- never both and never neither.
+    """
+    store = OrderStore(workspace)
+    doomed = store.create(title="Doomed")
+    barrier = threading.Barrier(2)
+
+    def delete() -> None:
+        barrier.wait()
+        store.delete(doomed.order_id)
+
+    def create() -> None:
+        barrier.wait()
+        store.create(title="Concurrent")
+
+    threads = [threading.Thread(target=delete), threading.Thread(target=create)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    titles = sorted(order.title for order in store.board().orders)
+    assert len(titles) == 1, f"an update was lost or a delete was undone: {titles}"
+    assert titles[0] == "Doomed" or titles[0] == "Concurrent"
+
+
+def test_concurrent_deletes_and_creates_leave_valid_json_and_unique_ids(
+    workspace: pathlib.Path,
+) -> None:
+    """Both mutations hammering one file: the file stays parseable, ids stay unique.
+
+    The atomic-replace claim and the lock claim together. A writer that lost the
+    lock would produce either an unparseable document or two orders sharing an id,
+    and both are operator-visible.
+    """
+    store = OrderStore(workspace)
+    seeded = [store.create(title=f"Seed {n}").order_id for n in range(4)]
+
+    def churn(n: int) -> None:
+        # Twelve workers over four seeded ids means most deletes name an order
+        # another worker already removed, and the store answers that with
+        # UnknownOrder. That refusal is correct -- this test is about the file,
+        # not about every delete succeeding.
+        with contextlib.suppress(UnknownOrder):
+            store.delete(seeded[n % len(seeded)])
+        store.create(title=f"Fresh {n}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(churn, range(12)))
+
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+    ids = [order["order_id"] for order in document["orders"]]
+    assert document["version"] == 1
+    assert len(ids) == len(set(ids)), f"a duplicate id was minted: {sorted(ids)}"
+    assert sorted(p.name for p in store.path.parent.iterdir()) == ["orders.json"]
+
+
+def test_the_document_stays_valid_while_deletes_and_creates_interleave(
+    workspace: pathlib.Path,
+) -> None:
+    """A reader at any moment sees a whole board, never a half-written one."""
+    store = OrderStore(workspace)
+    path = store.path
+    seeded = [store.create(title=f"Seed {n}").order_id for n in range(3)]
+    stop = threading.Event()
+    bad: list[str] = []
+    reads = [0]
+
+    def writer(n: int) -> None:
+        with contextlib.suppress(UnknownOrder):
+            store.delete(seeded[n % len(seeded)])
+        store.create(title=f"Fresh {n}")
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            try:
+                document = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                bad.append(f"unparseable document: {exc}")
+                stop.set()
+                return
+            if not isinstance(document.get("orders"), list):
+                bad.append(f"malformed document: {list(document)[:5]}")
+                stop.set()
+                return
+            reads[0] += 1
+
+    readers = [threading.Thread(target=reader, daemon=True) for _ in range(2)]
+    for thread in readers:
+        thread.start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(writer, range(12)))
+    finally:
+        stop.set()
+        for thread in readers:
+            thread.join(timeout=5)
+
+    assert not bad, bad[0]
+    assert reads[0] > 0, "the reader never observed the file; the test proved nothing"
+
+
+# --------------------------------------------------------------------------
 # Concurrency
 # --------------------------------------------------------------------------
 #
@@ -1243,7 +1591,7 @@ def test_the_architecture_document_records_the_boards_storage_and_routes() -> No
         "the 'an id is never reused' decision must be stated, not implied"
     )
 
-    # The five routes and the read-versus-command split.
+    # The six routes and the read-versus-command split.
     for route in (
         "/api/orders",
         "/api/orders/{id}",
@@ -1251,14 +1599,26 @@ def test_the_architecture_document_records_the_boards_storage_and_routes() -> No
     ):
         assert route in doc, f"{route} is not in the route table"
     assert "PATCH" in flat, "the edit route must be documented"
+    assert "DELETE" in flat, "the delete route must be documented"
 
     # Movement separate from editing.
     assert "Movement is not editing" in flat
 
     # No execution semantics, and the named exclusions.
     assert "no execution semantics" in flat
-    for excluded in ("delete", "drag-and-drop", "history", "Git metadata"):
+    for excluded in ("drag-and-drop", "history", "Git metadata"):
         assert excluded in flat, f"the exclusion of {excluded} is not recorded"
+
+    # Deletion: a hard delete of one order, and the properties that make it safe.
+    # Asserted positively, because a document that had simply deleted the word
+    # "delete" would satisfy every guard above.
+    assert "DELETE /api/orders/{id}" in flat
+    assert "never intentionally reused" in flat, (
+        "deletion must not weaken the id-never-reused decision"
+    )
+    assert "hard delete" in flat.lower()
+    for excluded in ("no archive", "no bulk delete", "no soft delete"):
+        assert excluded in flat.lower(), f"'{excluded}' is not recorded as a boundary"
 
 
 def test_the_route_table_lists_every_orders_route_with_its_guard() -> None:
@@ -1277,13 +1637,13 @@ def test_the_route_table_lists_every_orders_route_with_its_guard() -> None:
         if line.strip().startswith("| `/api/orders")
     ]
 
-    assert len(orders_rows) == 5, f"expected 5 Orders routes, found {len(orders_rows)}"
+    assert len(orders_rows) == 6, f"expected 6 Orders routes, found {len(orders_rows)}"
 
     for line in orders_rows:
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         assert len(cells) == 4, f"malformed route row: {line}"
         route, method, kind, guard = cells
-        assert method in ("GET", "POST", "PATCH"), route
+        assert method in ("GET", "POST", "PATCH", "DELETE"), route
         assert kind in ("observation", "command"), route
         assert "token" in guard, f"{route} lists no token guard"
         if kind == "command":
@@ -1372,13 +1732,45 @@ def test_the_store_reaches_nothing_outside_the_standard_library_and_stdlib_typin
     assert not roots - _STDLIB_ROOTS, f"third-party import: {sorted(roots - _STDLIB_ROOTS)}"
 
 
-def test_the_store_holds_no_delete(store: OrderStore) -> None:
-    """No delete feature in this MVP.
+def test_the_store_deletes_one_order_at_a_time(store: OrderStore) -> None:
+    """Ruling: no bulk delete.
 
-    Asserted as an absent attribute, so adding one later is a deliberate change
-    that fails this test rather than a method nobody notices appearing.
+    Asserted as an absent attribute for the plural verbs, so a future
+    ``delete_many`` fails this test rather than appearing unnoticed. The singular
+    ``delete`` is expected -- it is the feature.
     """
-    assert not [name for name in dir(OrderStore) if "delete" in name or "remove" in name]
+    plural = [
+        name
+        for name in dir(OrderStore)
+        if ("delete" in name or "remove" in name) and name != "delete"
+    ]
+    assert not plural, f"a bulk or plural removal appeared: {plural}"
+
+
+def test_the_store_offers_no_archive_or_restore(store: OrderStore) -> None:
+    """Ruling: no archive yet, and no soft delete. A delete cannot be undone."""
+    banned = [
+        name
+        for name in dir(OrderStore)
+        if any(word in name.lower() for word in ("archive", "restore", "undelete", "purge"))
+    ]
+    assert not banned, f"an archive or restore path appeared: {banned}"
+
+
+def test_the_stored_document_grows_no_deleted_field(store: OrderStore) -> None:
+    """A hard delete, asserted on the file's shape rather than on a route.
+
+    Soft delete would mean a ``deleted_at`` in the document and a filter on every
+    read. The counter must not be the only thing that changes.
+    """
+    store.create(title="Slate")
+    created = store.create(title="Tongs", smith="Byte")
+    before = set(document_of(store)["orders"][0])
+
+    store.delete(created.order_id)
+
+    assert set(document_of(store)) == {"version", "next_id", "orders"}
+    assert set(document_of(store)["orders"][0]) == before
 
 
 def test_an_order_is_immutable(store: OrderStore) -> None:
