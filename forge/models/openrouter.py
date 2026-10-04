@@ -37,6 +37,7 @@ raises :class:`ContextTooLarge` and the run fails visibly.
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
@@ -49,12 +50,16 @@ from .base import (
     ModelResponse,
     ToolCall,
     Usage,
+    VerificationCode,
+    VerificationResult,
 )
 
 __all__ = [
     "OPENROUTER_API_KEY_ENV",
     "OPENROUTER_ENDPOINT",
+    "OPENROUTER_MODELS_ENDPOINT",
     "OpenRouterGateway",
+    "OpenRouterVerifier",
     "ProviderCredentialMissing",
 ]
 
@@ -64,7 +69,15 @@ OPENROUTER_API_KEY_ENV = "FORGE_OPENROUTER_API_KEY"
 
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
+#: The model *listing*. What a verification probe reads, because a listing is
+#: free and a completion is not -- see :class:`OpenRouterVerifier`.
+OPENROUTER_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/models"
+
 DEFAULT_TIMEOUT_SECONDS = 120.0
+
+#: Verification is bounded and separate from a call's timeout: a health check
+#: that takes a minute is a health check an operator will stop running.
+VERIFY_TIMEOUT_SECONDS = 5.0
 
 #: Hard ceiling on a provider error message we ever construct ourselves. Any
 #: text here is Forge's, not the provider's, but the bound is kept anyway so a
@@ -392,3 +405,223 @@ class OpenRouterGateway:
             usage=usage,
             stop_reason=first.get("finish_reason"),
         )
+
+
+class OpenRouterVerifier:
+    """A :class:`~forge.models.base.ModelVerifier` for OpenRouter.
+
+    **Why a listing rather than a completion.** The requirement is to
+    establish that the model *can be served*, as cheaply and as safely as
+    possible. OpenRouter exposes ``GET /api/v1/models``, which costs nothing,
+    generates no tokens, cannot be billed, cannot enter a tool loop, and
+    answers with exactly the question being asked -- is this model offered?
+    A one-token completion would additionally prove the model *answers*, at the
+    price of spending money on every status check and generating text nobody
+    asked for. The listing is the cheapest check that reliably establishes
+    usability.
+
+    **Bounded by construction.** One attempt per model, no retries, no backoff,
+    and a default timeout of five seconds separate from a call's own. There is
+    no code path here that reaches :meth:`OpenRouterGateway.complete`.
+
+    **Same credential rules as the gateway.** The key is read from the injected
+    mapping, travels only in the ``Authorization`` header, and a missing key is
+    a *result* here rather than a construction failure: verification must report
+    on a configuration it was handed, and refusing to be constructed would leave
+    an operator with a status view that says nothing instead of one that says
+    why.
+
+    Args:
+        environ: The credential mapping, injected exactly as the gateway takes
+            it. A test never mutates the process environment to exercise this.
+        endpoint: Override for the listing URL. For testing and for a
+            self-hosted route; not a policy hook.
+        timeout: Seconds per attempt.
+    """
+
+    def __init__(
+        self,
+        *,
+        environ: Mapping[str, str],
+        endpoint: str = OPENROUTER_MODELS_ENDPOINT,
+        timeout: float = VERIFY_TIMEOUT_SECONDS,
+    ) -> None:
+        # Read the key but hold it privately and never expose it: a verifier
+        # formats itself into status output, so an attribute named like a
+        # secret is a secret one repr away from a terminal.
+        self._api_key = environ.get(OPENROUTER_API_KEY_ENV, "").strip()
+        self._endpoint = endpoint
+        self._timeout = timeout
+
+    def verify(self, model: str) -> VerificationResult:
+        """Check ``model`` once. Returns a result; never raises."""
+        if not self._api_key:
+            return VerificationResult.failure(
+                model,
+                VerificationCode.CREDENTIAL_MISSING,
+                reason=(
+                    f"{OPENROUTER_API_KEY_ENV} is not set, so OpenRouter could "
+                    "not be asked whether it serves this model"
+                ),
+                detail="no credential was presented",
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Accept": "application/json",
+            "HTTP-Referer": "https://steelandcode.com",
+            "X-Title": "Steel & Code Forge",
+        }
+
+        try:
+            status, text = self._get(self._endpoint, headers, self._timeout)
+        except urllib.error.HTTPError as exc:
+            # A real HTTP error. The body is read for nothing: an error body is
+            # where a provider echoes the request that carried the header.
+            status = int(exc.code)
+            text = ""
+        except (socket.timeout, TimeoutError):
+            return VerificationResult.failure(
+                model,
+                VerificationCode.TIMEOUT,
+                reason=(
+                    f"OpenRouter did not answer the model listing within "
+                    f"{self._timeout:g}s"
+                ),
+                detail="timeout",
+            )
+        except urllib.error.URLError as exc:
+            return self._transport_failure(model, exc)
+        except OSError as exc:
+            return self._transport_failure(model, exc)
+
+        if status in (401, 403):
+            return VerificationResult.failure(
+                model,
+                VerificationCode.UNAUTHENTICATED,
+                reason=(
+                    f"OpenRouter rejected the credential presented as "
+                    f"{OPENROUTER_API_KEY_ENV} (HTTP {status})"
+                ),
+                detail=f"http {status}",
+            )
+
+        if status != 200:
+            return VerificationResult.failure(
+                model,
+                VerificationCode.UNREACHABLE,
+                reason=f"OpenRouter returned HTTP {status} for the model listing",
+                detail=f"http {status}",
+            )
+
+        ids, malformed = _parse_model_listing(text)
+        if malformed:
+            return VerificationResult.failure(
+                model,
+                VerificationCode.MALFORMED_RESPONSE,
+                reason=(
+                    "OpenRouter returned a model listing this verifier cannot "
+                    f"use ({malformed})"
+                ),
+                detail="unparseable listing",
+            )
+
+        if model in ids:
+            return VerificationResult.success(
+                model,
+                reason="OpenRouter lists this model and accepted the credential",
+                detail=f"{len(ids)} model(s) listed",
+            )
+
+        return VerificationResult.failure(
+            model,
+            VerificationCode.NOT_FOUND,
+            reason=(
+                "OpenRouter accepted the credential but does not list this "
+                "model; the provider answered and the model is absent"
+            ),
+            detail=f"{len(ids)} model(s) listed",
+        )
+
+    def _get(self, url: str, headers: dict[str, str], timeout: float) -> tuple[int, str]:
+        """One GET, returning ``(status, body_text)``.
+
+        Separated from :meth:`verify` for the same reason the gateway separates
+        its transport from :meth:`complete`: tests substitute transport without
+        substituting the decision about what a failure means.
+        """
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status), response.read().decode(
+                "utf-8", errors="replace"
+            )
+
+    @staticmethod
+    def _transport_failure(
+        model: str, exc: urllib.error.URLError | OSError
+    ) -> VerificationResult:
+        """Name the exception type, never its message.
+
+        A URL or a socket error can quote a URL with a query string, and the
+        habit established by :class:`OpenRouterGateway` is that nothing that
+        reached a provider is repeated outward.
+
+        The wording names the cause rather than only the symptom, because the
+        two common causes have different fixes: a DNS or TLS failure is an
+        environment problem, and anything else is the provider being down. The
+        exception type is included so the operator can tell which without
+        guessing, and it is a class name rather than a message so nothing
+        provider-supplied is carried outward.
+        """
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return VerificationResult.failure(
+                model,
+                VerificationCode.TIMEOUT,
+                reason="OpenRouter did not answer the model listing in time",
+                detail="timeout",
+            )
+        kind = type(reason).__name__
+        return VerificationResult.failure(
+            model,
+            VerificationCode.UNREACHABLE,
+            reason=(
+                f"OpenRouter endpoint unreachable; the provider could not be "
+                f"contacted ({kind})"
+            ),
+            detail=kind,
+        )
+
+
+def _parse_model_listing(text: str) -> tuple[frozenset[str], str]:
+    """The model ids in a listing body, plus a short shape complaint.
+
+    Shared with the local verifier by way of :mod:`forge.models.verify`, which
+    calls the same OpenAI-compatible ``{"data": [{"id": ...}]}`` shape. A body
+    that is not this shape returns a complaint rather than raising, so a
+    provider that changes its listing format produces a reportable status
+    instead of a traceback.
+    """
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        return frozenset(), f"{exc.__class__.__name__}"
+
+    if not isinstance(payload, dict):
+        return frozenset(), "expected an object"
+
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        return frozenset(), "no data array"
+
+    ids: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            identifier = entry.get("id")
+            if isinstance(identifier, str) and identifier.strip():
+                ids.add(identifier.strip())
+
+    if not ids:
+        return frozenset(), "no usable model ids"
+
+    return frozenset(ids), ""

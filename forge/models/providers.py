@@ -27,12 +27,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
-__all__ = ["ProviderSpec", "ProviderCatalog", "GatewayFactory"]
+__all__ = [
+    "ProviderSpec",
+    "ProviderCatalog",
+    "GatewayFactory",
+    "VerifierFactory",
+]
 
 
 #: Builds a gateway. Takes no arguments here; credential lookup happens inside
 #: the gateway, which is the layer that owns credentials.
 GatewayFactory = Callable[[], object]
+
+#: Builds a verifier. Takes an injected credential mapping -- a verifier reads a
+#: credential to present it, so it is handed one explicitly rather than reading
+#: ``os.environ``. The verifier factory is the *credential-touching* layer for
+#: health, and saying so in the type is what keeps ``forge models status``
+#: (without ``--verify``) from having any reason to import one.
+VerifierFactory = Callable[[Mapping[str, str]], object]
 
 
 @dataclass(frozen=True)
@@ -49,11 +61,24 @@ class ProviderSpec:
             one, and cannot leak one -- it does not import ``os`` to do so.
         gateway_factory: Builds the gateway, or ``None`` when no implementation
             is registered yet.
+        verifier_factory: Builds this provider's
+            :class:`~forge.models.base.ModelVerifier`, or ``None`` when
+            verification is not implemented.
+
+            Deliberately a **separate field** rather than a second method on the
+            gateway. The gateway Protocol documents defending its one-method
+            shape, and verification is not a completion: it must never grow a
+            retry loop, a tool path, or the ability to generate a token, all of
+            which a shared interface would make someone else's problem to
+            enforce. A provider with a gateway but no verifier is *declared but
+            unchecked*, which :meth:`ProviderCatalog.verifier_for` reports as
+            ``None`` rather than guessing at.
     """
 
     name: str
     credential_env: str | None = None
     gateway_factory: GatewayFactory | None = None
+    verifier_factory: VerifierFactory | None = None
 
     @property
     def routable(self) -> bool:
@@ -64,6 +89,17 @@ class ProviderSpec:
         :class:`~forge.models.registry.Availability` is for.
         """
         return self.gateway_factory is not None
+
+    @property
+    def verifiable(self) -> bool:
+        """Whether Forge can actively check this provider.
+
+        Distinct from :attr:`routable`: Forge may be able to send a request to a
+        provider it cannot check (an unimplemented verifier), and treating the
+        two as the same fact is how "we could have asked but did not" turns into
+        a confident green.
+        """
+        return self.verifier_factory is not None
 
 
 def _openrouter_factory() -> object:
@@ -79,10 +115,34 @@ def _openrouter_factory() -> object:
     return OpenRouterGateway
 
 
+def _openrouter_verifier_factory(environ: Mapping[str, str]) -> object:
+    """Build an OpenRouter verifier, handed the credential mapping.
+
+    Imported by name for the same reason as the gateway factory above.
+    """
+    from .openrouter import OpenRouterVerifier
+
+    return OpenRouterVerifier(environ=environ)
+
+
 def _local_factory() -> object:
     from .local import LocalLlamaGateway
 
     return LocalLlamaGateway
+
+
+def _local_verifier_factory(environ: Mapping[str, str]) -> object:
+    """Build a local verifier.
+
+    ``environ`` is accepted and ignored: a loopback endpoint takes no
+    credential, and the parameter exists so every verifier factory has one
+    shape rather than each call site checking which kind it has.
+    """
+    del environ
+
+    from .local import LocalLlamaVerifier
+
+    return LocalLlamaVerifier()
 
 
 class ProviderCatalog:
@@ -112,11 +172,13 @@ class ProviderCatalog:
                     name="openrouter",
                     credential_env="FORGE_OPENROUTER_API_KEY",
                     gateway_factory=_openrouter_factory,
+                    verifier_factory=_openrouter_verifier_factory,
                 ),
                 "local": ProviderSpec(
                     name="local",
                     credential_env=None,
                     gateway_factory=_local_factory,
+                    verifier_factory=_local_verifier_factory,
                 ),
                 # Declared, not implemented. Configuration naming these parses
                 # and validates; routing to them reports why it cannot.
@@ -155,3 +217,27 @@ class ProviderCatalog:
         """The factory for ``name``, or ``None`` if unknown or unimplemented."""
         spec = self.spec(name)
         return spec.gateway_factory if spec is not None else None
+
+    def verifier_for(self, name: str) -> VerifierFactory | None:
+        """The verifier factory for ``name``, or ``None`` if there is none.
+
+        ``None`` covers both an unknown provider and one that is routable but
+        not verifiable. The distinction between "cannot be checked" and "checked
+        and failed" belongs to whoever asked -- a probe reports the first as
+        :class:`~forge.models.base.VerificationCode.UNIMPLEMENTED` and the
+        second with whatever the provider actually said, and this method is the
+        only thing that distinguishes them beforehand.
+        """
+        spec = self.spec(name)
+        return spec.verifier_factory if spec is not None else None
+
+    def verifiable_providers(self) -> tuple[str, ...]:
+        """Names of providers Forge can actively check.
+
+        Named here rather than in a probe module so "which providers can Forge
+        verify" is answered by the same table that answers "which providers does
+        Forge know".
+        """
+        return tuple(
+            name for name, spec in self._specs.items() if spec.verifier_factory
+        )

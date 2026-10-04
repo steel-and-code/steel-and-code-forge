@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import socket
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
@@ -20,12 +21,19 @@ from .base import (
     ModelResponse,
     ToolCall,
     Usage,
+    VerificationCode,
+    VerificationResult,
 )
 import re
 import xml.etree.ElementTree as ET
 
 LOCAL_LLAMA_ENDPOINT = "http://127.0.0.1:8080/v1/chat/completions"
+LOCAL_LLAMA_MODELS_ENDPOINT = "http://127.0.0.1:8080/v1/models"
 DEFAULT_TIMEOUT_SECONDS = 120.0
+
+#: Seconds per verification attempt. Bounded and short: a health check an
+#: operator waits a minute for is a health check they stop running.
+VERIFY_TIMEOUT_SECONDS = 5.0
 
 #: The one supported override name. Named in errors, never valued in them.
 LOCAL_TIMEOUT_ENV = "FORGE_LOCAL_TIMEOUT_SECONDS"
@@ -742,3 +750,184 @@ class LocalLlamaGateway:
             found.append(value)
 
         return found
+
+
+class LocalLlamaVerifier:
+    """A :class:`~forge.models.base.ModelVerifier` for a local llama.cpp server.
+
+    Reads ``GET /v1/models`` and matches the model id. Cheap in the strongest
+    sense: a loopback request, no generation, no money, and it never touches the
+    agent runtime.
+
+    **A local endpoint takes no credential, and this sends none.** No
+    ``Authorization`` header is attached even if an operator has one in the
+    environment -- an unauthenticated loopback service has no use for it, and
+    attaching one would leak it across the machine to a process Forge does not
+    control.
+
+    **A refused connection is the common case, not an exception.** With nothing
+    listening on the port, ``urlopen`` raises immediately, so the failure an
+    operator hits most often is the fastest one to report.
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint: str = LOCAL_LLAMA_MODELS_ENDPOINT,
+        timeout: float = VERIFY_TIMEOUT_SECONDS,
+    ) -> None:
+        self._endpoint = endpoint
+        self._timeout = timeout
+
+    def verify(self, model: str) -> VerificationResult:
+        """Check ``model`` once. Returns a result; never raises."""
+        try:
+            status, text = self._get(self._endpoint, self._timeout)
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            text = ""
+        except (socket.timeout, TimeoutError):
+            return VerificationResult.failure(
+                model,
+                VerificationCode.TIMEOUT,
+                reason=(
+                    f"the local endpoint did not answer the model listing "
+                    f"within {self._timeout:g}s"
+                ),
+                detail="timeout",
+            )
+        except urllib.error.URLError as exc:
+            return self._transport_failure(model, exc)
+        except OSError as exc:
+            return self._transport_failure(model, exc)
+
+        if status == 404:
+            # A server answering but serving no listing is a different problem
+            # from no server at all, and worth saying so.
+            return VerificationResult.failure(
+                model,
+                VerificationCode.NOT_FOUND,
+                reason=(
+                    "the local endpoint answered but does not expose a model "
+                    "listing at this path"
+                ),
+                detail="http 404",
+            )
+
+        if status != 200:
+            return VerificationResult.failure(
+                model,
+                VerificationCode.UNREACHABLE,
+                reason=f"the local endpoint returned HTTP {status} for the model listing",
+                detail=f"http {status}",
+            )
+
+        ids, malformed = _parse_local_listing(text)
+        if malformed:
+            return VerificationResult.failure(
+                model,
+                VerificationCode.MALFORMED_RESPONSE,
+                reason=(
+                    "the local endpoint returned a model listing this verifier "
+                    f"cannot use ({malformed})"
+                ),
+                detail="unparseable listing",
+            )
+
+        if model in ids:
+            return VerificationResult.success(
+                model,
+                reason="the local endpoint is serving this model",
+                detail=f"{len(ids)} model(s) listed",
+            )
+
+        return VerificationResult.failure(
+            model,
+            VerificationCode.NOT_FOUND,
+            reason=(
+                "the local endpoint is running but is not serving this model; "
+                "it may not be loaded"
+            ),
+            detail=f"{len(ids)} model(s) listed",
+        )
+
+    def _get(self, url: str, timeout: float) -> tuple[int, str]:
+        """One GET, returning ``(status, body_text)``."""
+        request = urllib.request.Request(
+            url, headers={"Accept": "application/json"}, method="GET"
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status), response.read().decode(
+                "utf-8", errors="replace"
+            )
+
+    @staticmethod
+    def _transport_failure(
+        model: str, exc: urllib.error.URLError | OSError
+    ) -> VerificationResult:
+        """Name the exception type, never its message.
+
+        The exception message from a loopback failure can carry a path or a
+        socket detail that has no place in a status line.
+
+        The timeout and unreachable wordings are deliberately different, because
+        the operator's next action differs. A timeout is worth waiting out; a
+        refused connection means nothing is listening, and the cause is almost
+        always that a configured local service was never started. That is a
+        configuration fact about the machine rather than a model that cannot be
+        served, and it should read as one -- otherwise a laptop with no
+        llama.cpp running reports in the same voice as a provider outage.
+        """
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return VerificationResult.failure(
+                model,
+                VerificationCode.TIMEOUT,
+                reason=(
+                    "local endpoint unreachable; the configured service did not "
+                    "answer within the timeout and may not be running"
+                ),
+                detail="timeout",
+            )
+        return VerificationResult.failure(
+            model,
+            VerificationCode.UNREACHABLE,
+            reason=(
+                "local endpoint unreachable; configured service may not be "
+                f"running ({type(reason).__name__})"
+            ),
+            detail=type(reason).__name__,
+        )
+
+
+def _parse_local_listing(text: str) -> tuple[frozenset[str], str]:
+    """The model ids in an OpenAI-compatible listing, plus a shape complaint.
+
+    ``/v1/models`` is specified as ``{"data": [{"id": ...}, ...]}``, the same
+    shape OpenRouter serves, but parsed here rather than shared: a local server
+    is not required to track a hosted provider's exact behaviour, and coupling
+    the two would make a divergence in either one a change to both.
+    """
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        return frozenset(), f"{exc.__class__.__name__}"
+
+    if not isinstance(payload, dict):
+        return frozenset(), "expected an object"
+
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        return frozenset(), "no data array"
+
+    ids: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, dict):
+            identifier = entry.get("id")
+            if isinstance(identifier, str) and identifier.strip():
+                ids.add(identifier.strip())
+
+    if not ids:
+        return frozenset(), "no usable model ids"
+
+    return frozenset(ids), ""

@@ -526,12 +526,51 @@ def test_the_agent_profile_still_declares_no_model() -> None:
     assert BYTE.model is None
 
 
-def test_no_live_health_probe_was_introduced() -> None:
-    """Availability stays injected. Nothing here may probe a provider."""
+def test_the_cli_imports_no_http_library() -> None:
+    """The CLI still talks to no provider directly.
+
+    Verification is a deliberate feature now, but it lives in
+    ``forge.models.verify`` and is reached by importing one module -- never by
+    the CLI opening a socket or building a request itself. Scanned as an import
+    graph rather than as raw text: the word "socket" appears in prose in this
+    file describing what the offline path deliberately does *not* do, and a
+    guard that fires on a comment trains people to reword comments.
+    """
     source = Path(str(_module("forge.cli.main").__file__)).read_text()
+    tree = ast.parse(source)
+
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
 
     for banned in ("urllib", "socket", "http.client", "requests", "httpx"):
-        assert banned not in source, banned
+        assert not any(banned in name for name in imported), banned
+
+
+def test_the_offline_status_path_cannot_reach_a_probe() -> None:
+    """The default path is offline, structurally.
+
+    ``_run_models_status_offline`` is the function plain ``forge models status``
+    runs. It is scanned on its own so that adding ``--verify`` could not quietly
+    widen it -- and so that a future offline handler growing a network call
+    fails here rather than in production.
+    """
+    source = Path(str(_module("forge.cli.main").__file__)).read_text()
+    handlers = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_run_models_status_offline"
+    ]
+    assert handlers, "offline status handler not found; this guard is stale"
+
+    for handler in handlers:
+        body = ast.dump(handler)
+        assert "verify" not in body, "the offline handler must not import a probe"
+        assert "API_KEY" not in body, "the offline handler must read no credential"
 
 
 def test_the_runtime_still_receives_a_plain_model_string(

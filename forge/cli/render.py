@@ -523,6 +523,7 @@ def render_route_json(decision) -> str:
 #: into a shape an operator has to re-read per row.
 _STATUS_TIER = 18
 _STATUS_HEALTH = 7
+_STATUS_VERIFIED = 9
 _STATUS_MODEL = 34
 _STATUS_PROVIDER = 12
 _STATUS_FALLBACKS = 30
@@ -541,13 +542,19 @@ def render_model_status(
     is a column-reading task. Each row carries the model that would be used, so
     a GREEN next to an unexpected id is visible without a second command.
 
+    The VERIFIED column answers a different question from HEALTH, and printing
+    them adjacently is the point: a GREEN row reading ``unverified`` is a model
+    Forge is *configured* to use and has *not* confirmed works, which looks
+    identical to a confirmed-healthy one if the indicator is dropped.
+
     ``tiers`` is the router's status list. This function decides nothing about
-    it -- not the health, not the model, not the slot position.
+    it -- not the health, not the model, not the slot position, not whether
+    anything was verified. Presentation cannot change a health value.
     """
     header = (
         f"{'TIER':<{_STATUS_TIER}} {'HEALTH':<{_STATUS_HEALTH}} "
-        f"{'MODEL':<{_STATUS_MODEL}} {'PROVIDER':<{_STATUS_PROVIDER}} "
-        f"{'SELECTED':<11} FALLBACKS"
+        f"{'VERIFIED':<{_STATUS_VERIFIED}} {'MODEL':<{_STATUS_MODEL}} "
+        f"{'PROVIDER':<{_STATUS_PROVIDER}} {'SELECTED':<11} FALLBACKS"
     )
 
     rows = [header]
@@ -557,26 +564,197 @@ def render_model_status(
         rows.append(
             f"{entry['tier']:<{_STATUS_TIER}} "
             f"{entry['health']:<{_STATUS_HEALTH}} "
+            f"{_verified_label(entry):<{_STATUS_VERIFIED}} "
             f"{model:<{_STATUS_MODEL}} "
             f"{provider:<{_STATUS_PROVIDER}} "
             f"{entry['slot']:<11} {_fallback_list(entry)}"
         )
 
     lines = ["\n".join(rows), ""]
+
+    if verified:
+        # A degraded tier gets its reasons underneath. The table has to stay
+        # scannable, so the summary is a short sentence and the detail -- why
+        # each candidate failed -- goes below it. Without the detail a RED tier
+        # reads only as "nothing works", and the operator's next question is
+        # always "why", which is the one thing this command can answer.
+        degraded = [
+            (item["tier"], item.get("reason", ""))
+            for item in tiers
+            if item["health"] != "GREEN" and item.get("reason")
+        ]
+        if degraded:
+            lines.append("")
+            for name, reason in degraded:
+                lines.append(f"  {name:<12} {reason}")
+                lines.extend(_failed_slot_lines(tiers=tiers, tier=name))
+
+    lines.append("")
     lines.append(f"  config        {source}")
 
     if verified:
+        # Diagnostic only. Nothing below the table is read by a health value, a
+        # routing decision, or an exit code.
+        lines.extend(_provider_summary_lines(tiers))
         lines.append(
-            "  availability  reported by an injected source; health is verified"
+            "  availability  checked against each provider; health above is "
+            "verified"
         )
     else:
         lines.append(
-            f"  availability  {UNVERIFIED_NOTE}: no availability source was "
-            "supplied, so no provider was contacted. Health reflects "
-            "configuration and gateway availability only."
+            f"  availability  {UNVERIFIED_NOTE}: no provider was contacted, so "
+            "health above reflects configuration and gateway availability "
+            "only. Re-run with --verify to check."
         )
 
     return "\n".join(lines)
+
+
+#: Column width for a provider name in the verification summary.
+_SUMMARY_PROVIDER = 14
+
+#: Human-facing names for the providers Forge ships. A display concern only --
+#: configuration, routing, and `--json` all use the lowercase provider key, and a
+#: summary that renamed them would look like a second source of truth.
+_PROVIDER_LABELS = {
+    "openrouter": "OpenRouter",
+    "local": "Local",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+}
+
+
+def _provider_label(provider: str) -> str:
+    """The display name for ``provider``, or the key itself if unknown.
+
+    A provider declared only in configuration has no label here, and inventing a
+    capitalisation rule for it would be worse than showing the key the operator
+    actually wrote.
+    """
+    return _PROVIDER_LABELS.get(provider, provider)
+
+
+def _provider_summary_lines(tiers: list) -> list[str]:
+    """Per-provider "N checked, M healthy" lines.
+
+    **Presentation and diagnostics only.** This is a summary *of* the slot rows
+    already in ``tiers``: it counts them and does not decide anything. No health
+    value, routing decision, or exit code is derived here or reads from here, and
+    the summary cannot make a tier look healthier than its row says. It exists
+    because the question an operator asks after the table -- "so is the problem
+    my provider, or my laptop?" -- needs the two to be visibly separate.
+
+    **Unchecked providers are counted, not hidden.** A provider with no verifier
+    shows ``0 checked, 0 healthy, N not checked``, so "Forge could not check
+    this" is distinguishable at a glance from "Forge checked and it was broken".
+    Showing only the providers that responded would quietly omit the very case an
+    operator most needs to notice -- and a bare ``0 checked`` with no
+    explanation would be read as a failure rate rather than as "nothing was
+    asked".
+
+    Deduplicated by ``provider/model``: a model standing behind three tiers is
+    one model, and counting it three times would make a three-tier registry with
+    one shared primary look busier than it is.
+    """
+    configured: dict[str, set[str]] = {}
+    healthy: dict[str, set[str]] = {}
+    unchecked: dict[str, set[str]] = {}
+
+    for entry in tiers:
+        for slot in entry.get("slots", []):
+            provider = slot.get("provider", "")
+            if not provider:
+                continue
+            key = f"{provider}/{slot.get('model', '')}"
+            configured.setdefault(provider, set()).add(key)
+            if slot.get("verified"):
+                healthy.setdefault(provider, set()).add(key)
+            # `unimplemented` is a result *value*, not a request, so `probed` is
+            # true for it. Counting it as checked would put a never-asked provider
+            # in the same column as one that answered and failed, which is the
+            # distinction this summary exists to make. The code is the honest
+            # signal, so it is what decides.
+            elif slot.get("verify_code") == "unimplemented" or not slot.get("probed"):
+                unchecked.setdefault(provider, set()).add(key)
+
+    if not configured:
+        return []
+
+    lines = ["", "  verification summary"]
+    for provider in sorted(configured, key=lambda name: _provider_label(name).lower()):
+        total = len(configured[provider])
+        good = len(healthy.get(provider, ()))
+        skipped = len(unchecked.get(provider, ()))
+
+        # "checked" counts only what a request was actually made for. A provider
+        # whose models were all skipped counts 0, which is the honest number --
+        # and the note beside it says why, so a 0 is never mistaken for "all of
+        # them were asked about and failed".
+        detail = f"{good} healthy"
+        if skipped:
+            detail += f", {skipped} not checked"
+        if total == skipped:
+            # No model on this provider was actually asked about, so there is no
+            # health information to report at all. Saying "0 healthy" there would
+            # read as a total failure rather than as "Forge cannot check this".
+            detail = f"{total} not checked, no health information"
+        headline = f"{total - skipped} checked, {detail}"
+        lines.append(
+            f"  {_provider_label(provider):<{_SUMMARY_PROVIDER}}{headline}"
+        )
+    return lines
+
+
+def _failed_slot_lines(*, tiers: list, tier: str) -> list[str]:
+    """One indented line per slot in ``tier`` that verification **rejected**.
+
+    Two exclusions, both about not putting a wrong word in front of an operator:
+
+    *   A slot that is merely *disabled* is left out. "An operator switched this
+        off" is already visible in the FALLBACKS column, and repeating it under
+        a failure heading would read as a provider problem.
+    *   A slot that verification *succeeded* on is left out too. It is working --
+        that is the reason this tier is YELLOW rather than RED -- and listing it
+        under a degraded tier's failures would be the mirror-image mistake.
+    """
+    entry = next((item for item in tiers if item["tier"] == tier), None)
+    if entry is None:
+        return []
+
+    lines: list[str] = []
+    for slot in entry.get("slots", []):
+        reason = slot.get("verify_reason", "")
+        if not reason or not slot.get("probed"):
+            continue
+        if slot.get("verified"):
+            continue
+        lines.append(f"    {slot['provider']}/{slot['model']}: {reason}")
+    return lines
+
+
+def _verified_label(entry: dict) -> str:
+    """What to print in the VERIFIED column for one tier.
+
+    ``yes`` only when the tier's selected model was probed *and* confirmed
+    usable. A tier that selected nothing has nothing verified, so it reads
+    ``no`` -- printing ``yes`` beside a RED row would be the exact confusion
+    this column exists to prevent.
+
+    ``no`` is deliberately ambiguous between "not probed" and "probed and
+    failed". A short column cannot carry that difference and does not need to:
+    HEALTH already says whether traffic flows, and the reason line under a
+    degraded tier says why. What the column must never do is claim a check that
+    did not happen.
+    """
+    model = entry.get("model")
+    if not entry.get("verified") or not model:
+        return "no"
+
+    for slot in entry.get("slots", []):
+        if slot.get("model") == model and not slot.get("verified", False):
+            return "no"
+
+    return "yes"
 
 
 def _fallback_list(entry: dict) -> str:

@@ -37,6 +37,7 @@ Design choices that are not obvious:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Literal, Protocol, runtime_checkable
 
 __all__ = [
@@ -48,6 +49,9 @@ __all__ = [
     "CompletionRequest",
     "ModelResponse",
     "ModelGateway",
+    "VerificationCode",
+    "VerificationResult",
+    "ModelVerifier",
     "GatewayError",
     "ContextTooLarge",
 ]
@@ -232,5 +236,133 @@ class ModelGateway(Protocol):
             GatewayError: transport failure, timeout, HTTP error, or an
                 unusable body.
             ContextTooLarge: the conversation exceeds the model's window.
+        """
+        ...
+
+
+# --------------------------------------------------------------------------
+# Verification
+# --------------------------------------------------------------------------
+#
+# Deliberately *not* a second method on ``ModelGateway``. A gateway answers a
+# conversation; a verifier answers "can this model serve at all". Widening the
+# gateway Protocol would force every implementation -- including the offline
+# ``ScriptedGateway`` -- to grow a method the agent runtime has no use for, and
+# the gateway's one-method shape is a decision that layer documents defending.
+# So verification is a separate, narrower Protocol that a provider may or may
+# not implement, reached through ``ProviderSpec.verifier_factory``.
+
+
+class VerificationCode(str, Enum):
+    """Why a verification attempt came out the way it did.
+
+    A flat vocabulary rather than a bitmask, because each of these is a
+    different thing for an operator to *do*: a bad key is fixed in the
+    environment, a timeout is retried later, and a model the provider no longer
+    serves is fixed in the configuration file. Collapsing them into one boolean
+    is what makes a health display useless exactly when something breaks.
+    """
+
+    #: The provider answered and offers this model.
+    OK = "ok"
+
+    #: The provider rejected the credential (HTTP 401/403).
+    UNAUTHENTICATED = "unauthenticated"
+
+    #: No credential was available to present. A configuration fact, not proof
+    #: the model is unreachable -- hence distinct from ``UNREACHABLE``.
+    CREDENTIAL_MISSING = "credential_missing"
+
+    #: The provider did not answer within the bound. Distinct from
+    #: ``UNREACHABLE`` because it is transient and usually not the model's fault.
+    TIMEOUT = "timeout"
+
+    #: The provider answered and does not list this model.
+    NOT_FOUND = "not_found"
+
+    #: Transport failure: connection refused, DNS failure, TLS error.
+    UNREACHABLE = "unreachable"
+
+    #: The provider answered with a body this verifier cannot parse.
+    MALFORMED_RESPONSE = "malformed_response"
+
+    #: The provider has no verifier in Forge. Declared-but-unimplemented is a
+    #: first-class, reportable outcome, not a failure to construct one.
+    UNIMPLEMENTED = "unimplemented"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """The outcome of one verification attempt.
+
+    A **value, never an exception**. A verification failure is an operator-facing
+    status (``forge models status --verify``), and a traceback out of an
+    inspection command tells the operator nothing about what to fix. Every
+    construction site in ``forge/models/verify.py`` produces one of these.
+
+    Attributes:
+        model: The provider-specific model id that was checked.
+        code: The machine-readable outcome. ``VerificationCode.OK`` iff
+            :attr:`usable`.
+        reason: A bounded, operator-safe sentence. Never contains a credential
+            or provider response prose -- see :mod:`forge.models.openrouter`
+            for why a provider body is never echoed.
+        detail: Optional extra context (an HTTP status, a timeout bound). Kept
+            separate so it can be surfaced without widening :attr:`reason`.
+    """
+
+    model: str
+    code: VerificationCode
+    reason: str
+    detail: str = ""
+
+    @property
+    def usable(self) -> bool:
+        """Whether this attempt established the model could serve."""
+        return self.code is VerificationCode.OK
+
+    @classmethod
+    def success(cls, model: str, *, reason: str, detail: str = "") -> (
+        "VerificationResult"
+    ):
+        return cls(model=model, code=VerificationCode.OK, reason=reason, detail=detail)
+
+    @classmethod
+    def failure(
+        cls, model: str, code: VerificationCode, *, reason: str, detail: str = ""
+    ) -> "VerificationResult":
+        return cls(model=model, code=code, reason=reason, detail=detail)
+
+    def to_json(self) -> dict[str, object]:
+        """One flat JSON-ready object, every field present."""
+        return {
+            "model": self.model,
+            "code": self.code.value,
+            "reason": self.reason,
+            "detail": self.detail,
+            "usable": self.usable,
+        }
+
+
+@runtime_checkable
+class ModelVerifier(Protocol):
+    """Can this provider serve this model, right now, cheaply?
+
+    One method, deliberately distinct from :class:`ModelGateway`: this one is
+    for the health seam and must never grow a completion path, a retry loop, or
+    a tool-calling capability. A verifier that could generate tokens would make
+    ``forge models status --verify`` an unbounded, billable operation.
+    """
+
+    def verify(self, model: str) -> VerificationResult:
+        """Check ``model`` once and report the outcome.
+
+        Returns:
+            A :class:`VerificationResult`. **Never raises** for a provider-side
+            failure -- a transport error, a timeout, a rejected credential, or
+            an unparseable body all come back as a result value.
         """
         ...

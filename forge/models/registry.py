@@ -37,6 +37,11 @@ produce an empty registry that looks healthy.
 **No routing happens here.** Selecting a slot is ``forge.models.router``'s job,
 and health is computed here because a status view and a routing decision must
 never disagree about whether a tier is usable.
+
+**No probing happens here either.** ``forge.models.verify`` imports this
+module; this module does not import that one, does not import ``urllib``, and
+has no way to make a network call even if a future edit wanted to. A probe
+reaches health through :meth:`Availability` and nothing else.
 """
 
 from __future__ import annotations
@@ -47,10 +52,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .providers import ProviderCatalog, ProviderSpec
 from .tiers import CapabilityTier, Health, RegistryConfigError
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    from .base import VerificationResult
 
 __all__ = [
     "SlotState",
@@ -111,29 +119,54 @@ class SlotState(str, Enum):
 class Availability:
     """An injected source of "is this model usable right now".
 
-    Three forms, all offline:
+    Four forms, all offline:
 
     *   ``None`` -- nothing is known. Every enabled slot is treated as usable,
         and :attr:`verified` is False.
     *   a mapping keyed ``"provider/model"`` or a bare model id.
     *   a callable taking a :class:`ModelSlot` and returning a bool.
+    *   a mapping of ``"provider/model"`` to a
+        :class:`~forge.models.base.VerificationResult` -- what
+        ``forge models status --verify`` produces. The result's ``usable`` is
+        the availability, and its ``reason`` is kept alongside so a status view
+        can report *why* without re-deriving it.
 
-    The callable form exists so a future health probe drops into the same seam
+    The callable form exists so a health probe drops into the same seam
     with no signature change. **No form performs network I/O**, and none of them
-    may: a probe would belong in a separate module that imports this one.
+    may: a probe belongs in ``forge.models.verify``, which imports this module.
 
     A model absent from a mapping is available. Absence means "not known to be
     broken"; a mapping that must enumerate every model would make adding a
     fallback a two-place edit and would mark a newly configured model unusable
     by default, which is the dangerous direction to fail in.
+
+    The ``VerificationResult`` form is the one place a reason travels, and it is
+    still just data: this module imports the *value type* from ``base``, never a
+    verifier, so the decision path gains no ability to reach a provider.
     """
 
     def __init__(
         self,
-        source: Mapping[str, bool] | Callable[["ModelSlot"], bool] | None = None,
+        source: (
+            Mapping[str, bool]
+            | Mapping[str, "VerificationResult"]
+            | Callable[["ModelSlot"], bool]
+            | None
+        ) = None,
         *,
         verified: bool | None = None,
+        reasons: Mapping[str, str] | None = None,
+        codes: Mapping[str, str] | None = None,
     ) -> None:
+        #: Optional per-slot reason text, keyed the same way the source is.
+        #: Populated by a probe so a status consumer can explain a failure
+        #: without a second lookup table of its own.
+        self.reasons: Mapping[str, str] = dict(reasons or {})
+        #: Optional per-slot :class:`~forge.models.base.VerificationCode`
+        #: value, keyed identically. The machine-readable companion to
+        #: :attr:`reasons`: a consumer that must tell an auth failure from a
+        #: timeout should not have to pattern-match on prose.
+        self.codes: Mapping[str, str] = dict(codes or {})
         self.source = source
         #: Whether anything actually checked availability.
 
@@ -149,7 +182,7 @@ class Availability:
 
     @classmethod
     def coerce(
-        cls, value: "Availability | Mapping[str, bool] | Callable[[ModelSlot], bool] | None"
+        cls, value: "Availability | Mapping[str, bool] | Mapping[str, VerificationResult] | Callable[[ModelSlot], bool] | None"
     ) -> "Availability":
         """Accept the raw forms at the API boundary.
 
@@ -181,16 +214,82 @@ class Availability:
         """
         return cls(source={f"*{name}": False for name in models})
 
+    @classmethod
+    def verified_results(
+        cls, results: Mapping[str, "VerificationResult"]
+    ) -> "Availability":
+        """Build availability from probe results, keyed ``"provider/model"``.
+
+        ``verified`` is **True unconditionally**, and that is the point worth
+        being careful about: it means "Forge checked and here is the answer",
+        not "everything is fine". A probe that found every model broken produces
+        ``verified=True`` availability in which every slot is unavailable --
+        which is the honest report. Setting it only on a clean sweep would make
+        a total outage indistinguishable from never having looked.
+        """
+        from .base import VerificationResult as _Result
+
+        usable: dict[str, bool] = {}
+        reasons: dict[str, str] = {}
+        codes: dict[str, str] = {}
+        for key, result in results.items():
+            if not isinstance(result, _Result):  # pragma: no cover - defensive
+                continue
+            usable[key] = result.usable
+            reasons[key] = result.reason
+            codes[key] = result.code.value
+
+        return cls(source=usable, verified=True, reasons=reasons, codes=codes)
+
+    def _lookup(self, slot: "ModelSlot"):
+        """The source's entry for ``slot``, or ``None`` if it names none."""
+        if self.source is None or callable(self.source):
+            return None
+        for key in (f"{slot.provider}/{slot.model}", f"*{slot.model}", slot.model):
+            if key in self.source:
+                return self.source[key]
+        return None
+
     def available(self, slot: "ModelSlot") -> bool:
         """Whether ``slot`` is reported available by this source."""
         if self.source is None:
             return True
         if callable(self.source):
             return bool(self.source(slot))
+        found = self._lookup(slot)
+        if found is None:
+            return True
+        # A VerificationResult is truthy as an object, so availability has to be
+        # read off it explicitly. Checking the type rather than duck-typing on
+        # ``.usable`` means a plain bool mapping keeps working unchanged.
+        return bool(getattr(found, "usable", found))
+
+    def code_for(self, slot: "ModelSlot") -> str:
+        """The :class:`~forge.models.base.VerificationCode` value for ``slot``.
+
+        ``""`` when no source named this slot. Present as a machine-readable
+        field alongside the human-readable :meth:`reason_for`, because a status
+        consumer that has to match on prose to tell an auth failure from a
+        timeout is a consumer that will eventually match it wrongly. Keeping both
+        means the renderer writes the sentence and a UI binds the code.
+        """
         for key in (f"{slot.provider}/{slot.model}", f"*{slot.model}", slot.model):
-            if key in self.source:
-                return bool(self.source[key])
-        return True
+            if key in self.codes:
+                return self.codes[key]
+        return ""
+
+    def reason_for(self, slot: "ModelSlot") -> str:
+        """Why ``slot`` is available or not, or ``""`` when nothing is known.
+
+        Distinct from availability on purpose. ``available(slot) is False`` says
+        the model cannot serve; this says whether that was a rejected key, a
+        timeout, or a model the provider no longer lists -- three different
+        things for an operator to go and fix.
+        """
+        for key in (f"{slot.provider}/{slot.model}", f"*{slot.model}", slot.model):
+            if key in self.reasons:
+                return self.reasons[key]
+        return ""
 
 
 # --------------------------------------------------------------------------
@@ -407,6 +506,12 @@ class ModelRegistry:
         returns a new value rather than mutating the one a caller is holding --
         two consumers can then disagree about availability without corrupting
         each other.
+
+        Per-slot reasons travel with the source: a copy that kept availability
+        but dropped the reasons would make ``forge models status --verify`` show
+        a RED tier with nothing to explain it. ``Availability.coerce`` returns
+        the same object when handed an ``Availability``, so passing an existing
+        instance through preserves them with no special case.
         """
         return ModelRegistry(
             tiers=self.tiers,
@@ -628,6 +733,14 @@ def parse_registry(
                 name=key,
                 credential_env=credential_env or None,
                 gateway_factory=existing.gateway_factory if existing else None,
+                # Carried across for the same reason as the gateway above: a
+                # redeclaration in configuration names a credential, and
+                # silently dropping the implementation would turn a provider
+                # Forge *can* check into one it reports as unimplemented -- the
+                # exact failure `--verify` exists to remove.
+                verifier_factory=(
+                    existing.verifier_factory if existing else None
+                ),
             )
         )
 

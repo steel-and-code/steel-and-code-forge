@@ -298,6 +298,16 @@ class ModelRouter:
         into one boolean is what makes a health display lose the difference
         between "an operator switched this off" and "this is currently
         unreachable", which are different problems with different fixes.
+
+        **Verification is reported, never decided here.** ``probed`` on a slot
+        is True when a request was actually made for it, and ``verified`` is
+        True only when that request confirmed the model usable. A slot nobody
+        asked about is ``probed=False, verified=False`` with an empty
+        ``verify_reason`` -- and a slot that was asked about and rejected is
+        ``probed=True, verified=False`` with a populated one, which is the
+        difference between "Forge does not know" and "Forge knows it is
+        broken". The provider-specific HTTP producing those results lives in
+        ``forge.models.verify``; this module imports neither it nor a gateway.
         """
         health = self.health_by_tier()
         entries: list[dict[str, object]] = []
@@ -339,22 +349,101 @@ class ModelRouter:
                     "provider": decision.provider,
                     "selection": decision.selection.value,
                     "slot": slot_label,
-                    "reason": decision.reason,
+                    "fallback_index": decision.fallback_index,
+                    "reason": self._tier_reason(decision),
+                    "routing_reason": decision.reason,
                     "verified": self._registry.availability.verified,
                     "slots": [
-                        {
-                            "model": slot.model,
-                            "provider": slot.provider,
-                            "enabled": slot.enabled,
-                            "state": self._registry.slot_state(slot).value,
-                            "position": position,
-                        }
+                        self._slot_status(slot, position)
                         for position, slot in self._slots_with_positions(tier)
                     ],
                 }
             )
 
         return entries
+
+    def _slot_status(self, slot: ModelSlot, position: int) -> dict[str, object]:
+        """One slot row: its state, what verification knows, and what it found.
+
+        ``probed`` and ``verified`` are separate, and conflating them is the
+        specific failure this layer exists to prevent:
+
+        *   ``probed`` -- a request was made and answered. True whether the answer
+            was yes or no.
+        *   ``verified`` -- a request was made *and the model was confirmed
+            usable*. A slot that was never probed is ``verified=False`` because
+            nothing was learned, and a slot that was probed and rejected is also
+            ``verified=False`` because the answer was no.
+
+        Both false is a different situation from either alone, and
+        ``verify_reason`` says which: empty means nobody asked, populated means
+        somebody did and here is what happened.
+        """
+        availability = self._registry.availability
+        reason = availability.reason_for(slot)
+        probed = bool(reason) or self._was_named(slot)
+
+        return {
+            "model": slot.model,
+            "provider": slot.provider,
+            "enabled": slot.enabled,
+            "state": self._registry.slot_state(slot).value,
+            "position": position,
+            "probed": probed,
+            "verified": probed and availability.available(slot),
+            "verify_code": availability.code_for(slot),
+            "verify_reason": reason,
+            "available": availability.available(slot),
+        }
+
+    def _was_named(self, slot: ModelSlot) -> bool:
+        """Whether the availability source names this slot at all.
+
+        A mapping source can say "this model is unavailable" without any reason
+        text, and a consumer still needs to know the difference between that and
+        a slot no source ever mentioned. Both mean "not verified healthy"; only
+        one of them was actually looked at.
+        """
+        source = self._registry.availability.source
+        if source is None or callable(source):
+            return False
+        return any(
+            key in source
+            for key in (slot.key, f"*{slot.model}", slot.model)
+        )
+
+    def _tier_reason(self, decision: RouteDecision) -> str:
+        """The tier's health summary, phrased in verified terms when probed.
+
+        One sentence, and it is the *operator's* sentence rather than the
+        router's: "primary unavailable; fallback #1 verified healthy". The
+        router's own longer reason -- which names each slot and its state --
+        stays untouched on ``routing_reason``, because a routing audit wants the
+        full derivation and a status line wants the conclusion.
+
+        The two are separate fields rather than one concatenated string because
+        concatenation here produced "selected fallback #1 ..., which is enabled
+        and available; primary unavailable; fallback #1 verified healthy" --
+        the same fact twice, in two vocabularies, which is how a status view
+        stops being scannable.
+
+        Only meaningful when the registry was actually probed. An offline status
+        reports the plain routing reason, because it cannot support a claim
+        about verification.
+        """
+        if not self._registry.availability.verified:
+            return decision.reason
+
+        if decision.selection is SelectionKind.PRIMARY:
+            return "primary verified usable"
+
+        if decision.selection is SelectionKind.FALLBACK:
+            return (
+                f"primary unavailable; fallback #{decision.fallback_index} "
+                "verified healthy"
+            )
+
+        return "no verified usable model in this tier"
 
     @staticmethod
     def _slots_with_positions(tier) -> list[tuple[int, ModelSlot]]:

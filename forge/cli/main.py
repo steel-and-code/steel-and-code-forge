@@ -438,6 +438,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit one JSON object per tier, newline-delimited",
     )
+    models_status_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "actively check each configured model with its provider and report "
+            "verified health. Makes network requests (one per distinct model, "
+            "no retries, no completion), and reads the provider credential "
+            "needed to check. Without this flag no provider is contacted and "
+            "health is configuration only."
+        ),
+    )
 
     workbench_parser = sub.add_parser(
         "workbench",
@@ -1272,6 +1283,21 @@ def _run_models_status(
 ) -> int:
     """One line per capability tier.
 
+    Two paths, and the split is the important part:
+
+    *   **Offline** (the default) reports configuration only. No socket, no
+        credential, no gateway. This is what makes `forge models status` safe to
+        run anywhere, including with no key exported.
+    *   **``--verify``** asks each provider whether it can serve each configured
+        model, then reports through the *same* health computation. Verification
+        supplies facts; it never decides health, so a GREEN means exactly what it
+        meant before verification existed.
+
+    The dispatch happens here rather than inside the offline path so the offline
+    handler provably cannot reach a probe: ``tests/test_model_cli.py`` and
+    ``tests/test_model_verify.py`` both assert the offline function contains no
+    credential reference and imports no gateway.
+
     Exit code reflects the worst tier: OK when every tier is GREEN, and
     EXIT_MODEL_UNAVAILABLE when any tier is RED. A RED capability is a real
     operational problem, so a script polling status should be able to notice
@@ -1280,6 +1306,25 @@ def _run_models_status(
     YELLOW does not affect the exit code. Traffic still flows on a degraded
     tier, and a command that failed on a working -- if not ideal -- capability
     would train an operator to ignore it.
+    """
+    if getattr(args, "verify", False):
+        return _run_models_status_verified(args, environ, out=out, err=err)
+
+    return _run_models_status_offline(args, environ, out=out, err=err)
+
+
+def _run_models_status_offline(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    *,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Configuration-only health. Opens nothing, reads no credential.
+
+    Kept separate from the verified path so "plain status performs zero network
+    activity" is a structural property of a small function rather than a promise
+    about a larger one.
     """
     router = _build_router(args, environ, err=err)
     if router is None:
@@ -1299,6 +1344,65 @@ def _run_models_status(
             file=out,
         )
 
+    return _worst_tier_exit_code(entries)
+
+
+def _run_models_status_verified(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    *,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """Probe every configured model, then report the same health the offline
+    path reports.
+
+    **What this is allowed to do, and it is exactly this much.** Build a
+    verifier per provider from the catalog, make one bounded request per distinct
+    model, read the credential that request needs, and hand the results to the
+    registry through the existing ``Availability`` seam. It does not build a
+    gateway, does not generate a completion, does not retry, and does not touch
+    the agent runtime, a workspace, or approvals.
+
+    **Failure is a value here.** A provider that is down, a rejected key, a
+    timeout, or a body that will not parse all produce a reported status. This is
+    an inspection command; a traceback would tell an operator nothing about what
+    to go and fix.
+    """
+    router = _build_router(args, environ, err=err)
+    if router is None:
+        return EXIT_USAGE
+
+    # Imported here rather than at module scope for the same reason the
+    # registry is: `forge check` must not import a module that opens sockets.
+    from ..models.verify import verified_registry
+
+    verified_router = ModelRouter(
+        verified_registry(router.registry, environ=environ)
+    )
+    entries = verified_router.status()
+
+    if args.as_json:
+        print(render.render_model_status_json(entries), file=out)
+    else:
+        print(
+            render.render_model_status(
+                tiers=entries,
+                source=verified_router.registry.source,
+                verified=verified_router.registry.availability.verified,
+            ),
+            file=out,
+        )
+
+    return _worst_tier_exit_code(entries)
+
+
+def _worst_tier_exit_code(entries: list[dict[str, object]]) -> int:
+    """OK unless some tier is RED.
+
+    Shared by both status paths so verification cannot introduce a second
+    opinion about what the exit code means.
+    """
     from ..models.tiers import Health
 
     return (

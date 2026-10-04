@@ -23,16 +23,21 @@ The agent that used it does not change, because it never named it.
 ```
   forge/models/
     tiers.py       vocabulary: CapabilityTier, Health, SelectionKind
+    base.py        ModelGateway, ModelVerifier, VerificationCode/Result
     providers.py   ProviderSpec, ProviderCatalog -- names, not classes
     registry.py    ModelSlot, TierConfig, RoutingTable, Availability,
                    ModelRegistry -- configuration and health
     router.py      RouteRequest, RouteDecision, ModelRouter -- selection
+    verify.py      the probe: performs checks, returns Availability
+    openrouter.py  OpenRouterGateway + OpenRouterVerifier
+    local.py       LocalLlamaGateway + LocalLlamaVerifier
     models.toml    the packaged default registry
 ```
 
-Dependencies run one way: `router -> registry -> providers -> tiers`. Nothing in
-this chain imports a gateway, imports `forge.tools`, or opens a socket. Deciding
-is not calling.
+Dependencies run one way: `router -> registry -> providers -> tiers`, and
+`verify -> registry -> base`. Nothing in the routing chain imports a gateway,
+imports `forge.tools`, or opens a socket. Deciding is not calling, and probing
+is a separate act from both.
 
 ## Capability tiers
 
@@ -67,9 +72,9 @@ legitimate choice.
 Each slot names its own provider. A tier's fallback may be a local model while
 its primary is remote.
 
-## Configured, enabled, available
+## Configured, enabled, available, verified
 
-Three separate facts. A health display that collapses them into one boolean
+Four separate facts. A health display that collapses them into one boolean
 lies, and the distinctions have different fixes:
 
 | Fact | Meaning | Set by |
@@ -77,8 +82,9 @@ lies, and the distinctions have different fixes:
 | **configured** | The slot exists in the configuration file. | Editing the file. |
 | **enabled** | `enabled = true`. | An operator, by decision. |
 | **available** | An availability source says it could serve now. | An injected source. |
+| **verified** | Forge *asked the provider* and the provider offered this model. | A probe run. |
 
-`SlotState` records the distinction without hiding it:
+`SlotState` records the first three without hiding any of them:
 
 ```
 CONFIGURED   present and enabled; nothing says it is unusable
@@ -102,6 +108,38 @@ Precedence, and why:
 reporting otherwise is `CONFIGURED` -- present and permitted, not confirmed
 working.
 
+### The assumed/default case, stated plainly
+
+With no availability source, every enabled slot is treated as **available** and
+the registry reports `verified = False`. That is a deliberate *assumption*, not
+a finding:
+
+- **Assumed availability** is what plain `forge models status` reports. It is
+  enough to answer "what is configured and would it route", and it is worthless
+  as an answer to "is my provider working". The status output says **unverified**
+  in full for exactly this reason.
+- **Verified availability** is what `forge models status --verify` reports. It
+  costs one bounded request per distinct model and answers the second question.
+
+> **The two must never be presented in the same column.** A GREEN row whose
+> VERIFIED cell is empty means "Forge would route here and has confirmed
+> nothing". Printing `yes` there is the single failure mode this design exists
+> to prevent.
+
+### What "verified" does and does not claim
+
+Verified means **one bounded request was made and the provider offered this
+model**. Specifically it does *not* claim:
+
+- that a completion would succeed (nothing is generated during verification);
+- that the provider is healthy in general;
+- that the credential will keep working;
+- anything at all about a slot that was not probed.
+
+A probe that found every model broken still reports `verified = True`, because
+*checked* is what the word means. The failure is in the answer, not the check,
+and conflating the two would make a total outage look like never having looked.
+
 ## Health
 
 Computed from **usability**, never from configuration presence.
@@ -124,6 +162,11 @@ and never has to decide what absence means.
 sits on a provider with no gateway implementation is RED even though the file
 parsed without complaint. A green light means something could serve, not
 something did.
+
+**Verification does not redefine these three.** It only supplies better facts
+underneath them. `TierConfig.health()` is the single definition and it was not
+touched; `--verify` feeds it through `Availability` and changes nothing about
+what GREEN means.
 
 ## Primary and fallback behaviour
 
@@ -160,18 +203,23 @@ A provider is a **name and a credential variable name**, not a class:
 ```python
 ProviderSpec(name="openrouter",
              credential_env="FORGE_OPENROUTER_API_KEY",
-             gateway_factory=...)   # or None
+             gateway_factory=...,      # or None
+             verifier_factory=...)     # or None
 ```
 
 `forge.models.registry` and `forge.models.router` import no gateway. Providers
 are written down in exactly one place, `ProviderCatalog.default()`.
 
-| Provider | Routable | Credential |
-|---|---|---|
-| `openrouter` | yes | `FORGE_OPENROUTER_API_KEY` |
-| `local` | yes | none |
-| `openai` | no | `FORGE_OPENAI_API_KEY` |
-| `anthropic` | no | `FORGE_ANTHROPIC_API_KEY` |
+`routable` and `verifiable` are separate facts. A provider can be one without
+the other, and treating them as the same is how "we could have asked but did
+not" becomes a confident green.
+
+| Provider | Routable | Verifiable | Credential |
+|---|---|---|---|
+| `openrouter` | yes | yes | `FORGE_OPENROUTER_API_KEY` |
+| `local` | yes | yes | none |
+| `openai` | no | no | `FORGE_OPENAI_API_KEY` |
+| `anthropic` | no | no | `FORGE_ANTHROPIC_API_KEY` |
 
 The asymmetry is deliberate. Declaring `openai` and `anthropic` means a
 configuration naming them **validates** and `forge models status` can show the
@@ -179,6 +227,15 @@ slot honestly, rather than it being silently dropped. Leaving them without a
 gateway means routing to one returns a structured failure naming the provider --
 never an import error inside a run. An unimplemented provider is *declared but
 unroutable*, which is why such a tier is RED rather than reassuring.
+
+`--verify` reports the same asymmetry through the same mechanism: a slot on an
+unimplemented provider comes back `verify_code = unimplemented`, a clean result
+naming the provider. Nothing is contacted and nothing raises.
+
+A provider redeclared in `models.toml` **keeps** its gateway and verifier
+implementations; only the credential name is configurable. Dropping them on
+redeclaration would turn a provider Forge can check into one it reports as
+unimplemented -- the exact failure `--verify` exists to remove.
 
 The catalog holds credential **variable names** only. It does not read a
 credential, does not import `os` to do so, and cannot leak one. Values are read
@@ -244,12 +301,13 @@ contents.
 
 ## The verified-health seam
 
-`Availability` is the injection point. It accepts a mapping or a callable and
-performs **no network I/O**:
+`Availability` is the injection point. It accepts a mapping, a callable, or the
+results of a probe, and performs **no network I/O**:
 
 ```python
 Availability(source={"local/qwen2.5-coder:14b": False})   # by provider/model
-Availability(source=lambda slot: ...)                      # for a future probe
+Availability(source=lambda slot: ...)                      # for an injected rule
+Availability.verified_results(results)                     # from a real probe
 Availability.none()                                       # nothing is known
 ```
 
@@ -267,14 +325,135 @@ two-place edit and marks a newly configured model broken by default. Failing in
 that direction is the dangerous one, so absence means available and the
 distinction stays visible instead of being resolved by pessimism.
 
-A future probe drops into this same seam through
-`registry.with_availability(...)`; the registry is immutable, so it returns a new
-value rather than mutating the one a caller holds. **A probe module imports this
-one; this one never imports a probe.** The decision path must not be able to make
-a network call.
+The probe drops into this same seam through `registry.with_availability(...)`;
+the registry is immutable, so it returns a new value rather than mutating the
+one a caller holds. **A probe module imports this one; this one never imports a
+probe.** The decision path must not be able to make a network call, and
+`tests/test_model_verify.py` asserts that structurally rather than by review.
 
-Credentials are deliberately *not* consulted for health. A missing key is
-configuration, not evidence a model is unreachable.
+Per-slot reasons and codes travel with the source. `Availability.reason_for()`
+and `Availability.code_for()` are what a status consumer reads, so it never has
+to pattern-match on prose to tell an auth failure from a timeout.
+
+Credentials are deliberately *not* consulted for health **on the offline path**.
+A missing key is configuration, not evidence a model is unreachable. Under
+`--verify` the credential is used, but only by the verifier, and a missing one
+comes back as `verify_code = credential_missing` -- a reportable status, not an
+exception.
+
+## Verified health: `forge models status --verify`
+
+### What it does
+
+```
+forge models status --verify
+```
+
+One bounded request per **distinct** `provider/model`, deduplicated across
+tiers, then health reported through the existing computation. The results enter
+health as an ordinary `Availability`, so `TierConfig.health()` decides
+GREEN/YELLOW/RED exactly as before.
+
+### Verification strategy, per provider
+
+| Provider | Check | Cost | Failure mapping |
+|---|---|---|---|
+| `openrouter` | `GET /api/v1/models` with the key in the `Authorization` header; model id present in the listing means usable | free; no tokens generated | 401/403 `unauthenticated`; no key `credential_missing`; socket timeout `timeout`; 200 but id absent `not_found`; non-JSON `malformed_response`; connection refused `unreachable` |
+| `local` | `GET /v1/models` on the OpenAI-compatible endpoint | free; loopback | as above, no auth branch |
+| `openai`, `anthropic` | none | none | `unimplemented` |
+
+**Why a listing and not a completion.** A one-token completion would additionally
+prove the model *answers*, at the price of spending money on every status check
+and generating text nobody asked for. The listing is the cheapest check that
+reliably establishes usability, and it cannot be billed.
+
+### Bounds, by construction
+
+- One attempt per distinct model. No retries, no backoff -- a verification loop
+  is an outage amplifier.
+- A five-second per-attempt timeout, separate from a call's own timeout.
+- **No completion, ever.** There is no code path from `verify.py` to
+  `ModelGateway.complete`, and a test asserts the string `chat/completions` does
+  not appear in that module.
+- No agent runtime, no workspace, no approval. A probe cannot execute anything;
+  it asks a provider about a list.
+- A **disabled slot is never probed.** An operator's switch is not something a
+  probe second-guesses, and spending a request on a switched-off model would
+  produce a result that could read as coverage.
+
+### The verification summary
+
+After the tier table, `--verify` prints one line per provider:
+
+```
+  verification summary
+  OpenRouter    2 checked, 1 healthy
+  Local         1 checked, 0 healthy
+  Anthropic     0 checked, 1 not checked, no health information
+```
+
+**Presentation and diagnostics only.** It is computed in `render.py` by counting
+the slot rows already in `status()`. No health value, routing decision, or exit
+code is derived from it, and no such value reads from it. A test asserts the
+four renderer helpers that produce the diagnostics reference no health constant
+in executable position.
+
+It exists because the question an operator asks after reading the table is
+"so is the problem my provider, or my laptop?", and a per-tier table cannot
+answer that. The two providers above are visibly separate problems.
+
+Two things it is careful about:
+
+- **"checked" means a request was actually made.** A provider with no verifier
+  reports `0 checked ... no health information`, because `unimplemented` is a
+  result *value* rather than a request and counting it as checked would put a
+  never-asked provider in the same column as one that answered and failed.
+- **Models are counted once per provider**, deduplicated by `provider/model`, so
+  the number agrees with the number of requests actually made. A model standing
+  behind three tiers is one model.
+
+## Operational wording for a stopped local endpoint
+
+A refused connection on the local endpoint is a fact about the *machine*, not
+about a model the provider cannot serve, and the two send an operator to
+different places. The reason reads:
+
+```
+local endpoint unreachable; configured service may not be running (ConnectionRefusedError)
+```
+
+`OpenRouter endpoint unreachable; the provider could not be contacted (...)` is
+the same shape for the hosted provider.
+
+> **Operational wording is not a special case that forgives anything.** A
+> stopped local endpoint is still an unusable model: the tier stays RED, the
+> fallback is still not selected, and the exit code is still
+> `EXIT_MODEL_UNAVAILABLE`. The wording changes how a failure *reads*, never
+> whether it counts. There is no code path anywhere that promotes a failed local
+> probe to usable, and one test asserts the renderer cannot introduce one.
+
+### Failure is a value
+
+Every failure mode returns a `VerificationResult` with a `VerificationCode` and
+a bounded, operator-safe reason. A verifier that raises, returns a non-result, or
+whose factory fails to build all become reportable statuses. An inspection
+command that crashes tells an operator nothing they can act on.
+
+Provider response bodies are **never** echoed into a reason. Providers quote the
+offending request in their error prose, and that request carried the
+authorization header. Only the HTTP status and short identifier fields survive;
+transport failures report the exception *type* and never its message.
+
+### Why verification is not a second gateway method
+
+`ModelGateway` has exactly one method, and a test asserts it stays that way.
+Verification is a separate, narrower `ModelVerifier` Protocol with a single
+`verify(model)` method, reached through `ProviderSpec.verifier_factory`.
+
+A verifier must never grow a completion path, a retry loop, or the ability to
+generate a token -- and a shared interface would make enforcing that somebody
+else's problem. `ScriptedGateway`, the offline implementation every test uses,
+does not implement verification and is not required to.
 
 ## UI consumers must use `ModelRouter.status()`
 
@@ -286,16 +465,43 @@ configuration, not evidence a model is unreachable.
 including one the registry does not carry -- carrying:
 
 ```
-tier  health  model  provider  selection  slot  reason  verified
+tier  health  model  provider  selection  slot  fallback_index
+reason          concise summary; "primary unavailable; fallback #1 verified
+                healthy" once probed, the plain routing reason offline
+routing_reason  the router's own full derivation, always present and untouched
+verified        did anything check at all
+
 slots[]: model  provider  enabled  state  position
+          probed         a request was made for this slot
+          verified       a request was made AND the model was confirmed usable
+          verify_code    machine-readable VerificationCode value, or ""
+          verify_reason  bounded operator-safe sentence, or "" if not probed
+          available      the availability fact on its own
 ```
 
 Each slot reports `enabled` **and** `state` separately. That is deliberate: a
 consumer given only a boolean has to re-derive the difference between "an
 operator switched this off" and "this is currently unreachable", and would
-eventually re-derive it wrongly. `forge models status --json` emits these
-objects newline-delimited, and the Workbench indicator should bind to the same
-shape rather than introducing a second format.
+eventually re-derive it wrongly.
+
+`probed` and `verified` are separated for the same reason. Both false is a
+different situation from either alone: a slot that was never asked about and a
+slot that was asked about and rejected both read `verified: false`, and
+`verify_reason` is what distinguishes them -- empty means nobody asked,
+populated means somebody did and here is what happened.
+
+`verify_code` exists so a UI never has to pattern-match `verify_reason` to tell
+an auth failure from a timeout. The renderer writes the sentence; a consumer
+binds the code.
+
+`reason` and `routing_reason` are separate fields rather than one concatenated
+string. A status line wants the conclusion; a routing audit wants the
+derivation. Concatenating them produced the same fact twice in two vocabularies.
+
+`forge models status --json` emits these objects newline-delimited, and the
+Workbench indicator should bind to the same shape rather than introducing a
+second format. The renderer decides nothing: it reads these fields and formats
+them, so presentation cannot change a health value.
 
 Health is defined once, in `ModelRegistry.health`. The router recomputes nothing
 and `render.py` imports neither module -- presentation cannot change a health
@@ -304,13 +510,36 @@ value.
 ## Commands
 
 ```
-forge models status [--config PATH] [--json]
+forge models status [--config PATH] [--json] [--verify]
 forge route --agent NAME --task KIND --difficulty LEVEL [--tier NAME] [--json]
 ```
 
-Both are inspection commands: no gateway is built, no request is made, no
-credential is read. `forge route` reports the tier, model, provider, whether
-primary or fallback, the reason, and the routing rule matched.
+`forge route` and plain `forge models status` are inspection commands: no
+gateway is built, no request is made, no credential is read. `forge route`
+reports the tier, model, provider, whether primary or fallback, the reason, and
+the routing rule matched.
+
+`forge models status --verify` is the one exception, and it is opt-in. It
+builds verifiers (not gateways), makes one bounded request per distinct model,
+and reads the credential that request needs. It changes **no** routing semantics:
+health comes from the same `TierConfig.health()` call the offline path uses.
+
+The offline path is a separate function from the verified one
+(`_run_models_status_offline` / `_run_models_status_verified`), so "plain status
+performs zero network activity" is a structural property of a small function
+rather than a promise about a larger one. Two tests assert it: one patches
+`socket` to fail on any connection during `forge models status`, the other
+scans the offline handler for any probe import or credential reference.
+
+`--verify` also prints the per-provider **verification summary**, described above.
+It is human-facing only and is deliberately absent from `--json`, whose
+newline-delimited tier objects are a machine contract a summary line would
+corrupt.
+
+Exit codes are shared by both paths: `EXIT_OK` unless some tier is RED, in which
+case `EXIT_MODEL_UNAVAILABLE`. YELLOW does not affect the exit code -- traffic
+still flows on a degraded tier. A stopped local endpoint produces RED, not a
+special-cased pass.
 
 `forge route` and `forge models status` require **no workspace**. Routing is not
 an operation on a workspace, and the workspace root being an explicit safety
@@ -355,6 +584,15 @@ tool loop, and the workspace rules are untouched, and `AgentRuntime` still
 receives a plain `model_id` string.
 
 What is deliberately not done: the registry is resolved **once, at the CLI
-edge**. It is not threaded into the runtime, no health probing happens, and no
-model call is retried on a different model mid-run. A run that starts on a
-fallback keeps that model; switching mid-run is a separate decision.
+edge**. It is not threaded into the runtime, and no model call is retried on a
+different model mid-run. A run that starts on a fallback keeps that model;
+switching mid-run is a separate decision.
+
+Health probing now exists, but **only** as an explicit operator command. It is
+never run during a run, never run implicitly, and its results are not persisted
+to the configuration file. A RED tier still fails to start, exactly as before;
+`--verify` tells you *before* you start what would have happened.
+
+Not changed by verification: `forge byte`, `forge workbench`, the agent runtime,
+tool dispatch, approvals, the workspace rules, command classification, and
+routing policy.
