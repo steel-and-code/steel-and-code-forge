@@ -56,6 +56,12 @@
  *   request that makes the server contact providers and present credentials. A
  *   page that re-checked on load or on visibility would turn a backgrounded tab
  *   into a repeating credential-bearing request.
+ *
+ * - A CLIPPED PREVIEW IS REPLACED, NOT KEPT. `model.reply` arrives clamped by
+ *   the server's event bounds, so a long answer reaches the transcript
+ *   clipped. The event stream stays bounded; the authoritative answer is read
+ *   from `/api/status` when the run completes and written into that same entry
+ *   -- one final answer in the transcript, never a preview followed by a copy.
  */
 
 (function () {
@@ -92,6 +98,27 @@
   var pendingApprovalId = null;
   var source = null;
 
+  // The transcript node holding the *clipped* `model.reply` preview of the
+  // answer, and the run whose final answer has already been written into it.
+  // Both are in-memory facts about what this tab has drawn, not about the run
+  // -- which is why a refresh asks the server rather than trusting them.
+  var assistantPreview = null;
+  var finalAnswerRun = null;
+
+  /* Write the authoritative final answer into the transcript.
+   *
+   * Called after `refreshStatus`, from two places -- `run.completed`, and
+   * `refreshStatus` itself when the server reports a finished run. The second
+   * is what makes a page that loaded after the run, or a reconnect that replayed
+   * the tail, show the answer at all.
+   */
+  function renderFinalAnswer(status) {
+    if (!status || status.state !== "completed") return;
+    var result = status.result;
+    if (!result || !result.text) return;
+    reconcileFinalAnswer(status.run_id, result.text);
+  }
+
   // -- rendering -------------------------------------------------------
 
   var STATE_TEXT = {
@@ -126,9 +153,96 @@
     return li;
   }
 
+  /* Append one entry, and return it.
+   *
+   * Returns the element so a caller that will later *replace* what it said can
+   * find it. `addMessage` itself stays a one-way append: the reconciliation
+   * below is the only thing in this file that edits an entry after the fact.
+   */
   function addMessage(role, text) {
+    if (!text) return null;
+    var node = entry(role, text);
+    el.thread.appendChild(node);
+    el.thread.scrollTop = el.thread.scrollHeight;
+    return node;
+  }
+
+  /* The authoritative final answer, recovered from /api/status.
+   *
+   * A `model.reply` event carries a *bounded preview*: every event field is
+   * clamped by `forge.events.Event`, so a long answer arrives clipped. The
+   * clamp is deliberate and stays -- an event is a summary of one observation,
+   * and a page should not be able to pull a whole answer through it. So the
+   * preview is not the answer, and the transcript must not be left holding it.
+   *
+   * The server holds the real thing: `RunResult.text` is returned verbatim in
+   * `GET /api/status`, unbounded, because that endpoint is a *read of state the
+   * server already has* rather than an event payload. On completion this reads
+   * it back and rewrites the preview entry in place.
+   *
+   * Four properties, each of which was a bug first:
+   *
+   * - ONE ANSWER, NOT TWO. The clipped preview is replaced, never followed by
+   *   a second entry. An operator reading the transcript must not see the
+   *   clipped text once and the full text once and have to guess which was
+   *   which.
+   * - AN UNCLIPPED PREVIEW IS LEFT ALONE. The server marks a clipped value with
+   *   a trailing ellipsis (`forge.events._clamp` does it, and
+   *   `tests/test_events.py` asserts it), so a preview without one arrived
+   *   whole. If it is also identical to the answer there is nothing to do, and
+   *   if it is not -- a mid-turn message, and the tab missed the final turn's
+   *   event -- it is real transcript content that must not be overwritten.
+   *   Clobbering it would lose what the model actually said in order to save
+   *   one entry.
+   * - REPLACEMENT IS BY DOM NODE, NOT BY TEXT MATCH. Matching the preview's
+   *   text to find it would fail exactly when it matters -- a clipped preview
+   *   is not a prefix of what replaces it if the model reworded, and matching
+   *   would then append and leave both.
+   * - IDEMPOTENT PER RUN. Reconciliation is driven by `run.completed`, which a
+   *   reconnect replays and `refreshStatus` can also reach; a `run_id` already
+   *   reconciled is a no-op, so neither leaves a second copy. That also makes a
+   *   page loaded *after* the run finished render the answer once, from the
+   *   status it fetched on load.
+   */
+
+  // The marker `forge.events._clamp` appends to a value it truncated. Used only
+  // to recognise a clipped preview, never to decide how much text to keep.
+  var CLIPPED = "…";
+
+  function entryBody(node) {
+    var kids = node.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var classes = String(kids[i].className || "").split(/\s+/);
+      if (classes.indexOf("body") >= 0) return kids[i];
+    }
+    return null;
+  }
+
+  function reconcileFinalAnswer(runId, text) {
     if (!text) return;
-    el.thread.appendChild(entry(role, text));
+    if (runId && runId === finalAnswerRun) return;
+
+    var preview = assistantPreview;
+    assistantPreview = null;
+    finalAnswerRun = runId || finalAnswerRun;
+
+    var body = preview ? entryBody(preview) : null;
+    if (!body) {
+      // Nothing to replace -- the preview never arrived, or this page was
+      // loaded after the run finished. One entry either way.
+      addMessage("assistant", text);
+    } else if (body.textContent === text) {
+      // Already the whole answer. Rewriting it would be a no-op with a
+      // scrollbar jump, and re-reading the status must not change the page.
+    } else if (String(body.textContent).slice(-1) === CLIPPED) {
+      // textContent, exactly as the entry was built: an assistant answer is
+      // model output and must never be parsed as markup.
+      body.textContent = text;
+    } else {
+      // A complete mid-turn message that is not the answer. It stays, and the
+      // answer goes after it.
+      addMessage("assistant", text);
+    }
     el.thread.scrollTop = el.thread.scrollHeight;
   }
 
@@ -270,6 +384,12 @@
         // reappears.
         renderPending(status.pending_approval);
         if (status.error) addMessage("system", status.error);
+        // A finished run's answer is read here too, not only on run.completed:
+        // the preview in the transcript is clipped by the event clamp, so a
+        // page loaded after the run -- or one whose stream missed the event --
+        // would otherwise have no final answer at all.
+        renderFinalAnswer(status);
+        return status;
       })
       .catch(function () {
         setState("idle");
@@ -467,9 +587,16 @@
       case "run.submitted":
         break;
       case "model.reply":
-        addMessage("assistant", data.text || "");
+        // A bounded preview, kept as-is. The authoritative answer is read from
+        // /api/status when the run completes; until then this is what the
+        // operator can see, and truncating it twice would only lose more.
+        assistantPreview = addMessage("assistant", data.text || "");
         break;
       case "run.completed":
+        // The turn/tool counts come from the event; the *answer* does not, so
+        // the summary line is written first and the transcript is repaired
+        // from the server's own result. Ordering matters: the repair is the
+        // last thing an operator reads.
         addMessage(
           "system",
           "Completed: " +
@@ -481,6 +608,11 @@
             " refusal(s)."
         );
         el.send.disabled = false;
+        // The counts above are the event's; the answer is not in it, so the
+        // authoritative one is read back from the server. `refreshStatus`
+        // performs the reconciliation, which is why the fix is a read rather
+        // than a second rendering path.
+        refreshStatus();
         break;
       case "run.failed":
       case "run.error":

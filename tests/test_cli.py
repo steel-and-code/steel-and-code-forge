@@ -25,7 +25,14 @@ from types import ModuleType
 import pytest
 
 from forge.cli import render
-from forge.cli.main import DEFAULT_AGENT, WORKSPACE_ENV, build_parser, main
+from forge.cli.main import (
+    DEFAULT_AGENT,
+    DEFAULT_MODEL_ENV,
+    MODEL_PROVIDER_ENV,
+    WORKSPACE_ENV,
+    build_parser,
+    main,
+)
 from forge.tools.approval import ScriptedApprovalChannel
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -329,6 +336,22 @@ def test_byte_requires_an_explicit_workspace(workspace_dir: Path) -> None:
     assert "workspace" in result.err
 
 
+def openrouter_environ(**extra: str) -> dict[str, str]:
+    """An environment that pins Byte to the OpenRouter gateway.
+
+    The routed default is local-first now, so a run with no ``--model`` and no
+    ``$FORGE_MODEL`` reaches the local gateway and fails at the socket, not at
+    the credential. Credential tests must therefore say which provider they
+    mean: a pinned model plus ``$FORGE_MODEL_PROVIDER=openrouter`` exercises
+    the key path, and it does so without consulting the operator's registry.
+    """
+    return {
+        DEFAULT_MODEL_ENV: "vendor/credential-probe",
+        MODEL_PROVIDER_ENV: "openrouter",
+        **extra,
+    }
+
+
 def test_byte_requires_a_task(workspace_dir: Path) -> None:
     result = run(
         ["byte", "--workspace", str(workspace_dir)],
@@ -373,7 +396,7 @@ def test_byte_reads_a_task_from_a_file(workspace_dir: Path, tmp_path: Path) -> N
             "--task-file",
             str(task_file),
         ],
-        env={},
+        env=openrouter_environ(),
     )
 
     # No key, so the gateway refuses before any request. That the failure is the
@@ -402,7 +425,10 @@ def test_byte_missing_key_fails_before_any_request(workspace_dir: Path) -> None:
 
     No network call is attempted, which is what makes this safe to assert.
     """
-    result = run(["byte", "--workspace", str(workspace_dir), "hello"], env={})
+    result = run(
+        ["byte", "--workspace", str(workspace_dir), "hello"],
+        env=openrouter_environ(),
+    )
 
     assert result.code == render.EXIT_USAGE
     assert "FORGE_OPENROUTER_API_KEY" in result.err
