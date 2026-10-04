@@ -37,16 +37,16 @@ credential_env = "FORGE_ANTHROPIC_API_KEY"
 # Cheap, fast, enough for summarising, triage, and drafting.
 primary = { model = "anthropic/claude-sonnet-4", provider = "openrouter" }
 fallbacks = [
-    { model = "qwen2.5-coder:14b", provider = "local" },
+    { model = "byte-coder", provider = "local" },
     { model = "openai/gpt-4o-mini", provider = "openrouter" },
 ]
 
 [tiers.coding_standard]
 # The workhorse: editing code, running tests, following the tool loop.
-primary = { model = "anthropic/claude-sonnet-4", provider = "openrouter" }
+primary = { model = "byte-coder", provider = "local" }
 fallbacks = [
+    { model = "anthropic/claude-sonnet-4", provider = "openrouter" },
     { model = "openai/gpt-4o", provider = "openrouter" },
-    { model = "qwen2.5-coder:14b", provider = "local" },
 ]
 
 [tiers.reasoning_heavy]
