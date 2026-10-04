@@ -971,6 +971,126 @@ class ModelResolutionError(Exception):
     """
 
 
+def _override_advisory(
+    model_id: str, environ: Mapping[str, str]
+) -> str | None:
+    """What Forge can tell the operator about an overridden model, or ``None``.
+
+    **This never blocks and never changes the resolved model.** The override
+    path short-circuits before the registry is read, and that is settled in
+    ``docs/model-registry.md``: pinning a model has to keep working when the
+    configuration file is broken, which is exactly when an operator reaches for
+    it. Turning a warning into a refusal would remove the escape hatch at the
+    moment it is needed.
+
+    So this is a *report*, and it is best-effort in the strongest sense: every
+    failure to produce one -- an unreadable config, an unknown provider, a
+    catalog that will not answer -- returns ``None`` and the run continues in
+    silence. A warning system that can itself fail a run is a second policy.
+
+    Three things are worth saying when the registry *can* be read:
+
+    *   the model is not configured here at all (most often a typo);
+    *   it is configured but ``enabled = false`` -- the operator's own switch;
+    *   it is configured and enabled, but the availability source says it cannot
+        serve a request right now.
+
+    The third is reported only when something actually checked. With no
+    availability source the registry knows nothing about reachability, and
+    claiming a model is unavailable because nobody asked would be inventing a
+    finding.
+
+    Args:
+        model_id: The identifier the operator selected.
+        environ: The injected environment, for registry discovery.
+
+    Returns:
+        One operator-readable sentence, or ``None`` when there is nothing worth
+        saying or nothing could be established.
+    """
+    from ..models.registry import RegistryConfigError, load_registry
+
+    try:
+        registry = load_registry(environ=environ)
+    except RegistryConfigError:
+        # Deliberately silent. The registry being unreadable is the exact
+        # situation the override exists to survive, so complaining here would
+        # either block the run or bury the operator in a warning about a file
+        # they are deliberately bypassing.
+        return None
+    except Exception:  # noqa: BLE001 - a warning must never fail a run
+        return None
+
+    # `registry.tiers` is a mapping of name -> TierConfig, so iterating it
+    # directly would yield names. Match on the full "provider/model" key first,
+    # then on the bare id, so an operator who pasted either form gets a real
+    # answer instead of a spurious "not configured".
+    candidates = [
+        slot
+        for tier in registry.tiers.values()
+        for slot in tier.slots
+        if slot.key == model_id or slot.model == model_id
+    ]
+
+    if not candidates:
+        return (
+            f"{model_id!r} is not configured in the model registry "
+            f"({registry.source}); the run will use it anyway, and the provider "
+            f"decides whether it exists"
+        )
+
+    # The most useful single state across every slot carrying this id: a model
+    # listed twice, once enabled and once not, is a configuration question, and
+    # reporting the enabled instance would hide it.
+    states = [registry.slot_state(slot) for slot in candidates]
+    enabled = [state for state in states if state.value == "configured"]
+    disabled = [state for state in states if state.value == "disabled"]
+    unavailable = [state for state in states if state.value == "unavailable"]
+
+    if disabled and not enabled:
+        return (
+            f"{model_id!r} is configured but disabled (enabled = false); the "
+            f"run will attempt it anyway"
+        )
+    if unavailable and not enabled:
+        return (
+            f"{model_id!r} is configured but its provider reports it unusable "
+            f"right now; the run will attempt it anyway"
+        )
+    return None
+
+
+def _warn_about_override(
+    model_id: str, environ: Mapping[str, str], warn: TextIO | None
+) -> None:
+    """Emit the advisory for an overridden model, if there is one to emit.
+
+    A no-op when no stream is supplied, which is what every existing caller and
+    every existing test does -- so adding the advisory changed no caller. The
+    two run paths that can show an operator pass their ``err`` stream.
+
+    The print is not wrapped in a try. A closed stderr is already handled at the
+    CLI boundary by the ``BrokenPipeError`` branch in ``main``, and swallowing
+    errors here would mean a warning could not be reported *and* could not be
+    seen failing, which is the worst of both.
+    """
+    if warn is None:
+        return
+    message = _override_advisory(model_id, environ)
+    if message:
+        print(f"{OVERRIDE_WARNING_PREFIX} {message}", file=warn)
+
+
+#: Shown on stderr when ``--model`` names a model this registry does not carry
+#: as usable. A *warning*, never a block -- see ``_override_advisory``.
+OVERRIDE_WARNING_PREFIX = "forge: warning:"
+
+#: The override is an invocation-level decision, so these two sources are the
+#: whole of it. Both are read fresh per run and neither is written anywhere.
+#: Kept as names rather than inlined because the CLI parser, the help text, and
+#: the docs all refer to them.
+OVERRIDE_FLAG = "--model"
+
 def _resolve_default_model(
     args: argparse.Namespace,
     environ: Mapping[str, str],
@@ -978,6 +1098,7 @@ def _resolve_default_model(
     profile: AgentProfile | None = None,
     task_kind: str = BYTE_TASK_KIND,
     difficulty: str = BYTE_TASK_DIFFICULTY,
+    warn: TextIO | None = None,
 ) -> ResolvedModel:
     """Decide which model a run uses, honouring overrides first.
 
@@ -1161,6 +1282,7 @@ def _run_agent(
             profile=profile,
             task_kind=task_kind,
             difficulty=difficulty,
+            warn=err,
         )
     except ModelResolutionError as exc:
         print(f"forge: {exc}", file=err)
@@ -1330,7 +1452,7 @@ def _run_workbench(
     # The workbench is a browser surface onto the same Byte run, so it must not
     # be able to start a run on a model `forge byte` would refuse.
     try:
-        resolved = _resolve_default_model(args, environ)
+        resolved = _resolve_default_model(args, environ, warn=err)
     except ModelResolutionError as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_USAGE

@@ -596,7 +596,7 @@ entirely**:
 
 | Source | Precedence |
 |---|---|
-| `--model ID` on `forge byte` / `forge workbench` | highest |
+| `--model ID` on `forge byte` / `forge neighbor` / `forge workbench` | highest |
 | `$FORGE_MODEL` | second |
 | the registry, by routing | default |
 
@@ -610,15 +610,115 @@ provider from `$FORGE_MODEL_PROVIDER`. Only a *routed* default takes its
 provider from the selected slot, because that is the pairing configuration
 stated; mixing the two would address a model to the wrong endpoint.
 
-`forge byte` routes as task `coding`, difficulty `standard`. Both are named in
+`forge byte` routes as task `coding`, difficulty `standard`; `forge neighbor`
+routes as `conversation`, `standard`. Both pairs are named in
 `forge/cli/main.py` and neither is an agent concern -- `AgentProfile.model`
 remains `None` by settled decision.
 
+### The four things that are not the same
+
+Manual model selection is easy to conflate with three neighbouring mechanisms,
+so the distinction is stated rather than left to be inferred from behaviour.
+
+| | What decides it | Lifetime | Shape |
+|---|---|---|---|
+| **Agent identity** | The contract, per agent | permanent | `AgentProfile`: name, instructions, allowed tools |
+| **Routing default** | The registry, from task + difficulty | per resolution | `[routing.tasks.*]` in `models.toml` |
+| **Invocation override** | A human, per run | one invocation | `--model ID` or `$FORGE_MODEL` |
+| **Health verification** | The provider, on request | a snapshot | `forge models status --verify`, `Availability` |
+
+They are orthogonal. An override says *this run, this model* and nothing else;
+it does not change what the next run routes to, what the agent is, or what the
+registry believes. Verification is not a fourth selection mechanism -- it
+supplies facts about reachability and never chooses a model.
+
+### What an override is not
+
+**Not an `AgentProfile` field.** `AgentProfile.model` stays `None` for every
+agent, and there is no `override`, `preferred_model`, or `pinned_model` field.
+An override that could be recorded on a profile would become a persistent
+per-agent preference, and the routing layer would stop being the single source
+of the default. `tests/test_model_override.py` asserts the field set exactly.
+
+**Not a registry mutation.** An override changes nothing in `models.toml`, in
+the registry object, or in any tier. `tests/test_model_override.py` runs a full
+pinned run and compares the workspace tree across it.
+
+**Not a trust signal.** Selecting a model does not assert that it works. Forge
+does not treat an override as "use this anyway"; it uses it, and the provider
+decides whether it exists. That is the honest relationship -- Forge cannot know
+the provider's catalogue, and an operator pinning a model they know about is
+adding information Forge lacks.
+
+### The advisory, and why it cannot block
+
+An override is **reported on, never validated against.** Where the registry is
+readable, Forge checks whether the selected model is one it knows about and
+prints a warning on stderr:
+
+| Registry says | Advisory |
+|---|---|
+| not configured at all | `'vendor/typo' is not configured in the model registry (path); the run will use it anyway...` |
+| configured, `enabled = false` | `'vendor/off' is configured but disabled (enabled = false); the run will attempt it anyway` |
+| configured, enabled, provider says unusable | `'vendor/x' is configured but its provider reports it unusable right now; ...` |
+| configured and usable | *silence* |
+| **could not be read** | *silence* |
+
+**The warning never changes the outcome.** The resolved model is the selected
+one either way, and the run proceeds. Two reasons, and the second is the
+important one:
+
+1. Turning a warning into a refusal would remove the escape hatch at the moment
+   it is needed -- an operator reaching for `--model` is usually doing so
+   *because* the configuration is broken.
+2. A warning that can fail a run is a second policy, and the whole point of the
+   override is that it is not one.
+
+Silence when the registry cannot be read is deliberate for the same reason: an
+operator bypassing a broken file should not also be handed a complaint about it.
+
+Reachability is reported only when something actually checked. With no
+`Availability` source the registry knows nothing about whether a model answers,
+and claiming one is unavailable because nobody asked would be inventing a
+finding.
+
+### No silent fallback for an explicit selection
+
+An override resolves to exactly the model named. It is never rewritten to a
+tier's fallback, because no tier is consulted -- there is nothing to fall back
+*from*. An operator told they ran `vendor/x` has run `vendor/x`, or has had a
+provider error, and never something else.
+
+This is the opposite of the *routed* path, where falling back is the whole
+point: a tier declares an ordered list of slots precisely so traffic keeps
+flowing when the primary is down.
+
+The asymmetry is the point, and it is drawn at the routing layer rather than in
+the CLI:
+
+| | Override | Routed |
+|---|---|---|
+| Registry consulted | no | yes |
+| Broken config | runs anyway | fails, naming the file |
+| Nothing usable | provider error at first call | `no usable model for <agent>'s default routing...` |
+| Falls back | never | yes, per the tier's `fallbacks` |
+
+### Both agents, one surface
+
+`forge byte` and `forge neighbor` take an identical `--model ID`, resolved
+identically. **Agent identity and manual model selection are independent axes:**
+an override selects a model without changing which agent runs, and the two
+agents' routing defaults (`coding` vs `conversation`) are unaffected by it.
+Nothing about a run is remembered afterwards, so there is no way for an override
+to become an agent's standing preference.
+
 > **`$FORGE_MODEL` shadows the registry silently.** If it is exported in your
 > shell, `forge byte` will keep using it and registry edits will appear to be
-> ignored -- including a disabled primary or a RED tier. Run
-> `unset FORGE_MODEL` before testing registry behaviour, or check
-> `forge route` output, which is unaffected by the override.
+> ignored -- including a disabled primary or a RED tier. It now emits the same
+> advisory as `--model` when the model is one the registry does not carry, but
+> a model that *is* configured will pass unnoticed. Run `unset FORGE_MODEL`
+> before testing registry behaviour, or check `forge route` output, which is
+> unaffected by the override.
 
 ## Still not connected
 

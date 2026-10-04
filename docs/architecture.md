@@ -590,3 +590,59 @@ with Byte as the reference agent. Session memory in v1; durable project memory
 designed and disabled; personal memory out of scope. Ember, Fin, and future
 agents inherit the architecture unless a future contract explicitly changes it.
 The full model is in [agent-contract.md](agent-contract.md).
+
+### 4c. Four model mechanisms, deliberately distinct
+
+Model selection in Forge is four separate things that are easy to conflate.
+Keeping them apart is what stops "manual selection" from quietly becoming a
+fifth thing that owns models.
+
+| | Decided by | Lifetime | Where |
+|---|---|---|---|
+| **Agent identity** | the contract | permanent | `AgentProfile` — name, instructions, allowed tools |
+| **Routing default** | the registry, from task + difficulty | per resolution | `[routing.tasks.*]` |
+| **Invocation override** | a human, per run | one invocation | `--model ID`, `$FORGE_MODEL` |
+| **Health verification** | the provider, on request | a snapshot | `Availability`, `forge models status --verify` |
+
+Precedence for a run is **override → routing**, both above supplying a provider:
+`--model ID` → `$FORGE_MODEL` → registry by task/difficulty. An override is an
+*invocation-level* decision and is deliberately narrow about what it is:
+
+* **not** an `AgentProfile` field — `model` stays `None`, and there is no
+  `override` or `preferred_model`. A per-agent standing preference would compete
+  with routing and remove the registry as the single source of the default.
+* **not** persistent — nothing is written, so no run can become the next run's
+  default.
+* **not** a registry mutation — no tier, slot, or config file changes.
+* **not** a trust signal — selecting a model does not assert it works.
+* **not** a fallback trigger — an override resolves to exactly what was named,
+  because no tier was consulted to fall back *from*.
+
+**An override is reported on, never validated against.** It short-circuits
+before the registry is read, so a broken configuration cannot block a run —
+that is the escape hatch's entire purpose, and an operator reaching for it is
+usually doing so *because* the configuration is broken. Where the registry *is*
+readable, Forge emits a non-blocking stderr advisory for a model that is
+unknown, `enabled = false`, or known-unusable. The warning never changes the
+outcome, and silence when the registry cannot be read is deliberate. A warning
+that could fail a run would be a second policy.
+
+Verification stays where it has always been: an explicit operator act that
+supplies facts about reachability and never selects a model. Making a run
+depend on a verification pass would put a network call in the path of every
+invocation.
+
+Full precedence, advisory table, and the routed/override asymmetry are in
+[model-registry.md](model-registry.md).
+
+**What does not vary per agent.** The safety stack is shared and is not
+configurable: same classifier, same secret rules, same approval layer, same
+executor, same `AgentProfile` narrowing rule (an agent may be *narrower* than
+the baseline, and no configuration path can widen it). Neighbor's difference
+from Byte is in its instructions, not in its permissions — including a
+multi-agent boundary that tells it to leave other agents' work alone, which is
+an instruction and not a permission.
+
+The per-agent contract, including Neighbor's settled fields and the reasoning
+behind each, is in [agent-contract.md](agent-contract.md).
+
