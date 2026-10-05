@@ -56,12 +56,15 @@ secrets/
 .secrets/
 *.jks
 
+# SQLite runtime sidecars
+# A database file is project content and stays trackable. Only the
+# generated files that appear beside it are state.
+*-journal
+*-wal
+*-shm
+
 # Local databases and state
-*.sqlite
-*.sqlite3
-*.db
-*.db-journal
-data/
+/data/
 !data/.gitkeep
 
 # Logs
