@@ -35,10 +35,9 @@ credential_env = "FORGE_ANTHROPIC_API_KEY"
 
 [tiers.general_light]
 # Cheap, fast, enough for summarising, triage, and drafting.
-primary = { model = "anthropic/claude-sonnet-4", provider = "openrouter" }
+primary = { model = "nvidia/nemotron-3-ultra-550b-a55b:free", provider = "openrouter" }
 fallbacks = [
     { model = "byte-coder", provider = "local" },
-    { model = "openai/gpt-4o-mini", provider = "openrouter" },
 ]
 
 [tiers.coding_standard]
