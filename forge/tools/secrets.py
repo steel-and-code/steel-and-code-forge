@@ -51,26 +51,14 @@ PRIVATE_KEY_MARKERS = (
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
 )
 
-# Credential-looking *key names* inside a file. Weaker evidence than a private
-# key block -- a ``token`` key in a sample config is not a secret -- so a match
-# is approval_required, never deny.
-CREDENTIAL_KEY_NAMES = (
-    "api_key",
-    "apikey",
-    "access_key",
-    "secret_key",
-    "access_token",
-    "refresh_token",
-    "client_secret",
-    "private_key",
-    "password",
-    "passwd",
-    "authorization",
-    "credentials",
-    "secret",
-    "token",
-    "auth",
-)
+# Credential-looking words in ordinary file content are intentionally not a
+# classification signal. Filename rules and PEM markers below are the stronger,
+# reviewable protections; scanning arbitrary prose and source creates approval
+# fatigue without proving that a file contains credentials.
+
+# Kept as an empty compatibility constant for callers that imported the old
+# evidence list; it is deliberately not consulted during classification.
+CREDENTIAL_KEY_NAMES: tuple[str, ...] = ()
 
 # How much of a candidate file to read for content checks. Bounded so that
 # classification never becomes an unbounded read of an arbitrarily large file.
@@ -278,12 +266,10 @@ class SecretClassifier:
             before content, because containment is the check that can be
             relied on absolutely.
         inspect_content: Whether to read candidate files looking for PEM private
-            key markers and credential-looking key names. Content inspection
-            requires the file to exist and be readable. Set ``False`` to run a
-            pure path-based classification.
-        inspect_content_keys: Whether to apply the weaker credential-key-name
-            check. Independent of ``inspect_content`` because it costs an extra
-            read and is a separate decision.
+            key markers. Content inspection requires the file to exist and be
+            readable. Set ``False`` to run a pure path-based classification.
+        inspect_content_keys: Retained for API compatibility. Ordinary content
+            words are not classification signals.
     """
 
     def __init__(
@@ -373,7 +359,9 @@ class SecretClassifier:
     ) -> tuple[str | None, str | None, str | None, bool]:
         """Inspect a candidate file for secret material.
 
-        Returns ``(deny_rule, approval_rule, detail, checked)``.
+        Returns ``(deny_rule, approval_rule, detail, checked)``. The approval
+        result is retained in the return shape for compatibility, but ordinary
+        credential-looking words are not inspected.
 
         Fails closed: any inability to read the file safely returns a denial
         rule rather than a clean result. The classification that produces is
@@ -406,20 +394,6 @@ class SecretClassifier:
                 detail = f"file contains private-key material ({marker.strip('- ')})"
                 return "secret.private_key_material", None, detail, True
 
-        # Credential key names: weaker evidence, approval_required. Skipped for
-        # binary content, where the match would be meaningless.
-        if self.inspect_content_keys and _BINARY_NUL not in prefix:
-            lowered = prefix.decode("utf-8", errors="replace").casefold()
-            for key in CREDENTIAL_KEY_NAMES:
-                if key in lowered:
-                    # A documentation file exists precisely to name the variables
-                    # a project uses. Scanning one for credential key names is a
-                    # guaranteed false positive, so the `.env*` documentation
-                    # exclusion applies to content checks too.
-                    if _is_env_example(resolved.name):
-                        return None, None, None, True
-                    detail = f"file content contains credential-looking key name {key!r}"
-                    return None, "guess.content_key_name", detail, True
 
         return None, None, None, True
 

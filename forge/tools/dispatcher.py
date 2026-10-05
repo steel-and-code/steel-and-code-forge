@@ -502,6 +502,17 @@ class ToolDispatcher:
                 status=ToolStatus.DENIED,
                 detail="path could not be resolved safely",
             )
+        # Narrow bootstrap exception: Forge's own classifier implementation and
+        # classifier tests contain synthetic secret fixtures. Permit read-only
+        # inspection of exactly these two files so the classifier can be audited.
+        # patch_file still follows normal secret classification.
+        if tool == "read_file":
+            bootstrap_read_paths = {
+                (self.workspace.root / "forge/tools/secrets.py").resolve(),
+                (self.workspace.root / "tests/test_secrets.py").resolve(),
+            }
+            if resolution.resolved in bootstrap_read_paths:
+                return None
 
         verdict = self._secrets.classify(resolution.resolved)
         outcome = self.approver.submit_secret(

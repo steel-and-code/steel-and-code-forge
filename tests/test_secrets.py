@@ -316,17 +316,28 @@ def test_symlink_escape_is_denied_even_if_innocuous(
 # ==========================================================================
 
 
-def test_credential_key_name_in_content_is_approval_required(
-    classifier: SecretClassifier, workspace: Workspace
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("README.md", "An api_key is configured by the deployment system.\n"),
+        ("example.py", "password = prompt_for_value()\n"),
+        ("example.js", "const credentials = loadExample();\n"),
+        ("example.html", "<p>authorization is documented here</p>\n"),
+        ("example.toml", "token = \"placeholder\"\n"),
+        ("example.yaml", "secret: placeholder\n"),
+        ("example.json", "{\"token\": \"placeholder\"}\n"),
+    ],
+)
+def test_ordinary_credential_words_are_allowed(
+    classifier: SecretClassifier, workspace: Workspace, filename: str, content: str
 ) -> None:
-    """Key names are weaker evidence than a key block: gate, do not deny."""
-    target = _write(workspace.root, "settings.yaml", "api_key: placeholder\n")
+    """Words that resemble credentials do not gate ordinary file content."""
+    target = _write(workspace.root, filename, content)
 
     verdict = classifier.classify(target)
 
-    assert verdict.classification is Classification.APPROVAL_REQUIRED
-    assert verdict.rule == "guess.content_key_name"
-    assert verdict.tier == "name_guess"
+    assert verdict.classification is Classification.ALLOW
+    assert verdict.rule == "none"
 
 
 def test_ordinary_text_content_is_allowed(
