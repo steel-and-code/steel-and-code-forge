@@ -86,3 +86,18 @@ desktop.ini
 # Local overrides
 docker-compose.override.yml
 local/
+
+# Workspace-local runtime state, not project source. Anchored to the repo
+# root so a nested .forge/ is still visible.
+/.forge/
+
+# Written into the workspace root when a process runs with HOME set to the
+# repo instead of the operator's home -- a headless Chromium profile and the
+# NSS key database it creates. Machine state, never project content.
+/.config/
+/.local/
+
+# Placeholder file from an agent tool call whose path/content arguments were
+# not substituted: the tool wrote <updated-config-content> to a file named
+# after its own schema argument.
+/<path-to-config-file>
