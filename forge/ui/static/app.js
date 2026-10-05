@@ -62,6 +62,30 @@
  *   clipped. The event stream stays bounded; the authoritative answer is read
  *   from `/api/status` when the run completes and written into that same entry
  *   -- one final answer in the transcript, never a preview followed by a copy.
+ *
+ * - THE ACTIVITY LINE IS DERIVED, AND SAYS ONLY WHAT AN EVENT ALREADY SAID.
+ *   `#activity-text` is a pure reduction of events this file was already
+ *   handling, into a label and a colour. It is not progress (no percentage, no
+ *   "almost done", no estimate), not reasoning (the `text` field of
+ *   `model.reply` is never read by it, so no model prose can reach it), not
+ *   persisted, and not a second source of truth -- a refresh re-derives it from
+ *   `GET /api/status`, which is the only authority. A refused tool reads as a
+ *   refusal there exactly as it reads red in the feed, because a status line
+ *   that says "finished" about a declined operation would be worse than the log
+ *   it sits above.
+ *
+ * - THE LIVENESS NOTE COUNTS SILENCE, NOT PROGRESS. "No activity for 47s" is
+ *   measured from the *client receipt* time of the last event, so it reports
+ *   one observable fact -- nothing has arrived at this tab for N seconds -- and
+ *   nothing else. It resets on every real event, and it does not run at all
+ *   unless a run is genuinely in flight. It is a statement about the stream, not
+ *   an inference about work the page cannot see.
+ *
+ * - THE ACTIVITY SHEET IS DISPLAY STATE, NOT STATE. At <=900px the feed is an
+ *   overlay sheet, opened by a button whose `aria-expanded` is set from the one
+ *   place that changes it. The feed keeps receiving events while closed -- a
+ *   sheet that only listened while open would be empty for the run it was
+ *   opened to watch -- and open/closed is never written to storage.
  */
 
 (function () {
@@ -82,6 +106,10 @@
     streamHint: document.getElementById("stream-hint"),
     thread: document.getElementById("thread"),
     feed: document.getElementById("feed"),
+    activityLine: document.getElementById("activity-line"),
+    activityText: document.getElementById("activity-text"),
+    activityToggle: document.getElementById("activity-toggle"),
+    activityClose: document.getElementById("activity-close"),
     composer: document.getElementById("composer"),
     task: document.getElementById("task"),
     send: document.getElementById("send"),
@@ -133,6 +161,244 @@
     var text = STATE_TEXT[state] || state || "unknown";
     el.stateChip.setAttribute("data-state", state || "idle");
     el.stateLabel.textContent = text;
+  }
+
+  // -- the derived activity line ---------------------------------------
+  //
+  // One line saying what Forge is doing right now, in the conversation's own
+  // header. It exists because the state chip has five values for an entire run
+  // -- "running" covers a four-minute run identically to its first second -- and
+  // the Activity feed, which does know, is a key=value log that an operator has
+  // to be looking at *and* able to read. So the primary surface was silent for
+  // the entire working phase of a run.
+  //
+  // WHAT IT IS. A pure reduction of the events this file already receives, to a
+  // label and a kind. Nothing else. No endpoint, no event name, no field, no
+  // server change: every event it reads is one the page was already handling.
+  //
+  // WHAT IT IS NOT, and the reasons are the point:
+  //
+  // - NOT PROGRESS. There is no percentage, no "almost done", no remaining time,
+  //   and no inferred task state. Forge does not expose progress, so any figure
+  //   here would be an invention with a number on it.
+  // - NOT REASONING. The only model text in the vocabulary is `model.reply`,
+  //   and its text field is not read here. No token of the model's prose, and no
+  //   chain-of-thought, can reach this line: it is a status, not a transcript.
+  // - NOT A SECOND SOURCE OF TRUTH. It is derived, has no authority, and cannot
+  //   disagree with the server because it holds nothing of its own -- a refresh
+  //   re-derives it from GET /api/status. If the server says completed, this
+  //   reads completed.
+  // - NOT PERSISTED. Like everything else here, it is never written to storage.
+  //   A status line that survived a reload from the tab's own memory would be a
+  //   claim about a run that may no longer exist.
+  //
+  // A REFUSAL MUST NEVER READ AS SUCCESS. `tool.result` with a refused status is
+  // rendered as a refusal, on the same rule the feed already uses (BAD_STATUS).
+  // An operator glancing at this line must not see "finished" for an operation
+  // that was declined -- that is the one failure mode that would make the page
+  // actively less trustworthy than the log it replaces.
+
+  // Statuses that mean the operation did not happen. Mirrors BAD_STATUS below,
+  // which colours the same events in the feed; both are kept in step because a
+  // line saying "finished" beside a red feed row would be a contradiction.
+  var REFUSED = { denied: 1, rejected: 1, denied_unattended: 1, error: 1 };
+
+  var ACTIVITY_IDLE = { text: "Idle", kind: "idle" };
+
+  /* Reduce one event to the line's text and kind.
+   *
+   * The order of the cases is the order of precedence, and it is deliberate:
+   * an approval outranks everything, because an approval is the only thing
+   * that stops the run, and an operator looking at this line needs to know that
+   * before anything else. `tool.call` outranks a stale `model.reply`, because
+   * the call is the newer fact.
+   *
+   * An unknown event, or a known one missing the field it needs, returns the
+   * generic working state rather than a guess. "Working" is the one label that
+   * cannot be wrong about an event this function has never seen.
+   */
+  function activityFor(name, data) {
+    var fields = data || {};
+
+    switch (name) {
+      case "approval.required":
+        return { text: "Waiting for your approval", kind: "wait" };
+      case "approval.answered":
+        return { text: "Resuming after your decision", kind: "work" };
+      case "run.completed":
+        return { text: "Completed", kind: "good" };
+      case "run.failed":
+      case "run.error":
+        return {
+          text: "Failed: " + (fields.detail || fields.reason || "unknown"),
+          kind: "bad",
+        };
+      case "tool.call":
+        return {
+          text: "Running " + (fields.tool || "a tool"),
+          kind: "work",
+        };
+      case "tool.result":
+        if (REFUSED[fields.status]) {
+          return {
+            text: (fields.tool || "A tool") + " was refused",
+            kind: "bad",
+          };
+        }
+        if (fields.status === "ok") {
+          return {
+            text: (fields.tool || "A tool") + " finished",
+            kind: "good",
+          };
+        }
+        // A status this build does not know. Reported, not smoothed over.
+        return {
+          text: (fields.tool || "A tool") + " returned " + (fields.status || "an unknown status"),
+          kind: "warn",
+        };
+      case "model.reply":
+        if (Number(fields.tool_calls) > 0) {
+          return { text: "Byte is choosing a tool", kind: "work" };
+        }
+        return { text: "Byte is writing an answer", kind: "work" };
+      case "run.started":
+        return { text: "Byte is working", kind: "work" };
+      case "run.submitted":
+        return { text: "Starting", kind: "work" };
+      case "session.state":
+        // The session's own word, mapped rather than echoed: this line must
+        // not become a second place that spells out Forge's state machine.
+        if (fields.state === "waiting_for_approval") {
+          return { text: "Waiting for your approval", kind: "wait" };
+        }
+        if (fields.state === "running") {
+          return { text: "Byte is working", kind: "work" };
+        }
+        if (fields.state === "completed") {
+          return { text: "Completed", kind: "good" };
+        }
+        if (fields.state === "failed") {
+          return { text: "Failed", kind: "bad" };
+        }
+        return ACTIVITY_IDLE;
+      default:
+        // Not a guess. "Working" is the honest floor for an event this build
+        // does not recognise, and it is what makes adding an event later safe.
+        return { text: "Working", kind: "work" };
+    }
+  }
+
+  /* The last reduced event, and when it arrived.
+   *
+   * In-memory only, like every other fact this tab holds. `lastEventAt` is the
+   * *client receipt* time, never a server timestamp: it answers "how long since
+   * something reached this tab", which is a question about the stream, and it is
+   * the only honest basis for the liveness line below.
+   */
+  var activity = ACTIVITY_IDLE;
+  var activitySince = 0;
+  var livenessTimer = null;
+
+  /* Counts real events, so a status read can tell whether it is current.
+   *
+   * `refreshStatus` stamps this before its fetch and compares on arrival. The
+   * check that matters: the server's `state` field is written by the same
+   * session code that emits the event, and the browser sees them through two
+   * different requests, so the snapshot can easily describe the moment BEFORE
+   * the last event. Comparing epochs -- rather than trusting arrival order, or
+   * assuming the fetch is fast -- is what keeps a late snapshot from undoing a
+   * line that is already correct.
+   */
+  var activityEpoch = 0;
+
+  function renderActivity() {
+    if (!el.activityText) return;
+    el.activityText.textContent = activity.text;
+    if (el.activityLine) el.activityLine.setAttribute("data-kind", activity.kind);
+  }
+
+  /* "No activity for 47s" -- a statement about the stream, and nothing else.
+   *
+   * This exists because the architecture has no heartbeat: between `run.started`
+   * and the first `model.reply` nothing is emitted at all, and between
+   * `tool.call` and `tool.result` nothing is either. A slow provider or a
+   * two-minute pytest run is therefore indistinguishable from a hang, and the
+   * page looks broken. What it may say is bounded to the truth:
+   *
+   *   - how long since the last event ARRIVED at this tab. Client receipt time,
+   *     never a server clock, so a skewed server cannot invent or hide silence.
+   *   - nothing else. No percentage, no "almost done", no "still thinking", no
+   *     estimate of time remaining, no claim about what the model is doing
+   *     internally. Those are inferences about work this page cannot see, and a
+   *     fabricated estimate is worse than an honest gap.
+   *
+   * It resets on every real event, and it is suppressed entirely unless a run is
+   * actually in flight -- counting up while idle would train an operator to
+   * ignore the one line that means something.
+   */
+  var LIVENESS_MIN_SECONDS = 10;
+
+  function elapsedSeconds() {
+    if (!activitySince) return 0;
+    return Math.floor((Date.now() - activitySince) / 1000);
+  }
+
+  function livenessText() {
+    var seconds = elapsedSeconds();
+    if (seconds < LIVENESS_MIN_SECONDS) return null;
+    return "No activity for " + seconds + "s";
+  }
+
+  function tickLiveness() {
+    if (!el.activityText || !livenessTimer) return;
+    var note = livenessText();
+    // The base label stays visible; the note is appended, never substituted, so
+    // "Running pytest" turning into a bare timer would lose the last real fact
+    // this page had.
+    var base = activity.text;
+    var suffix = note ? " · " + note : "";
+    if (el.activityText.textContent !== base + suffix) {
+      el.activityText.textContent = base + suffix;
+    }
+  }
+
+  function stopLiveness() {
+    if (livenessTimer) {
+      window.clearInterval(livenessTimer);
+      livenessTimer = null;
+    }
+  }
+
+  function startLiveness() {
+    stopLiveness();
+    if (!el.activityText) return;
+    // One tick a second. Not animated: the number changes once a second, which
+    // is readable, and there is no spinner or sweep to distract from the text.
+    // `prefers-reduced-motion` governs the one animation this file does add --
+    // the status dot -- and that lives in the stylesheet.
+    livenessTimer = window.setInterval(tickLiveness, 1000);
+  }
+
+  /* Note one real event: reduce it, redraw the line, restart the silence count.
+   *
+   * Called from `handle` for every event, before the feed row is appended, so
+   * the line and the feed are two renderings of one input and cannot drift.
+   */
+  function noteActivity(name, data) {
+    activity = activityFor(name, data);
+    activitySince = Date.now();
+    activityEpoch += 1;
+    renderActivity();
+    // The timer runs only while something is in flight. `run.completed` and
+    // the two failure events are terminal, so they stop it; a status read on
+    // load restarts it if the server says a run is live.
+    var terminal =
+      name === "run.completed" ||
+      name === "run.failed" ||
+      name === "run.error";
+    if (terminal) stopLiveness();
+    else if (!livenessTimer) startLiveness();
+    else tickLiveness();
   }
 
   function entry(role, text) {
@@ -369,6 +635,12 @@
   }
 
   function refreshStatus() {
+    // A status read is a snapshot taken NOW, but it is answered LATER. If an
+    // event arrives in between, that event is the newer fact, and letting the
+    // snapshot win would be a stale read overwriting live information -- which
+    // is exactly how the line briefly showed "Idle" while an approval card was
+    // open. The epoch is stamped at request time and compared on arrival.
+    var requestedAt = activityEpoch;
     return guardedFetch("/api/status")
       .then(function (response) {
         if (!response.ok) throw new Error("status " + response.status);
@@ -389,11 +661,49 @@
         // page loaded after the run -- or one whose stream missed the event --
         // would otherwise have no final answer at all.
         renderFinalAnswer(status);
+        // The derived line follows the server, not the tab. A refresh -- or a
+        // page that loaded after the run, or one whose stream was dropped --
+        // re-derives it from the state the server reports, so the line can never
+        // be the only thing on the page describing a run that has ended.
+        //
+        // Only when no event has arrived since the request was made. Otherwise
+        // this snapshot is older than what is already on screen, and the event
+        // is the better-informed answer -- the server's own `state` lags the
+        // event that caused it by exactly as long as the round trip.
+        if (activityEpoch === requestedAt) {
+          syncActivityToStatus(status);
+        }
         return status;
       })
       .catch(function () {
         setState("idle");
       });
+  }
+
+  /* Bring the derived line back in line with what the server just said.
+   *
+   * Reads only `state` -- the same field `setState` uses -- so this is a second
+   * rendering of one server answer, never a second opinion. A failed status
+   * read is not guessed around: the catch above leaves the line as it was,
+   * which is the truthful state for "I could not ask".
+   *
+   * The silence count is reset only when a run is genuinely in flight, so a
+   * completed or idle page does not start counting up at nothing.
+   */
+  function syncActivityToStatus(status) {
+    if (!status || !el.activityText) return;
+    if (status.state === "running" || status.state === "waiting_for_approval") {
+      activity = activityFor("session.state", { state: status.state });
+      activitySince = Date.now();
+      renderActivity();
+      if (!livenessTimer) startLiveness();
+      else tickLiveness();
+    } else {
+      activity = activityFor("session.state", { state: status.state || "idle" });
+      activitySince = 0;
+      renderActivity();
+      stopLiveness();
+    }
   }
 
   // -- model health -----------------------------------------------------
@@ -644,6 +954,10 @@
       default:
         break;
     }
+    // One reduction, two renderings: the feed row and the derived line above are
+    // fed the same event, so they cannot disagree about what just happened.
+    // Last, so the transcript entries for this event are already written.
+    noteActivity(name, data || {});
     addEvent(name, data || {});
   }
 
@@ -954,6 +1268,64 @@
       if (button) selectView(button.getAttribute("data-view"));
     });
   }
+
+  // -- the activity sheet ------------------------------------------------
+  //
+  // At <=900px the feed is an overlay sheet instead of a second column. The
+  // conversation is the primary surface, and a stacked feed meant an operator
+  // had to scroll a long transcript to reach the only live signal on the page.
+  //
+  // What this does NOT do is the interesting part:
+  //
+  // - IT DOES NOT UNSUBSCRIBE OR PAUSE. The feed keeps receiving and rendering
+  //   events with the sheet closed, because a sheet that only listened while
+  //   open would show an empty panel for the run it was opened to watch. The
+  //   events are already delivered to this tab; showing them later is free, and
+  //   re-fetching them would mean a second request path the server does not have.
+  // - IT IS NOT STORED. Open and closed are display state, not a fact about
+  //   Forge, so there is no localStorage and nothing that survives a reload. A
+  //   tab that reopens starts closed, which is the right default for the width
+  //   this applies at: the sheet is for looking at, not for leaving open.
+  // - IT IS PURELY VISUAL. `data-activity-open` on <body> is the single fact,
+  //   and the stylesheet decides what that means. No class is kept in step with
+  //   it in script, so there is nothing to forget to update.
+
+  function setActivityOpen(open) {
+    var body = document.body;
+    if (!body) return;
+    if (open) body.setAttribute("data-activity-open", "true");
+    else body.removeAttribute("data-activity-open");
+    // `aria-expanded` is the accessible statement of the same fact, and it is
+    // what assistive tech reads -- so it is set from the one place the state
+    // changes rather than toggled independently at each call site.
+    if (el.activityToggle) {
+      el.activityToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+  }
+
+  function toggleActivity() {
+    var open = document.body.getAttribute("data-activity-open") === "true";
+    setActivityOpen(!open);
+  }
+
+  if (el.activityToggle) {
+    el.activityToggle.addEventListener("click", toggleActivity);
+  }
+  if (el.activityClose) {
+    el.activityClose.addEventListener("click", function () {
+      setActivityOpen(false);
+    });
+  }
+
+  // Escape closes the sheet, but ONLY while it is open. Escape on a page with
+  // no sheet open belongs to the approval dialog and to nothing else; stealing
+  // it unconditionally would make the approval card harder to dismiss, which is
+  // the one thing on this page that must never be harder to deal with.
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape") return;
+    if (document.body.getAttribute("data-activity-open") !== "true") return;
+    setActivityOpen(false);
+  });
 
   // -- wiring ----------------------------------------------------------
 

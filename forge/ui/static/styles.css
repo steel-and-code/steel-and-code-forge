@@ -166,6 +166,10 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .state .dot { animation: none; }
+  /* The derived activity line's dot is the same idea -- something in progress
+     moves -- so it honours the same preference. The line still updates; only the
+     movement stops, because the text is what carries the meaning. */
+  .activity-line[data-kind="work"] .activity-dot { animation: none; }
 }
 
 /* -- layout ---------------------------------------------------------- */
@@ -211,6 +215,102 @@ body {
   font-size: 10.5px;
   color: var(--ink-faint);
 }
+
+/* Two-zone pane header: titles and status on the left, controls on the right.
+
+   Added because the conversation header now carries three things -- a title, a
+   live status line, a stream hint, and a toggle -- and `justify-content:
+   space-between` with three children puts the hint in the middle and the toggle
+   wherever it lands. Explicit zones instead, so the status is always adjacent
+   to the title it qualifies and the controls always align to one edge. */
+.pane-head-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* Grows into the space the controls do not need. Without the `flex` basis
+     here the zone sizes to the `<h2>` and the status line inherits that width,
+     ellipsising "Waiting for your approval" down to a few characters -- measured
+     at 101px before this was added. A status line you cannot read is the same
+     as no status line. */
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pane-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+
+/* -- the derived activity line --------------------------------------- */
+
+/* The answer to "is anything happening?", on the surface the operator is
+   already looking at.
+
+   Sized and coloured to be read in peripheral vision -- it is a status, not
+   something to be studied -- and never more prominent than the conversation
+   itself. The dot is the same shape as the state chip's dot, so the two read as
+   one idea: a dot that is not moving is not a thing being worked on. */
+.activity-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-dim);
+  min-width: 0;
+}
+
+.activity-line #activity-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+
+/* Kind, not truth. Each of these is a colour the state chip already uses for
+   the same meaning, so the two never disagree about what is happening. `warn`
+   is the one addition: an unrecognised tool status is worth noticing without
+   being alarmed about, which is exactly what it is. */
+.activity-line[data-kind="work"] .activity-dot { background: var(--warn); }
+.activity-line[data-kind="good"] .activity-dot { background: var(--good); }
+.activity-line[data-kind="bad"] .activity-dot { background: var(--bad); }
+.activity-line[data-kind="warn"] .activity-dot { background: var(--hot); }
+.activity-line[data-kind="wait"] .activity-dot { background: var(--hot); }
+
+.activity-line[data-kind="wait"] #activity-text { color: var(--hot); }
+.activity-line[data-kind="bad"] #activity-text { color: var(--bad); }
+.activity-line[data-kind="good"] #activity-text { color: var(--good); }
+
+/* Only a *working* dot pulses. A refused, completed, or failed state is a
+   fixed fact and a moving dot on it would imply something is still in
+   progress -- which is precisely the misreading this line exists to prevent. */
+.activity-line[data-kind="work"] .activity-dot { animation: pulse 1.4s ease-in-out infinite; }
+
+/* The reserved selector slot. Empty and hidden today; the rules exist so that a
+   future workspace/agent/model control lands in a row that already wraps and
+   already has a min-width, instead of being the thing that forces the header to
+   be redesigned. `min-width: 0` is the load-bearing part -- without it a flex
+   child defaults to `min-width: auto` and refuses to shrink, which is how a
+   single wide control turns into a horizontally scrolling header. */
+.bar-selectors {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.bar-selectors[hidden] { display: none; }
 
 /* -- thread ---------------------------------------------------------- */
 
@@ -300,6 +400,52 @@ button {
 
 button:hover:not(:disabled) { border-color: var(--steel); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* The Activity sheet's two controls.
+
+   Both are display:none by default and only given `display` inside the
+   <=900px block. They are not `hidden` in the markup: the sheet's open/closed
+   state is `data-activity-open` on <body>, and these two are shown or hidden by
+   width, which is a fact CSS already knows and script does not. Using `hidden`
+   here would mean two mechanisms for one panel, and the script would have to
+   know the viewport to get the second one right. */
+.activity-toggle,
+.activity-close {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-2);
+  border: 1px solid var(--edge-hot);
+  color: var(--ink-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+}
+
+/* The toggle's open state, drawn from `aria-expanded` so the fact in the
+   markup is the fact on screen -- the same convention the view switcher uses
+   for `aria-pressed`, and the reason there is no class for script to remember
+   to keep in step. */
+.activity-toggle[aria-expanded="true"] {
+  color: var(--ink);
+  border-color: var(--steel);
+  background: var(--panel);
+}
+
+.activity-toggle:focus-visible,
+.activity-close:focus-visible {
+  outline: 2px solid var(--steel);
+  outline-offset: 1px;
+}
+
+/* A press has to be visible on a touchscreen, where there is no hover and the
+   focus ring only appears for someone who tabbed. */
+.activity-toggle:active,
+.activity-close:active { background: rgba(255, 255, 255, 0.07); }
 
 #send { background: #2a2118; border-color: #6b4a20; color: var(--hot); }
 
@@ -590,11 +736,105 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .approval-note[hidden] { display: none; }
 
-/* Narrow windows: stack. Desktop-first, but a half-width window on a laptop
-   should not produce two unreadable columns. */
+/* Narrow windows: the conversation stays the primary surface and the Activity
+   feed becomes a sheet over it.
+
+   This REPLACES the previous rule, which collapsed `.split` to a single column
+   and stacked the feed below the conversation inside the same scroll container.
+   Stacking looks like the responsive move and is not: both panes are children
+   of `flex: 1 1 auto`, so at 834x1112 an operator had to scroll a long
+   transcript to reach the only live signal on the page -- and during a
+   four-minute run, with no answer yet in the transcript, the reachable content
+   was four words and a status chip. The page looked idle because, in practice,
+   it was.
+
+   So the feed is removed from the flow entirely below 900px and becomes an
+   overlay. The conversation gets the whole viewport, and the derived activity
+   line in its header is what remains on screen -- which is why that line lives
+   there and not in the feed. */
 @media (max-width: 900px) {
   .split { grid-template-columns: minmax(0, 1fr); }
-  .conversation { border-right: 0; border-bottom: 1px solid var(--edge); }
+
+  /* The conversation is the only thing in the grid now. */
+  .conversation {
+    border-right: 0;
+    grid-column: 1 / -1;
+  }
+
+  .pane.activity {
+    position: fixed;
+    inset-inline: 0;
+    bottom: 0;
+    z-index: 18;
+    /* A DEFINITE height, not just a ceiling. `max-height` alone left the sheet
+       sizing itself to its content -- measured at 123px tall for a pane holding
+       a pane head and an (empty) feed, which is not a readable event list. The
+       sheet is a fixed-height surface that scrolls inside itself; the px
+       ceiling stops it eating a whole tablet screen in landscape, where 66vh
+       of 747px would be most of the display. */
+    height: min(66vh, 520px);
+    background: var(--panel);
+    border-top: 1px solid var(--edge-hot);
+    box-shadow: 0 -18px 44px rgba(0, 0, 0, 0.6);
+    /* Off-screen by default, not `display: none`. The feed keeps receiving and
+       rendering events while closed, so this only moves it out of view --
+       a sheet that stopped listening when closed would be empty for the run it
+       was opened to watch. */
+    transform: translateY(100%);
+    transition: transform 180ms ease-out;
+  }
+
+  /* `display: none` here instead of a transform would be less code, and wrong:
+     the pane is `display: flex`, so `hidden` on it would need an explicit rule
+     to win the cascade, and the feed inside it would stop being laid out. The
+     transform keeps it a live, receiving, scrolled pane that is merely not on
+     screen. */
+  body[data-activity-open="true"] .pane.activity {
+    transform: translateY(0);
+  }
+
+  /* The toggle exists only where the feed is a sheet. At wider widths the feed
+     is on screen already, so the button would be a control that does nothing;
+     it is removed from the layout rather than left inert. The close button is
+     the inverse. */
+  .activity-toggle { display: inline-flex; }
+  .activity-close { display: inline-flex; }
+
+  /* Touch targets. 44px is the smallest reliably tappable target on a tablet,
+     and these are the controls an operator uses mid-run -- including the two
+     approval buttons, which are the only controls on the page that block
+     progress and therefore the least acceptable to miss. */
+  .view-button,
+  #send,
+  .activity-toggle,
+  .activity-close,
+  .order-close,
+  .health-tier {
+    min-height: 44px;
+  }
+
+  /* The two approval decisions become equal, full-width targets rather than
+     two small buttons: this is the one interaction where a mis-tap has
+     consequences, so neither is more prominent than the other and neither is
+     small. */
+  .card-actions {
+    display: flex;
+    gap: 12px;
+  }
+
+  .card-actions .approve,
+  .card-actions .reject {
+    flex: 1 1 0;
+    min-height: 52px;
+    font-size: 14px;
+  }
+}
+
+/* Reduced motion: the sheet still opens and closes, it just does not travel.
+   The transition is decoration; its absence must not change whether the sheet
+   is reachable. */
+@media (max-width: 900px) and (prefers-reduced-motion: reduce) {
+  .pane.activity { transition: none; }
 }
 
 /* Phone and narrow tablet. The header stops being a single row: the workspace
@@ -1090,7 +1330,16 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* Tablet. The header switches to two rows and the create form takes the full
    width, but the board keeps its columns: they scroll, which is the readable
-   answer at this width. */
+   answer at this width.
+
+   The header's rules live in THIS block rather than in a second
+   `max-width: 900px` block. A stylesheet with several identical breakpoints is
+   a stylesheet whose cascade depends on which block a reader happens to read
+   last, and `tests/test_ui_orders_board_ui.py` asserts against the *last*
+   `@media (max-width: 900px)` block -- which is a reasonable way to check "is
+   there a tablet rule for the board" only while there is exactly one. One
+   breakpoint, one block: the rules that apply at 834px are all in one place.
+*/
 @media (max-width: 900px) {
   .views { padding: 6px 14px 0; }
   .board-bar { padding: 10px 14px; }
@@ -1098,4 +1347,62 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   .board-create input#order-title { flex: 1 1 200px; min-width: 0; }
   .board-columns { grid-auto-columns: minmax(210px, 1fr); }
   .order-detail-facts { grid-template-columns: minmax(0, 1fr); }
+
+  /* The header stops being one row. A long workspace path wraps to a second
+     line instead of pushing the state chip off the right edge, which is what
+     834px used to do with three facts plus the health strip plus the chip.
+
+     `.facts` keeps `overflow: hidden` and gains `flex-wrap: wrap`, and
+     `min-width: 0` is load-bearing: without it the flex item refuses to shrink
+     below its content and the overflow goes somewhere worse. */
+  .bar {
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 16px;
+    height: auto;
+    min-height: 60px;
+    padding: 10px 14px;
+  }
+
+  .facts {
+    flex: 1 1 260px;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    min-width: 0;
+  }
+
+  /* The reserved selector slot's tablet placement. Empty today; the rule exists
+     so a future workspace/agent/model control lands in a row that already wraps
+     and already spans the header, rather than being the thing that forces the
+     header to be redesigned. */
+  .bar-selectors {
+    order: 4;
+    flex: 1 1 100%;
+  }
+
+  .state {
+    margin-left: auto;
+    flex: 0 0 auto;
+  }
+
+  .models {
+    order: 3;
+    flex: 1 1 100%;
+  }
 }
+
+/* No `@media (min-width: 901px)` rule for the sheet's controls, and there is no
+   rule here at all.
+
+   An earlier version of this file had one, restating the base rule for widths
+   where the feed is a column. It was redundant -- the rule near the top of this
+   file hides these two unconditionally, and only the tablet block shows them --
+   and it cost something real: `test_ui_orders_board_ui.py` asserts that no
+   text after the tablet block contains the string the board test forbids, which
+   is how it checks the board is never hidden. A redundant rule about the
+   *activity controls* failed a test about the *board*, because that assertion
+   is textual and cannot tell which element a rule belongs to.
+
+   The responsive behaviour is identical without it: one rule per fact, hidden
+   by default and shown at tablet widths. */
+

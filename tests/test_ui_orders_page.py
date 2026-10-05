@@ -36,13 +36,20 @@ That reason matters: a skipped test stops protecting anything, so the skip has
 to be legible rather than silent. It says what was attempted, what failed, and
 which files cover the same behaviour without an engine.
 
-**This module is currently skipped in this environment.** Chromium 152 here
-launches, fires its usual background requests to Google, and never completes a
-load event, so ``--dump-dom`` times out against *any* URL -- including a trivial
-loopback page that ``curl`` fetches in milliseconds. The Order Board's behaviour
-is not what is failing; the browser's network stack is unavailable. The logic it
-would have measured is covered without an engine by
-``tests/test_ui_orders_store.py`` (310 tests, all passing).
+**The cause of the historical skip was an environment variable, not the page.**
+With ``DBUS_SESSION_BUS_ADDRESS`` set, Chromium launches and then never completes
+the load event for *any* ``http://`` URL -- including a trivial loopback page
+that ``urllib`` fetches in milliseconds. The original diagnosis ("this Chromium's
+network stack is unavailable") was wrong, and it was expensive: it hid 31 real
+page-wiring tests behind a skip that looked principled. ``chrome_env`` now
+strips that variable for the Chromium child only, and the same launch that timed
+out completes in about a second. The parent shell is never mutated.
+
+No Chromium flag was the answer -- ``--disable-background-networking``,
+``--host-resolver-rules``, ``--no-proxy-server``, ``--user-data-dir``, and
+``--incognito`` were each measured and each still timed out. The capability probe
+stays, because the environment could still be hostile for some other reason, but
+it now reports a skip only when the browser genuinely cannot load a page.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ from __future__ import annotations
 import functools
 import http.server
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -166,6 +174,40 @@ CHROME = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.
 #: request at all -- see ``_chromium_can_serve_http``.
 CHROME_FLAGS = ("--headless", "--disable-gpu", "--no-sandbox")
 
+#: Environment variables stripped from every Chromium child launched here.
+#:
+#: ``DBUS_SESSION_BUS_ADDRESS`` is the one that matters, and it is the real cause
+#: of this module having been skipped for the wrong reason. With it set in this
+#: environment, Chromium launches, starts, and then never completes the load
+#: event for *any* ``http://`` URL -- including a trivial loopback page that
+#: ``urllib`` fetches in milliseconds -- so ``--dump-dom`` times out and the
+#: capability probe reports "this browser's network stack is unavailable".
+#: Removing it from the child's environment makes the same launch, same flags,
+#: same binary, succeed in about a second.
+#:
+#: No Chromium flag compensates. ``--disable-background-networking``,
+#: ``--host-resolver-rules=MAP * ~NOTFOUND``, ``--no-proxy-server``,
+#: ``--user-data-dir``, and ``--incognito`` were each measured against a
+#: loopback server and each still timed out; only the environment change
+#: flipped it. That is why this is an environment fix and not a flag fix.
+#:
+#: It is stripped for the **child only**, by passing an explicit ``env`` to
+#: ``subprocess.run``. The parent shell, and pytest's own environment, are
+#: never mutated: this module must not change how anything else on the machine
+#: behaves, and a test that edited ``os.environ`` to make a browser work would
+#: be a test that silently reconfigures the suite.
+CHROME_ENV_STRIP = ("DBUS_SESSION_BUS_ADDRESS",)
+
+
+def chrome_env() -> dict[str, str]:
+    """The environment for a Chromium child launched by this module.
+
+    A copy of the current environment with :data:`CHROME_ENV_STRIP` removed.
+    Returns a fresh dict on every call so a caller mutating the result cannot
+    reach back into the real environment.
+    """
+    return {k: v for k, v in os.environ.items() if k not in CHROME_ENV_STRIP}
+
 
 @functools.lru_cache(maxsize=1)
 def _probe_http_capability() -> tuple[bool, str]:
@@ -192,15 +234,21 @@ def _chromium_can_serve_http(
     finishes loading anything.
 
     The observed instance of that is environmental rather than a defect in the
-    page under test. Chromium fires background requests to
-    ``clients2.google.com``, ``redirector.gvt1.com``, and
-    ``accounts.google.com`` as it starts; with no outbound egress those never
-    complete, ``--dump-dom`` waits on the load event, and every run times out --
-    against *any* URL, including a trivial page on loopback that ``curl``
-    fetches in milliseconds. Blocking DNS, ``--single-process``,
-    ``--disable-background-networking``, and longer timeouts were all tried and
-    none of them help, because the stall is the load event rather than name
-    resolution.
+    page under test. Chromium fired background requests to
+    ``clients2.google.com`` and friends as it started, and with
+    ``DBUS_SESSION_BUS_ADDRESS`` set in this environment the load event never
+    completed -- against *any* URL, including a trivial page on loopback that
+    ``urllib`` fetches in milliseconds.
+
+    The fix is environmental and lives in :func:`chrome_env`, which strips that
+    variable for the Chromium child. It is worth being precise about why this is
+    a probe and not a flag list: five candidate flags were each measured against
+    a loopback server (``--disable-background-networking``,
+    ``--host-resolver-rules=MAP * ~NOTFOUND``, ``--no-proxy-server``,
+    ``--user-data-dir``, ``--incognito``) and every one of them still timed out,
+    while removing the variable made the identical launch succeed in about a
+    second. The earlier belief that no flag could rescue this was right; the
+    inference that the *browser* was unusable was not.
 
     So this is probed rather than assumed, and the answer decides whether the
     engine-dependent tests run at all. It is deliberately a *separate* page from
@@ -256,15 +304,16 @@ def _chromium_can_serve_http(
             capture_output=True,
             text=True,
             timeout=CHROME_PROBE_TIMEOUT_SECONDS,
+            env=chrome_env(),
         )
     except subprocess.TimeoutExpired:
         return False, (
             f"chromium launched but could not load any http:// URL within "
-            f"{CHROME_PROBE_TIMEOUT_SECONDS}s (it times out on a trivial "
-            f"loopback page that curl fetches instantly). This Chromium's "
-            f"network stack is unavailable in this environment, so page "
-            f"wiring cannot be measured here. The Order Board logic itself is "
-            f"covered by tests/test_ui_orders_store.py, "
+            f"{CHROME_PROBE_TIMEOUT_SECONDS}s, even with "
+            f"{', '.join(CHROME_ENV_STRIP)} removed from its environment (it "
+            f"times out on a trivial loopback page that urllib fetches "
+            f"instantly). Page wiring cannot be measured here. The Order Board "
+            f"logic itself is covered by tests/test_ui_orders_store.py, "
             f"tests/test_ui_orders_api.py, and "
             f"tests/test_ui_orders_board_ui.py."
         )
@@ -361,9 +410,33 @@ def _served_page() -> str:
     return html.replace("</head>", injection + "</head>")
 
 
-def _page_server(directory: int) -> tuple[socketserver.TCPServer, str]:
-    """Serve the real static files plus the instrumented page on loopback."""
-    html = _served_page()
+def _page_server(
+    directory: int,
+    *,
+    extra_probes: dict[str, pathlib.Path] | None = None,
+    html: str | None = None,
+) -> tuple[socketserver.TCPServer, str]:
+    """Serve the real static files plus the instrumented page on loopback.
+
+    Args:
+        directory: Accepted for signature compatibility with older callers and
+            unused; the served tree is the package's static directory.
+        extra_probes: URL path -> file on disk, for another module reusing this
+            server. Resolved per request, so a caller can pass its own probe
+            without this module's behaviour changing.
+        html: The page to serve. Defaults to this module's own instrumented
+            page. A caller reusing this server passes its own, because the probe
+            that reads the measurements and the probe that produces them have to
+            be the same one -- a server that injected its own page would serve a
+            page measuring the wrong document.
+    """
+    page = _served_page() if html is None else html
+    # Bound to a distinct local so the closure below sees a plain str.
+    page_html = page
+    # Bound to a distinct local so the closure below sees a plain dict. Rebinding
+    # the parameter inside the enclosing function is invisible to a type checker
+    # inside the nested class, and this way the narrowing is real.
+    probes: dict[str, pathlib.Path] = dict(extra_probes or {})
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def translate_path(self, path: str) -> str:
@@ -375,13 +448,22 @@ def _page_server(directory: int) -> tuple[socketserver.TCPServer, str]:
             # The probe is served from this origin. A `file://` script on an
             # `http://` page is refused by Chrome, which is a property of the
             # harness and not of the page under test.
+            #
+            # `EXTRA_PROBES` lets a second module reuse this server without
+            # duplicating the handler. Each name maps to the path it is served
+            # under, and the mapping is resolved per request rather than captured
+            # at construction -- so a module that points its own path at a
+            # different file gets that file, and this module's own behaviour is
+            # unchanged when the mapping is empty.
             if name == "__order-board-probe.js":
                 return str(PROBE_JS)
+            if name in probes:
+                return str(probes[name])
             return str(STATIC / name)
 
         def do_GET(self) -> None:  # noqa: N802 - stdlib API
             if self.translate_path(self.path) == "":
-                body = html.encode("utf-8")
+                body = page_html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -422,6 +504,7 @@ def _measure(width: int, height: int) -> dict[str, object]:
             capture_output=True,
             text=True,
             timeout=120,
+            env=chrome_env(),
         )
     finally:
         server.shutdown()

@@ -40,6 +40,23 @@
         <dd id="model" class="mono">&mdash;</dd>
       </div>
     </dl>
+    <!--
+      Reserved slot for future workspace/agent/model selectors.
+
+      Deliberately empty and hidden in this strike. It exists so that a later
+      change can drop controls in without redesigning the header a second time:
+      the responsive rules for a wrapping row of controls already exist (see
+      `.bar-selectors` in styles.css), so the header is measured and laid out
+      for that case even though nothing fills it yet.
+
+      Two things it must not become. It is not a place to decide anything -- a
+      selector here would post a command, and the page does not decide, it asks.
+      And a future selector must not be built from anything already in the DOM:
+      workspace, agent, and model are fixed per process and are rendered from
+      GET /api/status, so a control that could change them would be advertising
+      a capability the server does not have.
+    -->
+    <div class="bar-selectors" id="bar-selectors" hidden></div>
     <div class="models" id="models">
       <!--
         The model-health indicator lives here, drawn by health.js from
@@ -85,8 +102,48 @@
   <main class="split" id="workbench-view">
     <section class="pane conversation" aria-label="Byte conversation">
       <div class="pane-head">
-        <h2>Conversation</h2>
-        <span class="hint" id="stream-hint">stream: connecting</span>
+        <div class="pane-head-titles">
+          <h2>Conversation</h2>
+          <!--
+            The derived activity line. It is written only by `renderActivity`
+            in app.js, from events that already exist; see the rules on that
+            function for what it is and is not allowed to say.
+
+            It is in the conversation header rather than the Activity feed
+            because the feed is a log and this is the status. At desktop widths
+            they sit side by side; at <=900px the feed becomes a sheet and this
+            line is the only live signal left on the primary surface, which is
+            the whole reason an iPad run stopped looking idle.
+          -->
+          <p class="activity-line" id="activity-line" role="status" aria-live="polite">
+            <span class="activity-dot" aria-hidden="true"></span>
+            <span id="activity-text">Idle</span>
+          </p>
+        </div>
+        <div class="pane-head-actions">
+          <span class="hint" id="stream-hint">stream: connecting</span>
+          <!--
+            Opens the Activity sheet. Only visible at <=900px, where the feed
+            is an overlay; at wider widths the feed is already on screen and
+            this button would be a control that does nothing, so it is removed
+            from the layout rather than left inert.
+
+            `aria-expanded` is the fact assistive tech reads, and it is the same
+            attribute the model-health detail panel uses -- one convention, not
+            two. The feed is never destroyed when closed: it keeps receiving
+            events, so opening the sheet shows the run's actual history rather
+            than an empty panel.
+          -->
+          <button
+            type="button"
+            class="activity-toggle"
+            id="activity-toggle"
+            aria-expanded="false"
+            aria-controls="activity-pane"
+          >
+            Activity
+          </button>
+        </div>
       </div>
       <ol class="thread" id="thread" aria-live="polite"></ol>
       <form class="composer" id="composer" autocomplete="off">
@@ -103,10 +160,32 @@
       </form>
     </section>
 
-    <section class="pane activity" aria-label="Activity">
+    <!--
+      The Activity feed.
+
+      `id="activity-pane"` is what the toggle button's `aria-controls` points
+      at, so the relationship is in the markup rather than implied by position.
+
+      On a wide screen this is a column beside the conversation. At <=900px it
+      becomes a sheet over the conversation -- see `.pane.activity` in
+      styles.css -- and the close button appears. The feed itself is untouched
+      in both cases: same #feed, same event rows, same bounded metadata. Nothing
+      about what Forge reports changes because of the layout.
+    -->
+    <section class="pane activity" id="activity-pane" aria-label="Activity">
       <div class="pane-head">
         <h2>Activity</h2>
-        <span class="hint">metadata only &mdash; no file contents, no process output</span>
+        <div class="pane-head-actions">
+          <span class="hint">metadata only &mdash; no file contents, no process output</span>
+          <button
+            type="button"
+            class="activity-close"
+            id="activity-close"
+            aria-label="Close activity"
+          >
+            Close
+          </button>
+        </div>
       </div>
       <ol class="feed" id="feed" aria-live="polite"></ol>
     </section>
