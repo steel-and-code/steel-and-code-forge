@@ -43,10 +43,9 @@ fallbacks = [
 
 [tiers.coding_standard]
 # The workhorse: editing code, running tests, following the tool loop.
-primary = { model = "byte-coder", provider = "local" }
+primary = { model = "nvidia/nemotron-3-super-120b-a12b:free", provider = "openrouter" }
 fallbacks = [
-    { model = "anthropic/claude-sonnet-4", provider = "openrouter" },
-    { model = "openai/gpt-4o", provider = "openrouter" },
+    { model = "byte-coder", provider = "local" },
 ]
 
 [tiers.reasoning_heavy]
