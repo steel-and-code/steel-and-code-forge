@@ -170,8 +170,12 @@ class AgentRuntime:
 
         self.max_output_tokens = max_output_tokens or profile.max_output_tokens
 
-    def run(self, task: str) -> RunResult:
+    def run(self, task: str, state: ConversationState | None = None) -> RunResult:
         """Execute one task to completion.
+
+        ``state`` may be supplied by a session surface. It is appended to, never
+        reconstructed from prose, so assistant tool calls and their results keep
+        their provider-required ordering.
 
         Returns:
             The model's final message and the conversation that produced it.
@@ -182,7 +186,8 @@ class AgentRuntime:
                 Propagates deliberately -- a provider failure is not something
                 the model can be told about and recover from.
         """
-        state = ConversationState()
+        if state is None:
+            state = ConversationState()
         state.add_user(task)
 
         tool_specs = self.dispatcher.tool_specs()

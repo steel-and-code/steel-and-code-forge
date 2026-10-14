@@ -819,10 +819,14 @@ class TerminalApprovalChannel:
         prompt_stream: object | None = None,
         read: Callable[[str], str] | None = None,
         available: bool | None = None,
+        before_prompt: Callable[[], None] | None = None,
+        after_prompt: Callable[[], None] | None = None,
     ) -> None:
         self._prompt_stream = prompt_stream if prompt_stream is not None else sys.stdout
         self._read = read if read is not None else input
         self._available_override = available
+        self._before_prompt = before_prompt
+        self._after_prompt = after_prompt
 
     @property
     def available(self) -> bool:
@@ -846,6 +850,8 @@ class TerminalApprovalChannel:
             an exception into the caller's flow.
         """
         try:
+            if self._before_prompt is not None:
+                self._before_prompt()
             print(prompt, file=self._prompt_stream)  # type: ignore[arg-type]
             return self._read("")
         except (EOFError, KeyboardInterrupt):
@@ -853,6 +859,9 @@ class TerminalApprovalChannel:
         except (ValueError, OSError):
             # A closed or unwritable stream. No operator was reached.
             return None
+        finally:
+            if self._after_prompt is not None:
+                self._after_prompt()
 
 
 class ScriptedApprovalChannel:

@@ -255,6 +255,15 @@ class OpenRouterGateway:
                 f"model provider returned HTTP {status}{suffix}"
             )
 
+        # A provider can return an OpenRouter error envelope with HTTP 200. It
+        # is still a provider failure, not a successful response with no choices.
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            metadata = _safe_error_metadata(parsed)
+            suffix = f" ({metadata})" if metadata else ""
+            raise GatewayError(
+                f"model provider returned an error{suffix}"
+            )
+
         return self._parse_response(parsed)
 
     # -- encoding --------------------------------------------------------

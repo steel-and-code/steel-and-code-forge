@@ -32,6 +32,7 @@ from forge.agents.runtime import (
     AgentRuntime,
     MaxTurnsExceeded,
 )
+from forge.agents.state import ConversationStateStore
 from forge.models.base import GatewayError
 from forge.models.scripted import ScriptedGateway, ScriptedTurn
 from forge.tools.approval import Approver, ScriptedApprovalChannel
@@ -97,6 +98,28 @@ def test_text_only_response_ends_the_run(dispatcher_factory) -> None:
     assert result.text == "Nothing to do."
     assert result.turns == 1
     assert result.tool_calls == 0
+
+
+def test_state_store_preserves_two_turn_message_continuity(dispatcher_factory, workspace) -> None:
+    dispatcher, _ = dispatcher_factory()
+    state = ConversationStateStore().get(workspace.root, "BYTE")
+    gateway = ScriptedGateway([ScriptedTurn(text="first"), ScriptedTurn(text="second")])
+    runtime = _runtime(gateway, dispatcher)
+
+    runtime.run("remember this", state=state)
+    runtime.run("what did I say?", state=state)
+
+    assert [m.content for m in gateway.requests[1].messages if m.role == "user"] == [
+        "remember this", "what did I say?"
+    ]
+    assert gateway.requests[1].messages[1].role == "assistant"
+
+
+def test_state_store_isolates_agent_and_normalized_workspace(dispatcher_factory, workspace, tmp_path) -> None:
+    store = ConversationStateStore()
+    assert store.get(workspace.root, "Byte") is store.get(workspace.root / ".", "byte")
+    assert store.get(workspace.root, "byte") is not store.get(workspace.root, "neighbor")
+    assert store.get(workspace.root, "byte") is not store.get(tmp_path, "byte")
 
 
 def test_tool_call_dispatches_appends_and_continues(dispatcher_factory, workspace) -> None:

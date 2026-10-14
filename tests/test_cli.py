@@ -16,6 +16,7 @@ regression that every other test here would happily accept.
 from __future__ import annotations
 
 import importlib
+from importlib import metadata
 import io
 import json
 import re
@@ -150,6 +151,54 @@ def run_recording(argv: list[str], responses: list[str | None]) -> Run:
 # ==========================================================================
 # Argument parsing
 # ==========================================================================
+
+
+def test_version_reports_packaged_distribution_version(monkeypatch, capsys) -> None:
+    def installed_version(name: str) -> str:
+        assert name == "forge"  # [project].name in pyproject.toml
+        return "0.2.0a1"
+
+    monkeypatch.setattr(metadata, "version", installed_version)
+    monkeypatch.setattr(_module("forge.cli.main").tomllib, "load", lambda _source: {})
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["--version"])
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == "forge 0.2.0a1\n"
+
+
+def test_version_uses_checkout_version_when_distribution_is_absent(monkeypatch, capsys) -> None:
+    def not_installed(_name: str) -> str:
+        raise metadata.PackageNotFoundError("forge")
+
+    monkeypatch.setattr(metadata, "version", not_installed)
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["--version"])
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == "forge 0.2.0a1\n"
+
+
+def test_version_uses_checkout_version_when_editable_metadata_is_stale(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(metadata, "version", lambda _name: "0.1.0")
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["--version"])
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == "forge 0.2.0a1\n"
+
+
+def test_version_does_not_invent_a_version_without_metadata_or_checkout(monkeypatch, capsys) -> None:
+    def not_installed(_name: str) -> str:
+        raise metadata.PackageNotFoundError("forge")
+
+    monkeypatch.setattr(metadata, "version", not_installed)
+    monkeypatch.setattr(_module("forge.cli.main").tomllib, "load", lambda _source: {})
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["--version"])
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == "forge unknown (distribution metadata unavailable)\n"
 
 
 def test_parser_exposes_check_with_two_subjects() -> None:

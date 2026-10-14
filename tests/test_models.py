@@ -396,6 +396,35 @@ def test_provider_error_body_is_not_echoed(monkeypatch) -> None:
     assert "auth_error" in message
 
 
+def test_openrouter_top_level_error_envelope_is_provider_error(monkeypatch) -> None:
+    """An error envelope must not fall through to the no-choices diagnostic."""
+    from forge.models.openrouter import OpenRouterGateway
+
+    gateway = OpenRouterGateway(environ={"FORGE_OPENROUTER_API_KEY": "x"})
+    body = json.dumps(
+        {
+            "error": {
+                "code": "model_not_found",
+                "message": "provider request details must not be exposed",
+                "metadata": {"secret": "must-not-leak"},
+            },
+            "id": "provider-request-id",
+        }
+    )
+    monkeypatch.setattr(gateway, "_post", lambda *a, **k: (200, body))
+
+    with pytest.raises(GatewayError) as caught:
+        gateway.complete(CompletionRequest(system="s", messages=(), model="m"))
+
+    message = str(caught.value)
+    assert "returned an error" in message
+    assert "model_not_found" in message
+    assert "no choices" not in message
+    assert "provider request details" not in message
+    assert "must-not-leak" not in message
+    assert "provider-request-id" not in message
+
+
 def test_openrouter_gateway_satisfies_the_protocol(monkeypatch) -> None:
     from forge.models.openrouter import OpenRouterGateway
 

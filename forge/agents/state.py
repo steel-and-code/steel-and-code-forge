@@ -17,10 +17,12 @@ nothing secret-shaped is ever constructed as a message.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+import threading
 
 from ..models.base import Message
 
-__all__ = ["ConversationState", "DenialRecord"]
+__all__ = ["ConversationState", "ConversationStateStore", "DenialRecord"]
 
 
 @dataclass(frozen=True)
@@ -107,3 +109,20 @@ class ConversationState:
 
     def __len__(self) -> int:
         return len(self.messages)
+
+
+class ConversationStateStore:
+    """In-memory conversation states, isolated by workspace and agent."""
+
+    def __init__(self) -> None:
+        self._states: dict[tuple[str, str], ConversationState] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(workspace: str | Path, agent: str) -> tuple[str, str]:
+        return str(Path(workspace).expanduser().resolve()), agent.strip().lower()
+
+    def get(self, workspace: str | Path, agent: str) -> ConversationState:
+        key = self._key(workspace, agent)
+        with self._lock:
+            return self._states.setdefault(key, ConversationState())

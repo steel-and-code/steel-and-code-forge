@@ -34,8 +34,10 @@ declared global and then required to precede the leaf.
 from __future__ import annotations
 
 import argparse
+from importlib import metadata
 import os
 import sys
+import tomllib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Mapping, Sequence, TextIO
@@ -181,12 +183,32 @@ Usage:
   forge hermes --workspace DIR [--max-turns N] [--timeout SECONDS] "task"
   forge hermes --workspace DIR --task-file PATH
   forge workbench --workspace DIR [--model ID] [--port 8765]
+  forge tui --workspace DIR
 """
 
 
 # --------------------------------------------------------------------------
 # Parser
 # --------------------------------------------------------------------------
+
+
+def _forge_version() -> str:
+    """Use distribution metadata, accounting for stale editable-install metadata."""
+    try:
+        installed = metadata.version("forge")
+    except metadata.PackageNotFoundError:
+        installed = None
+    # An editable checkout can retain old installed metadata after pyproject
+    # changes. The source tree being executed is authoritative in that case;
+    # a wheel has no pyproject.toml beside its installed package.
+    try:
+        with (Path(__file__).resolve().parents[2] / "pyproject.toml").open("rb") as source:
+            project = tomllib.load(source)["project"]
+        if project["name"] == "forge":
+            return project["version"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return installed or "unknown (distribution metadata unavailable)"
 
 
 def _shared_options() -> argparse.ArgumentParser:
@@ -255,7 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version="forge 0.1.0",
+        version=f"forge {_forge_version()}",
     )
 
     sub = parser.add_subparsers(dest="subcommand", metavar="COMMAND")
@@ -699,6 +721,17 @@ def build_parser() -> argparse.ArgumentParser:
             "setting: the bind address is fixed at 127.0.0.1 and there is no "
             "flag to change it."
         ),
+    )
+
+    tui_parser = sub.add_parser(
+        "tui",
+        help="open the terminal UI (placeholder)",
+    )
+    tui_parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        default=None,
+        help=f"explicit workspace root (required; may also be set via {WORKSPACE_ENV})",
     )
 
     return parser
@@ -1334,6 +1367,7 @@ def _run_agent(
     err: TextIO,
     environ: dict[str, str],
     channel: ApprovalChannel | None,
+    conversation_state=None,
 ) -> int:
     """Run one agent on one task.
 
@@ -1418,7 +1452,8 @@ def _run_agent(
     )
 
     try:
-        result = runtime.run(task)
+        result = runtime.run(task, state=conversation_state)
+
     except MaxTurnsExceeded as exc:
         print(f"forge: {exc}", file=err)
         return EXIT_INTERNAL
@@ -1442,6 +1477,7 @@ def _run_byte(
     err: TextIO,
     environ: dict[str, str],
     channel: ApprovalChannel | None,
+    conversation_state=None,
 ) -> int:
     """Run Byte on one task.
 
@@ -1461,6 +1497,7 @@ def _run_byte(
         err=err,
         environ=environ,
         channel=channel,
+        conversation_state=conversation_state,
     )
 
 
@@ -1472,6 +1509,7 @@ def _run_neighbor(
     err: TextIO,
     environ: dict[str, str],
     channel: ApprovalChannel | None,
+    conversation_state=None,
 ) -> int:
     """Run Neighbor on one task.
 
@@ -1492,6 +1530,7 @@ def _run_neighbor(
         err=err,
         environ=environ,
         channel=channel,
+        conversation_state=conversation_state,
     )
 
 
@@ -2021,6 +2060,7 @@ def main(
     out: TextIO | None = None,
     err: TextIO | None = None,
     environ: dict[str, str] | None = None,
+    conversation_state=None,
 ) -> int:
     """Run the CLI and return an exit code.
 
@@ -2033,6 +2073,7 @@ def main(
         out: Stream for results. Defaults to stdout.
         err: Stream for usage and failure messages. Defaults to stderr.
         environ: Environment mapping. Defaults to ``os.environ``.
+        conversation_state: Optional session transcript. Standalone tasks are stateless.
 
     Returns:
         One of the exit codes in ``forge.cli.render``. Never raises for an
@@ -2122,6 +2163,7 @@ def main(
                 err=err_stream,
                 environ=env,
                 channel=channel,
+                conversation_state=conversation_state,
             )
 
         if args.subcommand == "hermes":
@@ -2167,6 +2209,16 @@ def main(
                 err=err_stream,
                 environ=env,
             )
+
+        if args.subcommand == "tui":
+            workspace, problem = _resolve_workspace(args.workspace, env)
+            if workspace is None:
+                print(f"forge: {problem}", file=err_stream)
+                return EXIT_USAGE
+            from . import tui
+
+            tui.run(workspace.root)
+            return EXIT_OK
 
         print(f"forge: unknown command: {args.subcommand!r}", file=err_stream)
         return EXIT_USAGE
