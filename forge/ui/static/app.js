@@ -41,6 +41,13 @@
  *   instead, because EventSource cannot set headers. The token is read from a
  *   meta tag the server filled in, kept in a closure, and never put in a URL.
  *
+ *   LAN MODE ADDITION, NOT A CHANGE TO THE RULE. In LAN mode that meta tag is
+ *   empty until the operator unlocks, and the token arrives in the POST
+ *   /api/unlock response instead -- into the same closure variable, used the
+ *   same way, and still never in a URL. The passphrase is posted once and
+ *   discarded, and the session that replaces it is an HttpOnly cookie this
+ *   script can neither read nor write. See the unlock section below.
+ *
  * - THE SERVER IS THE ONLY SOURCE OF STATE. Nothing here decides anything. A
  *   click posts a decision and then waits to be told what happened; if the
  *   answer is 409, the card says so rather than pretending it worked.
@@ -94,6 +101,15 @@
   var TOKEN =
     (document.querySelector('meta[name="forge-ui-token"]') || {}).content || "";
 
+  /* LAN mode only: the server set this to "1" when it served the page to a
+   * client that has not unlocked, and to "" otherwise. It is read here as a
+   * stated fact rather than inferred from TOKEN being empty, because an empty
+   * token on a loopback page is a bug and an empty token here is a policy, and
+   * the page must not present the same broken-looking surface for the two.
+   */
+  var LOCKED =
+    (document.querySelector('meta[name="forge-ui-locked"]') || {}).content === "1";
+
   var el = {
     workspace: document.getElementById("workspace"),
     agent: document.getElementById("agent"),
@@ -108,6 +124,7 @@
     feed: document.getElementById("feed"),
     activityLine: document.getElementById("activity-line"),
     activityText: document.getElementById("activity-text"),
+    runStatus: document.getElementById("run-status"),
     activityToggle: document.getElementById("activity-toggle"),
     activityClose: document.getElementById("activity-close"),
     composer: document.getElementById("composer"),
@@ -119,6 +136,10 @@
     approvalNote: document.getElementById("approval-note"),
     approve: document.getElementById("approve"),
     reject: document.getElementById("reject"),
+    unlockOverlay: document.getElementById("unlock-overlay"),
+    unlockForm: document.getElementById("unlock-form"),
+    unlockPassphrase: document.getElementById("unlock-passphrase"),
+    unlockNote: document.getElementById("unlock-note"),
   };
 
   // The pending approval id, as the server last reported it. Held in memory
@@ -161,6 +182,32 @@
     var text = STATE_TEXT[state] || state || "unknown";
     el.stateChip.setAttribute("data-state", state || "idle");
     el.stateLabel.textContent = text;
+  }
+
+  function formatDuration(seconds) {
+    seconds = Math.max(0, Number(seconds) || 0);
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = seconds % 60;
+    return (h ? String(h).padStart(2, "0") + ":" : "") +
+      String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+
+  function renderRunStatus(status) {
+    if (!el.runStatus) return;
+    if (!status || !status.run_id) { el.runStatus.textContent = ""; return; }
+    var max = status.max_turns == null ? "?" : status.max_turns;
+    var line = "Turn " + (status.turns || 0) + " / " + max +
+      " · " + (status.tool_calls || 0) + " tool calls · " +
+      (status.activity || "Working");
+    var noActivity = Number(status.no_activity_seconds);
+    var live = status.state === "running" || status.state === "waiting_for_approval";
+    if (live && Number.isFinite(noActivity) && noActivity >= LIVENESS_MIN_SECONDS) {
+      line += " · No activity for " + Math.floor(noActivity) + "s";
+    }
+    line += " · " + formatDuration(status.elapsed_seconds);
+    if (status.state === "waiting_for_approval") line = "Waiting for approval · " + line;
+    el.runStatus.textContent = line;
   }
 
   // -- the derived activity line ---------------------------------------
@@ -651,6 +698,7 @@
         el.agent.textContent = status.agent || "—";
         el.model.textContent = status.model || "—";
         setState(status.state);
+        renderRunStatus(status);
         // The single source of truth for a pending approval. A refresh lands
         // here, so a reload mid-decision recovers the same id and the card
         // reappears.
@@ -692,13 +740,47 @@
    */
   function syncActivityToStatus(status) {
     if (!status || !el.activityText) return;
-    if (status.state === "running" || status.state === "waiting_for_approval") {
+    if (status.state === "running") {
+      // Status snapshots may carry progress that has not arrived as an event.
+      // Prefer it to the generic running label, but keep the event-derived
+      // label for older/minimal snapshots.
+      var hasProgress =
+        status.turns != null ||
+        status.max_turns != null ||
+        status.tool_calls != null ||
+        status.activity != null ||
+        status.elapsed_seconds != null ||
+        status.no_activity_seconds != null;
+      if (hasProgress) {
+        var max = status.max_turns == null ? "?" : status.max_turns;
+        var line = "Turn " + (status.turns == null ? 0 : status.turns) +
+          " / " + max + " · " +
+          (status.tool_calls == null ? 0 : status.tool_calls) +
+          " tool calls · " + (status.activity || "Working");
+        var noActivity = Number(status.no_activity_seconds);
+        if (Number.isFinite(noActivity) && noActivity >= LIVENESS_MIN_SECONDS) {
+          line += " · No activity for " + Math.floor(noActivity) + "s";
+        }
+        line += " · " + formatDuration(status.elapsed_seconds);
+        activity = { text: line, kind: "work" };
+        activitySince = 0;
+        stopLiveness();
+        renderActivity();
+        return;
+      }
+      activity = activityFor("session.state", { state: status.state });
+      activitySince = Date.now();
+      renderActivity();
+      if (!livenessTimer) startLiveness();
+      else tickLiveness();
+    } else if (status.state === "waiting_for_approval") {
       activity = activityFor("session.state", { state: status.state });
       activitySince = Date.now();
       renderActivity();
       if (!livenessTimer) startLiveness();
       else tickLiveness();
     } else {
+      // Terminal states remain authoritative over any progress snapshot.
       activity = activityFor("session.state", { state: status.state || "idle" });
       activitySince = 0;
       renderActivity();
@@ -1327,7 +1409,97 @@
     setActivityOpen(false);
   });
 
+  // -- unlock -----------------------------------------------------------
+  //
+  // LAN mode only. On loopback the server never sets the locked flag, none of
+  // this runs, and the page starts exactly as it always did.
+  //
+  // What this does and does not hold to:
+  //
+  // - THE PASSPHRASE IS POSTED ONCE AND FORGOTTEN. It is read from the input,
+  //   sent, and the field is cleared immediately. It is never stored, never
+  //   written to localStorage or sessionStorage, and never placed in a URL.
+  // - THE TOKEN IS NOT STORED. The server answers the unlock with the UI token;
+  //   it goes into the same closure variable the meta tag would have filled and
+  //   nowhere else. That is why the header protocol is unchanged and why a
+  //   refresh re-presents the lock: the session cookie is the session, and the
+  //   page deliberately never becomes one.
+  // - A REFUSED UNLOCK SAYS NOTHING ABOUT WHY IT FAILED, because the server's
+  //   refusal names no field. The note restates the status without inventing a
+  //   cause, and never reports "wrong passphrase" -- a client that could tell
+  //   "wrong passphrase" from "locked out" from "not unlocked" is a client
+  //   that can sweep.
+  // - ON SUCCESS THE PAGE RELOADS rather than trying to patch itself back into
+  //   a working run. Re-deriving state from the server is this page's existing
+  //   rule for every other state change, and a reload is the one path that
+  //   cannot leave a half-initialised transcript behind.
+
+  function showUnlockNote(message) {
+    if (!el.unlockNote) return;
+    el.unlockNote.textContent = message;
+    el.unlockNote.hidden = false;
+  }
+
+  function unlock(passphrase) {
+    // Plain fetch, not guardedFetch: there is no token yet, and that is the
+    // whole reason this request exists. The Origin and Host guards are the
+    // server's, and the browser attaches both.
+    return fetch("/api/unlock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passphrase: passphrase }),
+    }).then(function (response) {
+      if (response.status === 401) {
+        showUnlockNote("Not unlocked.");
+        return;
+      }
+      if (response.status === 429) {
+        showUnlockNote("Too many attempts. Wait a moment and try again.");
+        return;
+      }
+      if (!response.ok) throw new Error("unlock " + response.status);
+      return response.json();
+    });
+  }
+
+  function startLocked() {
+    if (el.unlockOverlay) el.unlockOverlay.hidden = false;
+    if (el.unlockPassphrase) el.unlockPassphrase.focus();
+    // No status read, no ticket, no stream, no model health. Every one of them
+    // would be a request carrying an empty token, and every one would be
+    // refused -- four 403s in the console on a page that is behaving correctly.
+    if (el.unlockForm) {
+      el.unlockForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var value = el.unlockPassphrase ? el.unlockPassphrase.value : "";
+        if (!value) return;
+        if (el.unlockPassphrase) el.unlockPassphrase.value = "";
+        unlock(value).then(function (body) {
+          // The server sets the session cookie; the reload presents it, and
+          // the page comes back with the token in its meta tag as usual.
+          if (body && body.token) window.location.reload();
+        }).catch(function () {
+          showUnlockNote("Could not reach the workbench.");
+        });
+      });
+    }
+  }
+
   // -- wiring ----------------------------------------------------------
+
+  /* LAN mode, locked client. Return before any wiring, before the first
+   * request, and before the feed is seeded.
+   *
+   * Every listener below would be attached to controls the operator cannot use
+   * and every request would carry an empty token, so the whole tail is skipped
+   * rather than made individually safe. After a successful unlock the page
+   * reloads and arrives here with the locked flag clear, so this is a one-way
+   * branch and needs no teardown.
+   */
+  if (LOCKED) {
+    startLocked();
+    return;
+  }
 
   el.composer.addEventListener("submit", function (event) {
     event.preventDefault();

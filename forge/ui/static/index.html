@@ -18,6 +18,13 @@
   -->
   <title>Forge Workbench</title>
   <meta name="forge-ui-token" content="__FORGE_UI_TOKEN__">
+  <!--
+    LAN mode only. The server substitutes "1" when this client has not unlocked
+    and "" otherwise, so the script branches on a fact the server stated rather
+    than on the absence of a token. An empty token on a loopback page would be a
+    bug; here it is a policy, and the two must not look alike.
+  -->
+  <meta name="forge-ui-locked" content="__FORGE_UI_LOCKED__">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -119,6 +126,7 @@
             <span class="activity-dot" aria-hidden="true"></span>
             <span id="activity-text">Idle</span>
           </p>
+          <p class="run-status" id="run-status" role="status" aria-live="polite"></p>
         </div>
         <div class="pane-head-actions">
           <span class="hint" id="stream-hint">stream: connecting</span>
@@ -259,6 +267,44 @@
         <button type="button" class="reject" id="reject">Reject</button>
       </div>
       <p class="approval-note" id="approval-note" hidden></p>
+    </section>
+  </div>
+
+  <!--
+    The unlock form. LAN mode only, and hidden on a loopback page because the
+    server sets the locked meta to "" there.
+
+    It carries no run state, no workspace path, no model id, and no version:
+    a device that has not authenticated learns that a workbench is running and
+    nothing else. That is a deliberate limit, not a first pass -- the workspace
+    path and the model id are both on this page one script line away, and
+    rendering them before the passphrase is presented would hand a
+    network-adjacent device exactly the reconnaissance a password prompt should
+    not leak.
+
+    No localStorage and no cookie read here either. The passphrase is posted
+    once and forgotten; the server answers with an HttpOnly session cookie
+    that this script never sees and never stores. A refresh re-presents the
+    lock, which is correct: the cookie is the session, and the page never
+    becomes one.
+  -->
+  <div class="overlay" id="unlock-overlay" hidden>
+    <section class="card" role="dialog" aria-modal="true" aria-labelledby="unlock-title">
+      <p class="eyebrow" id="unlock-title">Forge Workbench</p>
+      <p class="lede">This workbench is on the network. Enter the passphrase to watch the run.</p>
+      <form class="unlock-form" id="unlock-form" autocomplete="off">
+        <label class="sr-only" for="unlock-passphrase">Passphrase</label>
+        <input
+          type="password"
+          id="unlock-passphrase"
+          name="passphrase"
+          autocomplete="current-password"
+          required
+          placeholder="Passphrase"
+        />
+        <button type="submit" id="unlock-submit">Unlock</button>
+      </form>
+      <p class="approval-note" id="unlock-note" role="status" aria-live="polite" hidden></p>
     </section>
   </div>
 

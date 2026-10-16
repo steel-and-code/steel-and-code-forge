@@ -660,11 +660,17 @@ def test_a_run_returns_to_a_terminal_state_and_accepts_another(
     workspace: Workspace,
 ) -> None:
     session = _session(workspace, [ScriptedTurn(text="one"), ScriptedTurn(text="two")])
-    session.submit("first")
+    first_id = session.submit("first")
     assert _wait_for(lambda: session.state is UiSessionState.COMPLETED)
+    assert session.status()["result"]["text"] == "one"
 
-    session.submit("second")
-    assert _wait_for(lambda: session.status()["result"]["text"] == "two")
+    second_id = session.submit("second")
+    assert second_id != first_id
+    assert _wait_for(lambda: session.state is UiSessionState.COMPLETED)
+    status = session.status()
+    assert status["run_id"] == second_id
+    assert status["state"] == "completed"
+    assert status["result"]["text"] == "two"
 
 
 def test_status_reports_the_fixed_workspace(workspace: Workspace) -> None:
@@ -674,6 +680,29 @@ def test_status_reports_the_fixed_workspace(workspace: Workspace) -> None:
     assert status["agent"] == "byte"
     assert status["model"] == "scripted"
     assert status["run_id"] is None
+
+
+def test_status_reports_truthful_run_observables(workspace: Workspace) -> None:
+    session = _session(
+        workspace,
+        [
+            ScriptedTurn(
+                text="done",
+                tool_calls=(("search_files", {"pattern": "*.py"}),),
+            ),
+            ScriptedTurn(text="final"),
+        ],
+        max_turns=4,
+    )
+    session.submit("inspect")
+    assert _wait_for(lambda: session.state is UiSessionState.COMPLETED)
+    status = session.status()
+    assert status["max_turns"] == 4
+    assert status["turns"] == 2
+    assert status["tool_calls"] == 1
+    assert status["activity"] == "Completed"
+    assert isinstance(status["elapsed_seconds"], int)
+    assert isinstance(status["no_activity_seconds"], int)
 
 
 def test_session_states_have_no_cancelled() -> None:

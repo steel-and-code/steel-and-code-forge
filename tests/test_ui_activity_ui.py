@@ -417,6 +417,47 @@ def test_a_live_run_reported_by_the_server_does_tick() -> None:
     assert labels(report)[-1] == "Byte is working · No activity for 25s"
 
 
+def test_status_progress_is_visible_and_terminal_states_win() -> None:
+    """A status snapshot must expose progress without weakening state authority."""
+    report = drive(
+        {
+            "status": {
+                "state": "running",
+                "turns": 8,
+                "max_turns": 25,
+                "tool_calls": 16,
+                "activity": "Model working",
+                "elapsed_seconds": 63,
+                "no_activity_seconds": 23,
+            }
+        },
+        {
+            "status": {
+                "state": "running",
+                "turns": 2,
+                "max_turns": 25,
+                "tool_calls": 3,
+                "activity": "Recent activity",
+                "elapsed_seconds": 9,
+                "no_activity_seconds": 9,
+            }
+        },
+        {"status": {"state": "waiting_for_approval"}},
+        {"status": {"state": "completed"}},
+        {"status": {"state": "failed"}},
+    )
+
+    assert labels(report) == [
+        "Turn 8 / 25 · 16 tool calls · Model working · No activity for 23s · 01:03",
+        "Turn 2 / 25 · 3 tool calls · Recent activity · 00:09",
+        "Waiting for your approval",
+        "Completed",
+        "Failed",
+    ]
+    assert "No activity" not in labels(report)[1]
+    assert kinds(report) == ["work", "work", "wait", "good", "bad"]
+
+
 # -- the sheet ------------------------------------------------------------
 
 

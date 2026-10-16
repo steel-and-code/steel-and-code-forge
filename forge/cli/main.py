@@ -131,10 +131,16 @@ DEFAULT_HERMES_TIMEOUT = 900.0
 #: passed as argv[0] and no shell is involved.
 HERMES_PROGRAM_ENV = "FORGE_HERMES_PROGRAM"
 
-#: The Workbench bind address is fixed, and not configurable. Stated as a
-#: constant rather than merely omitted from the parser so that a future edit
-#: adding a `--host` flag has to delete a named safety property rather than
-#: just supply a new argument.
+#: The Workbench bind address in its default mode, and not configurable there.
+#: Stated as a constant rather than merely omitted from the parser so that a
+#: future edit adding a `--host` flag has to delete a named safety property
+#: rather than just supply a new argument.
+#:
+#: LAN mode is a separate, explicit, and narrower path -- see ``--lan`` and
+#: ``--lan-address`` in the workbench parser. It binds one named literal
+#: address, never this constant's opposite, and it is not reachable by editing
+#: anything else: no default, no environment variable, and no value that means
+#: "any interface".
 WORKBENCH_BIND_HOST = "127.0.0.1"
 
 #: Default loopback port for `forge workbench`.
@@ -171,7 +177,9 @@ model routing.
 `forge hermes` invokes the external Hermes Agent as a subprocess, text-only:
 Forge cannot classify its internal tool calls, so it grants it no capabilities.
 Hermes picks its own model; Forge only reports it.
-`forge workbench` serves a local browser view of one Byte run on loopback.
+`forge workbench` serves a local browser view of one Byte run on loopback, or
+on one named LAN address with `--lan --lan-address` when you want to watch it
+on a tablet.
 
 Usage:
   forge check command --workspace DIR [-- PROGRAM [ARG...]]
@@ -183,6 +191,7 @@ Usage:
   forge hermes --workspace DIR [--max-turns N] [--timeout SECONDS] "task"
   forge hermes --workspace DIR --task-file PATH
   forge workbench --workspace DIR [--model ID] [--port 8765]
+  forge workbench --workspace DIR --lan --lan-address ADDR [--lan-steer]
   forge tui --workspace DIR
 """
 
@@ -670,20 +679,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     workbench_parser = sub.add_parser(
         "workbench",
-        help="serve a local browser surface for one Byte run",
+        help="serve a local browser surface for one Byte run, on loopback or one named LAN address",
         description=(
             "Serve the Forge Workbench on this machine: a single-page view of "
             "one Byte run, its tool activity, and any approval it needs. A "
             "human is present, so an approval-required operation prompts and "
             "waits -- this is the same question the terminal asks, asked "
             "through a browser.\n\n"
-            "Binds 127.0.0.1 only, with no option to widen it. Every request "
-            "carrying a capability requires a per-process token plus a "
-            "same-origin check (exact Origin on a POST; on a GET, exact "
+            "Binds 127.0.0.1 only by default, with no option to widen it. "
+            "Every request carrying a capability requires a per-process token "
+            "plus a same-origin check (exact Origin on a POST; on a GET, exact "
             "Origin or the browser's own Sec-Fetch-Site, since a same-origin "
             "GET carries no Origin header). There is no flag for a public "
-            "host in v1, and an approval-required operation with no browser "
-            "attached still fails closed."
+            "host, and an approval-required operation with no browser attached "
+            "still fails closed.\n\n"
+            "LAN mode (--lan --lan-address ADDR) serves the same surface on one "
+            "named address so a tablet on the same network can watch it. It "
+            "requires a passphrase in the environment and is READ-ONLY unless "
+            "you also pass --lan-steer: every write, including answering an "
+            "approval, is refused until you do."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -691,6 +705,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  forge workbench --workspace .\n"
             "  forge workbench --workspace . --model anthropic/claude-sonnet-4\n"
             "  forge workbench --workspace . --port 9000\n"
+            "  FORGE_WORKBENCH_LAN_PASSPHRASE=... forge workbench --workspace . "
+            "--lan --lan-address 192.168.1.20\n"
         ),
     )
     workbench_parser.add_argument(
@@ -717,9 +733,49 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_WORKBENCH_PORT,
         help=(
-            "loopback port to bind (default: %(default)s). This is not a host "
-            "setting: the bind address is fixed at 127.0.0.1 and there is no "
-            "flag to change it."
+            "port to bind (default: %(default)s). This is not a host setting: "
+            "the bind address is 127.0.0.1 unless you pass --lan with "
+            "--lan-address, and there is no flag to set it freely."
+        ),
+    )
+    workbench_parser.add_argument(
+        "--lan",
+        action="store_true",
+        help=(
+            "serve on a LAN address so a tablet on this network can open the "
+            "workbench. Off by default. Requires --lan-address and a "
+            "FORGE_WORKBENCH_LAN_PASSPHRASE of at least 16 characters; without "
+            "the passphrase the server refuses to start, because off loopback "
+            "the page itself carries the UI token. Read only unless you also "
+            "pass --lan-steer.\n\n"
+            "The passphrase name and the minimum are stated here as literal "
+            "text rather than interpolated, because this parser is built at "
+            "import time and importing forge.ui.security for two strings would "
+            "break the rule that forge core imports nothing from the optional "
+            "UI package. tests/test_ui_lan.py asserts this text still matches "
+            "those constants, so the copy cannot drift."
+        ),
+    )
+    workbench_parser.add_argument(
+        "--lan-address",
+        metavar="ADDR",
+        default=None,
+        help=(
+            "the one literal address to bind in LAN mode, e.g. 192.168.1.20. "
+            "A wildcard (0.0.0.0, ::), a loopback address, a link-local or "
+            "multicast address, and anything that is not a literal address are "
+            "all refused: this binds one interface, not every interface."
+        ),
+    )
+    workbench_parser.add_argument(
+        "--lan-steer",
+        action="store_true",
+        help=(
+            "in LAN mode, let an unlocked device on this network start runs "
+            "and answer approvals. Without it every GET works -- including the "
+            "activity stream -- and every write is refused with 403. The "
+            "approval path is the same single-spend one loopback uses; this "
+            "changes who may reach it, not what it does."
         ),
     )
 
@@ -1547,18 +1603,25 @@ def _run_workbench(
     err: TextIO,
     environ: dict[str, str],
 ) -> int:
-    """Serve the Workbench on loopback.
+    """Serve the Workbench on loopback, or on one named LAN address.
 
     Like `_run_byte`, this assembles a pipeline and decides nothing: the model
     id is resolved from configuration, the gateway is built from the injected
     environment, and every permission decision stays in ``forge/tools``.
 
-    Two things are deliberately absent. There is no ``--host``, because a
-    browser surface that can be bound to a public interface is a different
-    product with a different threat model. And there is no automatic browser
+    Three things are deliberately absent. There is no ``--host``, because a
+    browser surface that can be bound to an arbitrary interface is a different
+    product with a different threat model. There is no automatic browser
     launch, because spawning a browser is a side effect of starting a server
     that nobody asked for, and the operator who typed the command is already
-    at a terminal with the URL in front of them.
+    at a terminal with the URL in front of them. And there is no way to reach
+    LAN mode by anything other than ``--lan`` *and* a literal
+    ``--lan-address``: no environment variable, no config file, and no default
+    that means "any interface".
+
+    Every LAN refusal exits before a socket exists. A LAN surface that started
+    and then complained would already have bound the port, and "it is running
+    but the passphrase is wrong" is not a state worth having.
     """
     from ..agents.byte import BYTE
     from ..models.base import GatewayError
@@ -1566,13 +1629,53 @@ def _run_workbench(
     from ..ui.broker import SseBroker
     from ..ui.models import ModelHealth
     from ..ui.runner import runtime_factory
-    from ..ui.security import UiToken
+    from ..ui.security import (
+        InvalidLanAddress,
+        LanConfig,
+        Passphrase,
+        UiToken,
+        validate_lan_address,
+    )
     from ..ui.server import create_app
     from ..ui.session import WorkbenchSession
 
     port = getattr(args, "port", DEFAULT_WORKBENCH_PORT)
     if not (1 <= int(port) <= 65535):
         print(f"forge: port must be between 1 and 65535, not {port}", file=err)
+        return EXIT_USAGE
+
+    # -- LAN mode resolution -----------------------------------------
+    #
+    # All of it here, before the model is resolved, the gateway is built, or a
+    # socket is bound. Two of these three refusals are about the operator having
+    # made a mistake, and one is about them not having configured the secret --
+    # none of which should cost a model resolution or a provider credential
+    # read to discover.
+    lan: "LanConfig | None" = None
+    lan_passphrase: "Passphrase | None" = None
+    if getattr(args, "lan", False):
+        try:
+            address = validate_lan_address(getattr(args, "lan_address", None))
+        except InvalidLanAddress as exc:
+            print(f"forge: {exc}", file=err)
+            return EXIT_USAGE
+        try:
+            lan_passphrase = Passphrase.from_environ(environ)
+        except ValueError as exc:
+            print(f"forge: {exc}", file=err)
+            return EXIT_USAGE
+        lan = LanConfig(address=address, steer=bool(getattr(args, "lan_steer", False)))
+    elif getattr(args, "lan_address", None) or getattr(args, "lan_steer", False):
+        # The flags that do nothing without --lan. Refused rather than ignored:
+        # an operator who typed --lan-address and got a loopback server would
+        # read the URL, see 127.0.0.1, and have no reason to suspect the flag
+        # they cared about was dropped.
+        flag = "--lan-address" if getattr(args, "lan_address", None) else "--lan-steer"
+        print(
+            f"forge: {flag} needs --lan as well; without it the workbench "
+            f"binds {WORKBENCH_BIND_HOST} and is not reachable from the network",
+            file=err,
+        )
         return EXIT_USAGE
 
     # Resolved the same way `forge byte` resolves it, because the DEFAULT_MODEL
@@ -1679,11 +1782,40 @@ def _run_workbench(
             # so it lands in <workspace>/.forge/orders.json and no caller can
             # aim it somewhere else. Stated here because the CLI builds every
             # other collaborator explicitly.
+            lan=lan,
+            passphrase=lan_passphrase,
         )
     except ImportError as exc:  # pragma: no cover - guarded above
         raise UiUnavailable(str(exc)) from exc
 
-    print(f"forge: workbench on http://{WORKBENCH_BIND_HOST}:{port}", file=out)
+    # The URL an operator types, and the only address the socket is bound to.
+    # They are the same string on purpose: in LAN mode the address in the URL
+    # is also the one origin the app will answer for, and printing a different
+    # one would be printing a URL that is refused.
+    bind_host = lan.address if lan else WORKBENCH_BIND_HOST
+    print(f"forge: workbench on http://{bind_host}:{port}", file=out)
+    if lan:
+        print("forge: LAN mode -- reachable by every device on this network", file=out)
+        print(
+            f"forge: bound to {bind_host} only; "
+            f"{'writable with --lan-steer' if lan.steer else 'read-only (writes are refused)'}",
+            file=out,
+        )
+        print(
+            "forge: unlock on that device with the passphrase in "
+            "FORGE_WORKBENCH_LAN_PASSPHRASE",
+            file=out,
+        )
+        print(
+            "forge: cleartext HTTP -- anything that can sniff this network can "
+            "read the passphrase and the stream",
+            file=out,
+        )
+    else:
+        print(
+            "forge: bound to loopback; approval-required operations need you",
+            file=out,
+        )
     print(f"forge: workspace {workspace.root}", file=out)
     print(f"forge: model {model_id}", file=out)
     if resolved.routed:
@@ -1691,9 +1823,8 @@ def _run_workbench(
             f"forge: tier {resolved.tier} ({resolved.selection}); {resolved.reason}",
             file=out,
         )
-    print("forge: bound to loopback; approval-required operations need you", file=out)
 
-    uvicorn.run(app, host=WORKBENCH_BIND_HOST, port=int(port), log_level="warning")
+    uvicorn.run(app, host=bind_host, port=int(port), log_level="warning")
     return EXIT_OK
 
 

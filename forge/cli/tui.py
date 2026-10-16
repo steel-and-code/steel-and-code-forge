@@ -38,6 +38,27 @@ class ExecutionEvent:
     value: Any = None
 
 
+class _ResponseStream(io.StringIO):
+    """Keep the CLI display intact while retaining its final response print.
+
+    Both native and external runners print the final response last, in a single
+    ``print(result.text)`` call. Earlier prints contain reports, not the answer.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.response = ""
+        self._at_print_boundary = True
+
+    def write(self, text: str) -> int:
+        if text != "\n" or self._at_print_boundary:
+            self.response = text
+            self._at_print_boundary = False
+        else:
+            self._at_print_boundary = True
+        return super().write(text)
+
+
 class MainThreadApprovalChannel:
     """Approval channel safe for a worker: prompting is owned by the UI loop.
 
@@ -88,14 +109,14 @@ class ExecutionWorker:
     def _run(self) -> None:
         try:
             try:
-                code, output, error = _execute(self.submitted, channel=self.approvals)
+                result = _execute(self.submitted, channel=self.approvals)
             except TypeError as exc:
                 # Keep small test/application adapters that implement the old
                 # callable shape usable while the channel-aware path rolls out.
                 if "channel" not in str(exc):
                     raise
-                code, output, error = _execute(self.submitted)
-            self.events.put(ExecutionEvent("complete", (code, output, error)))
+                result = _execute(self.submitted)
+            self.events.put(ExecutionEvent("complete", result))
         except Exception as exc:  # worker errors are data, never UI exceptions
             self.events.put(ExecutionEvent("error", exc))
 
@@ -164,7 +185,7 @@ def _task_layout(text: str, width: int, prefix: str = _TASK_PREFIX) -> list[tupl
     return result
 
 
-def _execute(submitted: SubmittedTask, *, channel=None) -> tuple[int, str, str]:
+def _execute(submitted: SubmittedTask, *, channel=None) -> tuple[int, str, str, str]:
     """Run the existing CLI route.
 
     The synchronous path retains the established terminal approval fallback;
@@ -174,7 +195,7 @@ def _execute(submitted: SubmittedTask, *, channel=None) -> tuple[int, str, str]:
     from ..tools.approval import TerminalApprovalChannel
     from .main import main
 
-    out, err = io.StringIO(), io.StringIO()
+    out, err = _ResponseStream(), io.StringIO()
     # Run against a candidate transcript: failed or interrupted attempts must
     # not leave an orphaned user message or an unanswered tool call in history.
     saved = submitted.conversation_state
@@ -218,7 +239,7 @@ def _execute(submitted: SubmittedTask, *, channel=None) -> tuple[int, str, str]:
         saved.turns = candidate.turns
         saved.denials.clear()
         saved.denials.update(candidate.denials)
-    return code, out.getvalue(), err.getvalue()
+    return code, out.getvalue(), err.getvalue(), out.response if code == 0 else ""
 
 def _confirm_engineering(stdscr: curses.window, workspace: Path) -> bool:
     """Require a deliberate yes after displaying the external authority boundary."""
@@ -260,6 +281,44 @@ def _open_hermes_engineering(workspace: Path) -> int:
         ).returncode
     finally:
         curses.reset_prog_mode()
+
+
+def _copy_response(response: str) -> str:
+    """Copy the complete answer via an installed system clipboard utility."""
+    candidates = (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                  ["xsel", "--clipboard", "--input"], ["pbcopy"])
+    # Prefer the native Wayland clipboard when running under Wayland, but still
+    # allow it as a fallback if the display environment is not advertised.
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        candidates = (candidates[1], candidates[2], candidates[0], candidates[3])
+    for command in candidates:
+        program = shutil.which(command[0])
+        if program is None:
+            continue
+        try:
+            result = subprocess.run(
+                [program, *command[1:]], input=response, text=True, timeout=5,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return "Copied response to clipboard"
+    return "Error: clipboard unavailable or copy failed"
+
+
+def _export_response(workspace: Path, response: str) -> Path:
+    """Create a Markdown answer in the workspace, never replacing an entry."""
+    for index in range(1000):
+        name = "forge-response.md" if index == 0 else f"forge-response-{index}.md"
+        path = workspace / name
+        try:
+            with path.open("x", encoding="utf-8") as output:
+                output.write(response)
+            return path
+        except FileExistsError:
+            continue
+    raise FileExistsError("No unused response filename available")
 
 
 def _output_layout(output: str, width: int) -> list[str]:
@@ -426,7 +485,7 @@ def _render(stdscr: curses.window, workspace: Path, highlighted: int, selected_a
     if editing_task:
         footer = "Tab to agent, q quit  •  Enter submit  •  Ctrl-O newline  •  PgUp/PgDn scroll"
     else:
-        footer = "q quit  •  E Hermes engineering  •  Tab agent/task  •  Enter select  •  PgUp/PgDn scroll"
+        footer = "q quit  •  Y copy  •  S save  •  E Hermes engineering  •  Tab agent/task  •  Enter select  •  PgUp/PgDn scroll"
     _put(stdscr, geo["footer"], 0, footer, max(1, width - 1))
     if editing_task and editor is not None and visible and width > 2:
         for i, (line_start, line_end, _) in enumerate(visible):
@@ -445,7 +504,7 @@ def _screen(stdscr: curses.window, workspace: Path) -> SubmittedTask | None:
     editor = _TaskEditor()
     editing_task = False
     submitted = None
-    status, output = "", ""
+    status, output, response = "", "", ""
     activity: list[str] = []
     message_count = 0
     output_scroll = 0
@@ -474,9 +533,10 @@ def _screen(stdscr: curses.window, workspace: Path) -> SubmittedTask | None:
                 pass
             else:
                 if event.kind == "complete":
-                    code, result, error = event.value
+                    code, result, error = event.value[:3]
                     status = "Completed" if code == 0 else f"Error: {error.strip() or result.strip() or f'agent exited with status {code}'}"
                     output = result if code == 0 else ""
+                    response = event.value[3] if code == 0 and len(event.value) > 3 else ""
                     activity.append(f"{worker.submitted.selected_agent} {'Completed' if code == 0 else 'Failed'}")
                     state = worker.submitted.conversation_state
                     if code == 0 and state is not None:
@@ -512,7 +572,7 @@ def _screen(stdscr: curses.window, workspace: Path) -> SubmittedTask | None:
                     )
                     message_count = (len(submitted.conversation_state.messages)
                                      if submitted.conversation_state is not None else 0)
-                    editor = _TaskEditor(); status = f"Running {selected_agent}..."; output = ""; output_scroll = 0
+                    editor = _TaskEditor(); status = f"Running {selected_agent}..."; output = ""; response = ""; output_scroll = 0
                     _render(stdscr, workspace, highlighted, selected_agent, editor.text, editing_task, submitted,
                             status, output, editor, output_scroll, activity)
                     try:
@@ -554,6 +614,20 @@ def _screen(stdscr: curses.window, workspace: Path) -> SubmittedTask | None:
             highlighted = (highlighted + 1) % len(AGENTS)
         elif key in (curses.KEY_UP, ord("k")):
             highlighted = (highlighted - 1) % len(AGENTS)
+        elif key in (ord("Y"), ord("S")):
+            if worker is not None:
+                status = "Response unavailable while agent is running"
+            elif not response:
+                status = "No agent response to copy or save"
+            elif key == ord("Y"):
+                status = _copy_response(response)
+            else:
+                try:
+                    path = _export_response(workspace, response)
+                except (OSError, UnicodeError):
+                    status = "Error: response could not be saved"
+                else:
+                    status = f"Saved response: {path.name}"
         elif key == ord("E") and selected_agent == "Hermes" and worker is None:
             if _confirm_engineering(stdscr, workspace):
                 try:

@@ -425,6 +425,17 @@ def test_openrouter_top_level_error_envelope_is_provider_error(monkeypatch) -> N
     assert "provider-request-id" not in message
 
 
+def test_openrouter_http_error_status_is_not_a_parse_failure(monkeypatch) -> None:
+    """A non-JSON HTTP error is reported by status, not as a body parse error."""
+    from forge.models.openrouter import OpenRouterGateway
+
+    gateway = OpenRouterGateway(environ={"FORGE_OPENROUTER_API_KEY": "x"})
+    monkeypatch.setattr(gateway, "_post", lambda *a, **k: (502, "upstream unavailable"))
+
+    with pytest.raises(GatewayError, match=r"returned HTTP 502"):
+        gateway.complete(CompletionRequest(system="s", messages=(), model="m"))
+
+
 def test_openrouter_gateway_satisfies_the_protocol(monkeypatch) -> None:
     from forge.models.openrouter import OpenRouterGateway
 
@@ -458,6 +469,41 @@ def test_openrouter_parses_a_text_response(monkeypatch) -> None:
 
     assert response.text == "hello"
     assert response.usage.input_tokens == 12
+    assert not response.wants_tools
+
+
+def test_openrouter_parses_responses_style_text_body(monkeypatch) -> None:
+    """Some OpenRouter model routes return output blocks, not chat choices."""
+    from forge.models.openrouter import OpenRouterGateway
+
+    gateway = OpenRouterGateway(environ={"FORGE_OPENROUTER_API_KEY": "x"})
+    monkeypatch.setattr(
+        gateway,
+        "_post",
+        lambda *a, **k: (
+            200,
+            json.dumps(
+                {
+                    "id": "resp_123",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "hello from Neighbor"}
+                            ],
+                        }
+                    ],
+                }
+            ),
+        ),
+    )
+
+    response = gateway.complete(
+        CompletionRequest(system="s", messages=(), model="openai/gpt-5.6-luna")
+    )
+
+    assert response.text == "hello from Neighbor"
     assert not response.wants_tools
 
 
@@ -527,6 +573,57 @@ def test_openrouter_rejects_an_unusable_body(monkeypatch) -> None:
 
     with pytest.raises(GatewayError, match="cannot use"):
         gateway.complete(CompletionRequest(system="s", messages=(), model="m"))
+
+
+def test_openrouter_parse_failure_reports_safe_response_structure(monkeypatch) -> None:
+    from forge.models.openrouter import OpenRouterGateway
+
+    gateway = OpenRouterGateway(environ={"FORGE_OPENROUTER_API_KEY": "x"})
+    secret_text = "provider text must never be echoed"
+    arbitrary = "provider-id-123"
+    body = json.dumps(
+        {
+            "id": arbitrary,
+            "output": [
+                {
+                    "type": "unexpected_item",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": secret_text},
+                        {"type": "tool_use", "id": arbitrary, "name": "read_file"},
+                    ],
+                }
+            ],
+            "metadata": "arbitrary metadata",
+        }
+    )
+    monkeypatch.setattr(gateway, "_post", lambda *a, **k: (200, body))
+
+    with pytest.raises(GatewayError) as caught:
+        gateway.complete(CompletionRequest(system="s", messages=(), model="m"))
+
+    message = str(caught.value)
+    assert "no choices" in message
+    assert "top_keys=id,metadata,output" in message
+    assert "output:array,len=1" in message
+    assert "content:array,len=2" in message
+    assert "type=unexpected_item" in message
+    assert "type=output_text" in message
+    assert secret_text not in message
+    assert arbitrary not in message
+    assert "arbitrary metadata" not in message
+
+
+def test_openrouter_parse_failure_preserves_non_object_diagnostic_safety() -> None:
+    from forge.models.openrouter import OpenRouterGateway
+
+    with pytest.raises(GatewayError) as caught:
+        OpenRouterGateway._parse_response("response text with secret")
+
+    message = str(caught.value)
+    assert "expected an object" in message
+    assert "type=string" in message
+    assert "response text with secret" not in message
 
 
 def test_openrouter_detects_an_oversized_context(monkeypatch) -> None:

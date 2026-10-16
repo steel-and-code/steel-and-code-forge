@@ -502,6 +502,31 @@ def test_the_packaged_default_registry_loads() -> None:
     assert set(t.value for t in CapabilityTier) <= set(registry.tier_names())
 
 
+def test_packaged_registry_offers_gpt_4_1_mini_without_changing_defaults() -> None:
+    """The model is an enabled OpenRouter slot, not a new default."""
+    from forge.models.registry import default_config_path
+
+    registry = load_registry(default_config_path(), availability=Availability.all_available())
+    light = registry.tier("general_light")
+    assert light is not None
+    assert light.primary.model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert [(slot.model, slot.provider, slot.enabled) for slot in light.fallbacks] == [
+        ("byte-coder", "local", True),
+        ("openai/gpt-4.1-mini", "openrouter", True),
+    ]
+    assert registry.slot_usable(light.fallbacks[-1])
+    coding = registry.tier("coding_standard")
+    reasoning = registry.tier("reasoning_heavy")
+    assert coding is not None and coding.primary.model == "openai/gpt-5.6-luna"
+    assert reasoning is not None and reasoning.primary.model == "openai/o3"
+    assert registry.routing.default_tier == "general_light"
+    assert registry.routing.tasks["coding"] == {
+        "light": "general_light",
+        "standard": "coding_standard",
+        "hard": "reasoning_heavy",
+    }
+
+
 def test_the_packaged_default_does_not_claim_verified_health() -> None:
     """Loading a configuration is not checking a provider.
 

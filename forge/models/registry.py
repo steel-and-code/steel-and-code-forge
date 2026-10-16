@@ -36,7 +36,8 @@ produce an empty registry that looks healthy.
 
 **No routing happens here.** Selecting a slot is ``forge.models.router``'s job,
 and health is computed here because a status view and a routing decision must
-never disagree about whether a tier is usable.
+never disagree about whether a tier is usable. Agent defaults are configuration
+only; the router applies their precedence before ordinary tier routing.
 
 **No probing happens here either.** ``forge.models.verify`` imports this
 module; this module does not import that one, does not import ``urllib``, and
@@ -64,6 +65,7 @@ __all__ = [
     "SlotState",
     "ModelSlot",
     "TierConfig",
+    "AgentDefault",
     "RoutingTable",
     "Availability",
     "ModelRegistry",
@@ -83,7 +85,7 @@ LOCAL_CONFIG_NAME = "models.toml"
 #: Top-level tables a configuration file may contain. Anything else is a typo
 #: until proven otherwise, and a silently ignored typo is how a working registry
 #: becomes a no-op that still reports GREEN.
-_ALLOWED_TABLES = ("providers", "tiers", "routing")
+_ALLOWED_TABLES = ("providers", "tiers", "routing", "agents")
 
 _DEFAULT_DIFFICULTY = "standard"
 
@@ -380,6 +382,19 @@ class TierConfig:
 
 
 @dataclass(frozen=True)
+class AgentDefault:
+    """An optional agent-specific model slot, configured in the registry."""
+
+    model: str
+    provider: str
+    enabled: bool = True
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+
+@dataclass(frozen=True)
 class RoutingTable:
     """Which tier serves which kind of work.
 
@@ -449,6 +464,7 @@ class ModelRegistry:
 
     tiers: Mapping[str, TierConfig]
     routing: RoutingTable
+    agent_defaults: Mapping[str, AgentDefault]
     catalog: ProviderCatalog
     availability: Availability
     source: str = ""
@@ -516,6 +532,7 @@ class ModelRegistry:
         return ModelRegistry(
             tiers=self.tiers,
             routing=self.routing,
+            agent_defaults=self.agent_defaults,
             catalog=self.catalog,
             availability=Availability.coerce(availability),
             source=self.source,
@@ -617,6 +634,17 @@ def _parse_tier(name: str, raw: Any, catalog: ProviderCatalog) -> TierConfig:
     return TierConfig(
         tier=name, primary=primary, fallbacks=tuple(fallbacks)
     )
+
+
+def _parse_agent_defaults(raw: Any, catalog: ProviderCatalog) -> dict[str, AgentDefault]:
+    table = _require_mapping(raw, "agents")
+    defaults: dict[str, AgentDefault] = {}
+    for agent, raw_default in table.items():
+        name = str(agent).strip().lower()
+        where = f"agents.{name}"
+        slot = _parse_slot(raw_default, where, catalog)
+        defaults[name] = AgentDefault(slot.model, slot.provider, slot.enabled)
+    return defaults
 
 
 def _parse_routing(raw: Any) -> RoutingTable:
@@ -759,6 +787,7 @@ def parse_registry(
         tiers[key] = _parse_tier(key, raw_tier, base)
 
     routing = _parse_routing(document_map.get("routing", {"default_tier": ""}))
+    agent_defaults = _parse_agent_defaults(document_map.get("agents", {}), base)
 
     for task, by_difficulty in routing.tasks.items():
         for difficulty, tier_name in by_difficulty.items():
@@ -781,6 +810,7 @@ def parse_registry(
     return ModelRegistry(
         tiers=tiers,
         routing=routing,
+        agent_defaults=agent_defaults,
         catalog=base,
         availability=Availability.coerce(availability),
         source=source,

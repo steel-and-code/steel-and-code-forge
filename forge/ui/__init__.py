@@ -13,13 +13,22 @@ What the surface is, and what it deliberately is not:
     ``docs/architecture.md`` for why this does not create an unattended approval
     route, and why it does not weaken the fail-closed rule for machine-driven
     HTTP callers.
-*   It is **local**. Bound to ``127.0.0.1`` with no host flag, gated by a
-    per-process token and a same-origin check on every capability-bearing
+*   It is **local by default**. Bound to `127.0.0.1` with no host flag, gated by
+    a per-process token and a same-origin check on every capability-bearing
     request, and sending no CORS headers at all. The same-origin check is an
     exact ``Origin`` on a POST and, on a read-only GET, an exact ``Origin`` or
     the browser's own ``Sec-Fetch-Site: same-origin`` -- a browser sends no
     ``Origin`` at all on a same-origin GET, so demanding one there would refuse
     the Workbench's own page. See :mod:`forge.ui.security`.
+*   It is **local, or one named LAN address, by explicit request**.
+    ``forge workbench --lan --lan-address ADDR`` serves the same surface on one
+    interface for a tablet on the same network, and adds what a
+    page-fetching peer does not already have: an operator-set passphrase gating
+    ``GET /``, a ``Host`` allowlist against DNS rebinding, per-address unlock
+    backoff, and a **read-only** default in which every POST is refused unless
+    ``--lan-steer`` is also passed. There is no ``--host``, and no value means
+    "any interface". The token was never an authentication boundary off
+    loopback, which is the fact the passphrase exists to fix.
 *   It is **one session**. One process, one active run. A second task while a
     run is in flight is a conflict, not a queue.
 *   It is **inert**. It observes through :class:`forge.events.EventSink` and

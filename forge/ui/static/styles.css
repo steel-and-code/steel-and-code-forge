@@ -210,6 +210,14 @@ body {
   color: var(--ink-dim);
 }
 
+.run-status {
+  margin: 4px 0 0;
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
 .hint {
   font-family: var(--mono);
   font-size: 10.5px;
@@ -697,6 +705,48 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   gap: 6px 16px;
   font-size: 12.5px;
 }
+
+/* -- unlock form (LAN mode) ------------------------------------------- */
+/*
+  Reuses .overlay and .card, so the locked page is the same surface the
+  approval card is rather than a second visual language.
+
+  One row, and the input takes the width: a passphrase field narrower than the
+  keyboard's comfortable target is a field people mistype into, and on a tablet
+  that mistyping lands in the backoff. The button keeps a touch-sized minimum
+  for the same reason.
+*/
+.unlock-form {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+
+.unlock-form input {
+  flex: 1 1 220px;
+  min-height: 44px;
+  padding: 10px 12px;
+  font: inherit;
+  font-family: var(--mono);
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+}
+
+.unlock-form input:focus {
+  outline: 2px solid var(--hot);
+  outline-offset: 1px;
+}
+
+.unlock-form button {
+  min-height: 44px;
+  padding: 10px 18px;
+}
+
+#unlock-overlay .card { border-color: var(--edge); }
+#unlock-overlay .eyebrow { color: var(--ink-faint); }
 
 .approval-fields dt {
   color: var(--ink-faint);

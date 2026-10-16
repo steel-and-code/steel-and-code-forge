@@ -3,6 +3,7 @@
 import curses
 import importlib
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -770,6 +771,162 @@ def test_missing_hermes_never_suspends_or_spawns(tmp_path: Path, monkeypatch) ->
     assert "FileNotFoundError" in screen.frames[-1]
 
 
+def test_execute_extracts_only_final_response_from_cli_output(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+
+    cli = importlib.import_module("forge.cli.main")
+
+    def fake_main(argv, *, out, err, channel):
+        print("forge: gate allowed: private context", file=out)
+        print("forge: session secret-id", file=out)
+        print("", file=out)
+        print("First line\n\nLast line  ", file=out)
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    code, display, error, response = tui._execute(
+        tui.SubmittedTask("Hermes", "task", tmp_path), channel=object()
+    )
+    assert code == 0 and error == ""
+    assert "private context" in display
+    assert response == "First line\n\nLast line  "
+
+
+def test_execute_keeps_newline_only_response_not_cli_metadata(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+
+    cli = importlib.import_module("forge.cli.main")
+
+    def fake_main(argv, *, out, err, channel):
+        print("metadata secret", file=out)
+        print("", file=out)
+        print("\n", file=out)
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    assert tui._execute(tui.SubmittedTask("Hermes", "task", tmp_path), channel=object())[3] == "\n"
+
+
+def test_native_runner_response_is_separate_from_cli_summary(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+    from forge.models.scripted import ScriptedGateway, ScriptedTurn
+
+    cli = importlib.import_module("forge.cli.main")
+    answer = "# Full answer\n\n" + "line\n" * 80
+    monkeypatch.setattr(cli, "_build_model_gateway", lambda *args, **kwargs:
+                        ScriptedGateway([ScriptedTurn(text=answer)]))
+    code, display, error, response = tui._execute(
+        tui.SubmittedTask("Neighbor", "task", tmp_path), channel=object()
+    )
+    assert code == 0 and error == ""
+    assert response == answer
+    assert display != response
+
+
+def test_copy_prefers_wayland_and_sends_entire_response(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+
+    answer = "line\n" * 100
+    calls = []
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setattr(tui.shutil, "which", lambda name: f"/bin/{name}")
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Completed", (), {"returncode": 0})()
+
+    monkeypatch.setattr(tui.subprocess, "run", fake_run)
+    assert "Copied" in tui._copy_response(answer)
+    assert calls[0][0] == ["/bin/wl-copy"]
+    assert calls[0][1]["input"] == answer
+    assert calls[0][1]["timeout"] > 0
+    assert calls[0][1]["text"] is True
+    assert "shell" not in calls[0][1]
+
+
+@pytest.mark.parametrize("failure", [OSError("unavailable"), subprocess.TimeoutExpired("wl-copy", 1)])
+def test_copy_falls_back_after_clipboard_failure(monkeypatch, failure) -> None:
+    from forge.cli import tui
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setattr(tui.shutil, "which", lambda name: f"/bin/{name}" if name in ("wl-copy", "xclip") else None)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[0].endswith("wl-copy"):
+            raise failure
+        return type("Completed", (), {"returncode": 0})()
+
+    monkeypatch.setattr(tui.subprocess, "run", fake_run)
+    assert "Copied" in tui._copy_response("answer")
+    assert calls == [["/bin/wl-copy"], ["/bin/xclip", "-selection", "clipboard"]]
+
+
+def test_copy_fails_closed_when_no_clipboard_or_all_tools_fail(monkeypatch) -> None:
+    from forge.cli import tui
+
+    monkeypatch.setattr(tui.shutil, "which", lambda name: None)
+    assert "Error" in tui._copy_response("answer")
+    monkeypatch.setattr(tui.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(tui.subprocess, "run", lambda *a, **kw: type("Result", (), {"returncode": 1})())
+    assert "Error" in tui._copy_response("answer")
+
+
+def test_export_uses_exclusive_safe_workspace_filename(tmp_path: Path) -> None:
+    from forge.cli.tui import _export_response
+
+    (tmp_path / "forge-response.md").write_text("existing", encoding="utf-8")
+    (tmp_path / "forge-response-1.md").symlink_to(tmp_path / "outside")
+    answer = "# Answer\n\n" + "long line\n" * 100
+    first = _export_response(tmp_path, answer)
+    second = _export_response(tmp_path, answer)
+    assert first == tmp_path / "forge-response-2.md"
+    assert second == tmp_path / "forge-response-3.md"
+    assert first.read_text(encoding="utf-8") == answer
+    assert (tmp_path / "forge-response.md").read_text(encoding="utf-8") == "existing"
+    assert (tmp_path / "forge-response-1.md").is_symlink()
+
+
+def test_response_shortcuts_route_only_outside_composer(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+
+    answer = "private response " + "line\n" * 50
+    monkeypatch.setattr(tui, "_execute", lambda submitted: (0, "report secret\n\n" + answer, "", answer))
+    copied = []
+    monkeypatch.setattr(tui, "_copy_response", lambda text: (copied.append(text) or "Copied response"))
+    screen = FakeScreen([ord("Y"), ord("S"), 9, *map(ord, "YS"), 10,
+                         ("wait_status", "Completed", 9), ord("Y"), ord("S"),
+                         9, ord("Y"), ord("S"), 9, ord("q")], height=12, width=50)
+    tui._screen(screen, tmp_path)
+    assert copied == [answer]
+    assert (tmp_path / "forge-response.md").read_text(encoding="utf-8") == answer
+    assert any("Task [typing]: YS" in frame for frame in screen.frames)
+    assert "Copied response" in "\n".join(screen.frames)
+    assert "Saved response" in "\n".join(screen.frames)
+
+
+def test_export_error_is_reported_without_leaking_response(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+
+    monkeypatch.setattr(tui, "_execute", lambda submitted: (0, "answer", "", "answer"))
+    monkeypatch.setattr(tui, "_export_response", lambda *args: (_ for _ in ()).throw(PermissionError("private path")))
+    screen = FakeScreen([9, ord("x"), 10, ("wait_status", "Completed", 9), ord("S"), ord("q")])
+    tui._screen(screen, tmp_path)
+    assert "Error: response could not be saved" in screen.frames[-1]
+    assert "private path" not in screen.frames[-1]
+
+
+def test_failed_run_does_not_export_prior_answer(tmp_path: Path, monkeypatch) -> None:
+    from forge.cli import tui
+
+    monkeypatch.setattr(tui, "_execute", lambda submitted: (3, "tool output secret", "denied", "answer"))
+    screen = FakeScreen([9, ord("x"), 10, ("wait_status", "Error: denied", 9), ord("S"), ord("q")])
+    tui._screen(screen, tmp_path)
+    assert "No agent response" in screen.frames[-1]
+    assert not list(tmp_path.glob("forge-response*.md"))
+
+
 @pytest.mark.parametrize("agent", ["Neighbor", "Hermes", "Byte"])
 def test_tui_dispatches_through_existing_cli_with_task_and_workspace(
     tmp_path: Path, monkeypatch, capsys, agent: str
@@ -791,7 +948,7 @@ def test_tui_dispatches_through_existing_cli_with_task_and_workspace(
 
     monkeypatch.setattr(cli, "main", fake_main)
     submitted = tui.SubmittedTask(agent, "fix the tests", tmp_path)
-    assert tui._execute(submitted) == (0, "from existing runner", "")
+    assert tui._execute(submitted) == (0, "from existing runner", "", "from existing runner")
     assert calls[0][0] == [agent.lower(), "--workspace", str(tmp_path), "fix the tests"]
     assert isinstance(calls[0][1], TerminalApprovalChannel)
     assert terminal_modes == []
@@ -803,7 +960,7 @@ def test_worker_execution_does_not_print_over_curses_after_return(tmp_path: Path
 
     cli = importlib.import_module("forge.cli.main")
     monkeypatch.setattr(cli, "main", lambda argv, **kwargs: 0)
-    assert tui._execute(tui.SubmittedTask("Neighbor", "task", tmp_path), channel=object()) == (0, "", "")
+    assert tui._execute(tui.SubmittedTask("Neighbor", "task", tmp_path), channel=object()) == (0, "", "", "")
     assert capsys.readouterr().out == ""
 
 

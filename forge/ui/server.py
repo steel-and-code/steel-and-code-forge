@@ -62,6 +62,41 @@ Static files are served as files. The only transformation is substituting the
 per-process token into the page at request time, which is a single string
 replacement rather than a template engine -- one less dependency for a page
 that has exactly one variable.
+
+LAN mode
+--------
+
+``create_app(..., lan=LanConfig(...))`` puts this same surface on one named LAN
+address so a tablet on the same network can open it. With ``lan`` left as
+``None`` -- which is every existing caller and every existing test -- nothing
+below runs and the app is byte-for-byte the loopback one.
+
+The reason the guards above are not weakened is that they were never
+*authentication* off loopback. ``GET /`` is served without a token because it
+is the token's delivery mechanism, so a device that can reach the port can
+fetch the page, read the token out of the meta tag, and satisfy both guards; on
+a LAN the page origin is the bind address, so its requests carry a perfectly
+legitimate ``Origin`` and a truthful ``Sec-Fetch-Site: same-origin``. LAN mode
+therefore adds what a page-fetching peer does not already have:
+
+*   :class:`~forge.ui.security.Passphrase` gating ``GET /``. The token is
+    withheld from an unauthenticated client, so the page stops being a
+    self-service credential.
+*   :class:`~forge.ui.security.UnlockStore` for the unlocked session, in an
+    ``HttpOnly`` ``SameSite=Strict`` cookie, plus per-address failure backoff.
+    In memory only; a restart revokes every session.
+*   :func:`~forge.ui.security.check_host` in front of every route, which is the
+    DNS-rebinding defence.
+*   A **read-only** default: every GET works, and every POST is refused with
+    403 unless the operator also passed ``--lan-steer``. That includes
+    ``POST /api/approvals/{id}``, which is the endpoint whose compromise is
+    unrecoverable. ``--lan-steer`` does not add a route or a channel: it uses
+    the identical one, so an approval answered from a tablet is the same
+    single-spend capability in :mod:`forge.tools.approval` as one answered at
+    the machine, and the first valid answer still wins with later ones 409.
+
+``GET /api/health`` stays unauthenticated in both modes, unchanged, because
+liveness reveals nothing and the operator needs it to check the port is up.
 """
 
 from __future__ import annotations
@@ -83,10 +118,15 @@ from .broker import HEARTBEAT_SECONDS, SseBroker, Subscriber
 from .channel import StaleApproval, UnknownApproval, WebApprovalChannel
 from .security import (
     SEC_FETCH_SITE_HEADER,
+    SESSION_COOKIE,
     TOKEN_HEADER,
+    LanConfig,
+    Passphrase,
     StreamTicketStore,
     UiToken,
+    UnlockStore,
     allowed_origins,
+    check_host,
     check_origin,
     check_same_origin,
 )
@@ -111,6 +151,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 #: placeholder rather than a silent ``None``: if the substitution ever fails,
 #: the page's token is obviously wrong instead of mysteriously empty.
 TOKEN_PLACEHOLDER = "__FORGE_UI_TOKEN__"
+
+#: What the served page carries when a LAN client has not unlocked yet.
+#: Substituted with ``"1"`` to mark the page locked and with ``""`` when it is
+#: not, so the page's own script can branch on it instead of inferring its state
+#: from a missing token. A separate placeholder rather than a clever
+#: string-replace: the loopback page must be unchanged, and this is the only
+#: thing that tells the script whether the empty token is a policy or a bug.
+LOCKED_PLACEHOLDER = "__FORGE_UI_LOCKED__"
 
 
 # --------------------------------------------------------------------------
@@ -202,6 +250,17 @@ class ApprovalRequestBody(BaseModel):
 # --------------------------------------------------------------------------
 
 
+class UnlockRequest(BaseModel):
+    """``POST /api/unlock`` body.
+
+    One field, and the response names no field either -- a refusal that said
+    "wrong passphrase" would tell a sweeping client which half of the pair to
+    vary.
+    """
+
+    passphrase: str = Field(min_length=1, max_length=512)
+
+
 def create_app(
     *,
     workspace: Workspace,
@@ -211,6 +270,8 @@ def create_app(
     port: int,
     health: ModelHealth | None = None,
     orders: OrderStore | None = None,
+    lan: LanConfig | None = None,
+    passphrase: Passphrase | None = None,
 ) -> FastAPI:
     """Build the Workbench application.
 
@@ -233,11 +294,26 @@ def create_app(
             so no caller can aim the board at a directory outside the run's
             workspace root -- the same reason the root itself is not a request
             parameter. A test passes one to keep orders in a directory it owns.
+        lan: LAN mode. ``None`` -- the default, and every existing caller --
+            means loopback, with no Host check, no passphrase, and no unlock
+            route. Present means bind-and-serve was already arranged by the CLI
+            and this app is the one origin entry it adds.
+        passphrase: The operator's LAN secret. Required whenever ``lan`` is
+            present. Not defaulted and not optional-because-optional: a LAN
+            surface with no passphrase would serve its own token to every
+            device on the network, and the failure would be invisible in the
+            terminal. Refusing to build the app makes it a startup error instead.
 
     Deliberately constructed with explicit arguments rather than read from
     ``os.environ`` or a global: a test needs to build two independent
     applications in one process, each with its own token and workspace.
     """
+    if lan is not None and passphrase is None:
+        raise ValueError(
+            "LAN mode needs a passphrase; an app with lan set and no "
+            "passphrase would serve the UI token to every device on the "
+            "network"
+        )
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         """Bind the broker's loop at startup, release pending approvals at exit.
@@ -269,7 +345,21 @@ def create_app(
 
     broker = session.broker
     tickets = StreamTicketStore()
-    origins = allowed_origins(port)
+    # The LAN address contributes exactly one origin entry, and only in LAN
+    # mode. With lan=None this is the two loopback spellings and nothing else,
+    # which is the set every existing test asserts against.
+    origins = allowed_origins(port, lan.address if lan else None)
+    # Kept separately because the read-only rule exempts loopback specifically:
+    # the two loopback spellings are "a browser on this machine", and the LAN
+    # entry is "a device on the network", which is the distinction the rule
+    # turns on. Deriving it from `origins` would be wrong -- that set contains
+    # the LAN address too.
+    loopback_origins = allowed_origins(port)
+    # In LAN mode the Host header is an allowlist over the same three spellings
+    # a browser could legitimately use. On loopback this set is computed and
+    # never consulted, because require_host returns before reading it.
+    hosts = frozenset(origin.removeprefix("http://") for origin in origins)
+    unlocks = UnlockStore() if lan is not None else None
 
     # Exposed on app.state rather than kept as a closure local, so a test can
     # assert the single-use property against the store the routes actually use
@@ -285,6 +375,30 @@ def create_app(
     app.state.orders = orders if orders is not None else OrderStore(workspace.root)
 
     # -- guards ---------------------------------------------------------
+
+    def require_host(request: Request) -> None:
+        """The DNS-rebinding guard. Installed only in LAN mode.
+
+        On loopback this is a no-op by absence, not by a flag: a request to
+        ``127.0.0.1`` cannot have been pointed here by someone else's DNS
+        record, so there is nothing to defend and no reason to add a header
+        rule that would have to be right for every existing caller.
+
+        In LAN mode the ``Host`` must be one of the address spellings this
+        process actually serves. A name an attacker controls resolving to the
+        bind address produces a ``Host`` in no allowlist, and it is refused
+        before the route body runs -- so the answer does not depend on the
+        attacker's DNS staying pointed here. Defence in depth: a non-browser
+        client can forge ``Host``, and one that does still has to present the
+        session or the token.
+        """
+        if lan is None:
+            return
+        if not check_host(request.headers.get("host"), hosts):
+            raise HTTPException(
+                status_code=403,
+                detail="host not allowed; this surface serves one address only",
+            )
 
     def require_browser(request: Request) -> None:
         """Exact-Origin check, on every state-changing route.
@@ -328,8 +442,69 @@ def create_app(
         if not token.matches(request.headers.get(TOKEN_HEADER)):
             raise HTTPException(status_code=403, detail="invalid UI token")
 
+    def require_lan_write_allowed(request: Request) -> None:
+        """Refuse a POST from a LAN client unless the operator allowed it.
+
+        The read-only default, and it is the narrowest place the rule can live:
+        every state-changing route on this app depends on ``guarded``, so one
+        refusal here refuses ``POST /api/run``, ``POST /api/approvals/{id}``,
+        the four board writes, ``POST /api/models/verify``, and
+        ``POST /api/events-ticket`` together, and a new command route cannot
+        accidentally opt out by being added somewhere else.
+
+        Three ways it does not apply, each for a reason rather than a
+        convenience:
+
+        *   **Loopback is exempt.** A browser on this machine is not a device
+            on the network, and refusing a local POST in LAN mode would break
+            the operator's own session for no security gain. The exemption is
+            the exact loopback origin, not "any client that looks local".
+        *   **Reads are exempt**, because the whole point of the mode is a
+            tablet that can watch. Every GET, including the SSE stream, works.
+        *   **The unlock POST is exempt**, or nothing could ever unlock.
+        """
+        if lan is None or lan.steer:
+            return
+        origin = request.headers.get("origin")
+        if origin and origin in loopback_origins:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "LAN mode is read-only; pass --lan-steer to let a device on "
+                "this network start runs and answer approvals"
+            ),
+        )
+
     async def guarded(request: Request) -> None:
         """Origin + token, for state-changing requests."""
+        await asyncio.to_thread(require_host, request)
+        await asyncio.to_thread(require_lan_write_allowed, request)
+        await asyncio.to_thread(require_browser, request)
+        await asyncio.to_thread(require_token, request)
+
+    async def guarded_ticket(request: Request) -> None:
+        """Host + exact Origin + token, *without* the read-only refusal.
+
+        One route needs this and it is not a loophole: ``POST
+        /api/events-ticket`` mints the single-use ticket that ``EventSource``
+        spends, and it is POST only because a response body carrying a
+        capability cannot come from a GET that a page could be made to issue
+        from anywhere. The action it authorises is **reading the stream**. Under
+        the plain ``guarded`` chain a read-only LAN tablet could never connect
+        to SSE at all, which would make the read-only default promise an
+        observer it cannot actually deliver -- the failure would look like a
+        broken server rather than a policy.
+
+        So the distinction is not GET-versus-POST, it is *read capability
+        versus write capability*, and the ticket is read. Everything that could
+        make it a write capability is absent: the ticket cannot start a run,
+        cannot answer an approval, is single-use, and expires in
+        :data:`~forge.ui.security.TICKET_TTL_SECONDS`. The strict exact-Origin
+        and token guards are unchanged, so this is the same handshake a
+        loopback page performs.
+        """
+        await asyncio.to_thread(require_host, request)
         await asyncio.to_thread(require_browser, request)
         await asyncio.to_thread(require_token, request)
 
@@ -341,21 +516,63 @@ def create_app(
         would let any same-origin script read the workspace and any pending
         approval, which is exactly the data the token exists to gate.
         """
+        await asyncio.to_thread(require_host, request)
         await asyncio.to_thread(require_same_origin, request)
         await asyncio.to_thread(require_token, request)
 
     # -- page -----------------------------------------------------------
 
+    def unlocked(request: Request) -> bool:
+        """Whether this request carries a live session for this process.
+
+        ``True`` on loopback unconditionally. Not as a shortcut around a
+        check -- on loopback there is no session and no passphrase, so there is
+        nothing to check; the two loopback origins are the operator's own
+        machine, which is the boundary LAN mode exists to cross.
+        """
+        if unlocks is None:
+            return True
+        return unlocks.is_unlocked(request.cookies.get(SESSION_COOKIE))
+
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
+    async def index(request: Request) -> HTMLResponse:
         """The single page, with the token substituted in.
 
         Served without a token requirement: it *is* the token's delivery
         mechanism, so requiring it would be circular. It carries no capability
         beyond what it hands to the browser that Forge itself sent it to.
+
+        In LAN mode that circularity is the hole, because a peer on the network
+        can fetch this route: the served token is a credential handed to
+        whoever asks. So an unauthenticated LAN client gets the unlock page
+        instead, with the placeholder left unsubstituted -- the page loads, its
+        script reads an empty token, and every guarded request it makes is
+        refused. Nothing is withheld *silently*: the operator sees an unlock
+        form, not a page that mysteriously cannot connect.
+
+        The unlock page carries no run state, no workspace path, no model id,
+        and no workspace existence at all, so a device that has not authenticated
+        learns that a workbench is running and nothing else.
+
+        Host-checked in LAN mode like every other route. Answering the lock to a
+        rebound name would be a small leak -- "a workbench is running here" --
+        and the whole point of the allowlist is that the refusal must not depend
+        on the attacker's DNS staying pointed at this host, so this route does
+        not get an exemption the other routes do not have.
         """
+        await asyncio.to_thread(require_host, request)
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html.replace(TOKEN_PLACEHOLDER, token.value))
+        if not unlocked(request):
+            # LOCKED_PLACEHOLDER becomes "1" and the token placeholder becomes
+            # the empty string. Two named substitutions rather than one clever
+            # one, so the served page's state is set by the same single-string
+            # replacement the loopback path already uses.
+            return HTMLResponse(
+                html.replace(LOCKED_PLACEHOLDER, "1").replace(TOKEN_PLACEHOLDER, "")
+            )
+        return HTMLResponse(
+            html.replace(LOCKED_PLACEHOLDER, "").replace(TOKEN_PLACEHOLDER, token.value)
+        )
 
     if STATIC_DIR.is_dir():
         app.mount(
@@ -368,7 +585,7 @@ def create_app(
 
     @app.post("/api/events-ticket")
     async def events_ticket(
-        request: Request, _: None = Depends(guarded)
+        request: Request, _: None = Depends(guarded_ticket)
     ) -> JSONResponse:
         """Mint a single-use, short-lived ticket for the event stream.
 
@@ -377,6 +594,83 @@ def create_app(
         *in a header* to obtain something it can use without one.
         """
         return JSONResponse({"ticket": tickets.issue()})
+
+    if unlocks is not None:
+
+        async def guarded_unlock(request: Request) -> None:
+            """Host + strict exact Origin, and **no token**.
+
+            The token is the thing this route hands out, so requiring it here
+            would make the route unreachable: a locked page was served with an
+            empty token, and a request guarded on the token can never come from
+            a client that has one. This is the one place in the app where a
+            capability-bearing request is authorised without the UI token, and
+            it is bounded by two things that are not hand-waving:
+
+            *   The strict exact-``Origin`` check, unchanged. A page on another
+                site cannot drive this route, because the browser would send
+                that site's origin.
+            *   The ``Host`` allowlist, in LAN mode, which also stops a
+                rebound name from getting here.
+
+            What is left to protect is the passphrase itself, and that is what
+            :class:`UnlockStore`'s backoff is for. A correct answer mints a
+            session and returns the token, which is the intended outcome and no
+            more than loopback already hands out to anyone who can reach the
+            port.
+            """
+            await asyncio.to_thread(require_host, request)
+            await asyncio.to_thread(require_browser, request)
+
+        @app.post("/api/unlock")
+        async def api_unlock(
+            body: UnlockRequest, request: Request, _: None = Depends(guarded_unlock)
+        ) -> Response:
+            """Exchange the operator's passphrase for a device session.
+
+            **Registered only in LAN mode.** On loopback the route does not
+            exist, so the app is not merely refusing it -- it is the same set of
+            routes it always was, and a test asserting the loopback route table
+            does not have to learn about an exception.
+
+            It exists because the alternative is worse: serving the page's token
+            to whoever asks. Nothing else on this surface is new in LAN mode.
+
+            Rate limited per client address by :class:`UnlockStore`, and the
+            backoff does not exempt a correct passphrase -- see that class for
+            why serving a correct answer inside an open window would make the
+            window an oracle. The refusal body names no field and no expected
+            value.
+
+            On success: a session cookie plus the UI token, so the page can
+            continue to speak the existing header protocol without a reload.
+            Nothing is written to disk; a restart revokes every session.
+            """
+            client = _client_address(request)
+            store = unlocks
+            secret = passphrase
+            assert store is not None and secret is not None  # guarded by create_app
+            if store.locked_out(client):
+                raise HTTPException(
+                    status_code=429,
+                    detail="too many failed attempts; wait and try again",
+                )
+            if not secret.matches(body.passphrase):
+                store.record_failure(client)
+                raise HTTPException(status_code=401, detail="not unlocked")
+            store.record_success(client)
+            response = JSONResponse({"token": token.value})
+            response.set_cookie(
+                SESSION_COOKIE,
+                store.open_session(),
+                # Not Secure: this strike is cleartext HTTP, and a Secure cookie
+                # over http:// is one the browser never sends back. HttpOnly and
+                # SameSite=Strict are the attributes doing the work here.
+                httponly=True,
+                samesite="strict",
+                path="/",
+            )
+            return response
 
     @app.get("/api/status")
     async def api_status(
@@ -534,7 +828,13 @@ def create_app(
         browser gets the tail it missed. When the ring has moved past the gap,
         the stream says so rather than presenting a partial history as a whole
         one.
+
+        The Host check is here rather than inherited because this route calls
+        :func:`require_same_origin` directly instead of depending on
+        ``guarded_read``. The order stays load-bearing: Host, then same-origin,
+        then ``redeem``.
         """
+        await asyncio.to_thread(require_host, request)
         await asyncio.to_thread(require_same_origin, request)
         if not tickets.redeem(ticket):
             raise HTTPException(
@@ -786,15 +1086,40 @@ def create_app(
         return await read_board(delete)
 
     @app.get("/api/health")
-    async def api_health() -> JSONResponse:
+    async def api_health(request: Request) -> JSONResponse:
         """Liveness, unauthenticated and capability-free.
 
         Useful for a human checking the port is live, and deliberately reveals
         nothing: not the workspace, not the model, not whether a run is active.
+
+        Deliberately **not** Host-checked, in either mode, and that is a real
+        exception rather than an oversight. This is the one route that answers
+        an unauthenticated caller, so installing the LAN Host guard here would
+        make "is the port up" a question only answerable by a client whose
+        ``Host`` happens to be allowed -- and a probe with a wrong Host would
+        report 403 where the honest answer is "not listening". The body is a
+        fixed two-key object with no state in it, so answering it to a rebound
+        name discloses nothing about the run.
         """
         return JSONResponse({"ok": True, "service": "forge-workbench"})
 
     return app
+
+
+def _client_address(request: Request) -> str:
+    """The address to count unlock failures against.
+
+    The socket peer, not ``X-Forwarded-For``: a forwarded header is client-
+    supplied, so trusting it would let a sweeping client spread its failures
+    across an unbounded set of counters and get five guesses per fake address.
+
+    Behind a proxy this counts the proxy, which is wrong in the restrictive
+    direction -- every device would share one counter. There is no reverse
+    proxy in front of the Workbench in this design, and inventing trust for a
+    header that is currently untrustworthy would be the larger error.
+    """
+    client = request.client
+    return client.host if client is not None else "unknown"
 
 
 # --------------------------------------------------------------------------

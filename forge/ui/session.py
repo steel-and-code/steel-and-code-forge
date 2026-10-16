@@ -45,6 +45,7 @@ place that knows.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,6 +55,7 @@ from typing import Callable
 
 from ..agents.profile import AgentProfile
 from ..agents.runtime import AgentRuntime, MaxTurnsExceeded
+from ..agents.state import ConversationStateStore
 from ..events import emit
 from ..models.base import GatewayError
 from ..tools.workspace import Workspace
@@ -134,6 +136,11 @@ class _RunRecord:
     summary: RunSummary | None = None
     error: str | None = None
     finished_at: str | None = None
+    max_turns: int | None = None
+    turns: int = 0
+    tool_calls: int = 0
+    activity: str = "Starting"
+    last_event_at: float | None = None
     history: list[dict[str, object]] = field(default_factory=list)
 
 
@@ -176,6 +183,7 @@ class WorkbenchSession:
         self.model_id = model_id
         self.broker = broker if broker is not None else SseBroker()
         self._runtime_factory = runtime_factory
+        self._conversation_states = ConversationStateStore()
 
         self._lock = threading.Lock()
         self._state = UiSessionState.IDLE
@@ -277,8 +285,11 @@ class WorkbenchSession:
         the page needs to be able to say which it was.
         """
         runtime = self._runtime_factory(self.broker, self.channel)
+        with self._lock:
+            record.max_turns = runtime.max_turns
         try:
-            result = runtime.run(record.task)
+            state = self._conversation_states.get(self.workspace.root, self.profile.name)
+            result = runtime.run(record.task, state=state)
         except MaxTurnsExceeded as exc:
             self._fail(record, str(exc))
             return
@@ -297,6 +308,9 @@ class WorkbenchSession:
         )
         with self._lock:
             record.summary = summary
+            record.turns = result.turns
+            record.tool_calls = result.tool_calls
+            record.activity = "Completed"
             record.finished_at = _now_iso()
         self._set_state(UiSessionState.COMPLETED)
 
@@ -310,12 +324,28 @@ class WorkbenchSession:
     # -- observation -----------------------------------------------------
 
     def _emit_event(self, name: str, **fields: object) -> None:
-        """Session-level events, in the same shape the runtime emits.
-
-        Deliberately routed through the same sink rather than a second
-        mechanism, so the broker has exactly one kind of thing to deliver and a
-        subscriber cannot receive two incompatible event formats.
-        """
+        """Record and publish one observable event through the existing broker."""
+        now = time.monotonic()
+        with self._lock:
+            record = self._record
+            if record is not None:
+                record.last_event_at = now
+                if name == "model.reply":
+                    record.turns = int(fields.get("turn", record.turns))
+                elif name == "tool.call":
+                    record.tool_calls += 1
+                if name == "approval.required":
+                    record.activity = "Waiting for approval"
+                elif name == "tool.call":
+                    record.activity = f"Running {fields.get('tool', 'a tool')}"
+                elif name == "run.completed":
+                    record.activity = "Completed"
+                elif name in {"run.failed", "run.error"}:
+                    record.activity = "Failed"
+                elif name == "model.reply":
+                    record.activity = "Model working"
+                elif name == "run.started":
+                    record.activity = "Model working"
         emit(self.broker, name, **fields)
 
     def status(self) -> dict[str, object]:
@@ -346,6 +376,13 @@ class WorkbenchSession:
         body["run_id"] = record.run_id
         body["task"] = record.task
         body["started_at"] = record.started
+        body["max_turns"] = record.max_turns
+        body["turns"] = record.turns
+        body["tool_calls"] = record.tool_calls
+        body["activity"] = record.activity
+        body["elapsed_seconds"] = _elapsed_seconds(record.started, record.finished_at)
+        if record.last_event_at is not None:
+            body["no_activity_seconds"] = max(0, int(time.monotonic() - record.last_event_at))
         if record.finished_at is not None:
             body["finished_at"] = record.finished_at
         if record.error is not None:
@@ -373,6 +410,13 @@ class WorkbenchSession:
         exit on it would make Ctrl-C hang.
         """
         self.channel.release_all()
+
+
+def _elapsed_seconds(started: str, finished: str | None) -> int:
+    """Return elapsed wall time from the run's UTC timestamps."""
+    start = datetime.fromisoformat(started).timestamp()
+    end = datetime.fromisoformat(finished).timestamp() if finished else time.time()
+    return max(0, int(end - start))
 
 
 def _now_iso() -> str:

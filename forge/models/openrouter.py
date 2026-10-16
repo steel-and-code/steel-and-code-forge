@@ -122,6 +122,85 @@ def _safe_error_metadata(payload: Any) -> str:
     return ", ".join(parts)
 
 
+def _structure_type(value: Any) -> str:
+    """Return a JSON shape name without exposing a value."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def _object_keys(value: Any) -> str:
+    if not isinstance(value, dict):
+        return f"type={_structure_type(value)}"
+    return "keys=" + ",".join(sorted(str(key) for key in value))
+
+
+def _safe_structure_summary(payload: Any) -> str:
+    """Describe response shape without copying provider-controlled values.
+
+    This deliberately has no generic value serializer. Keys are structural
+    metadata, and the only values reproduced are JSON ``type`` discriminators,
+    which are useful for identifying output block schemas.
+    """
+    if not isinstance(payload, dict):
+        return f"root:type={_structure_type(payload)}"
+
+    parts = ["top_keys=" + ",".join(sorted(str(key) for key in payload))]
+    for field in ("choices", "output", "usage", "error"):
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, list):
+            parts.append(f"{field}:array,len={len(value)}")
+            for index, item in enumerate(value):
+                if not isinstance(item, dict):
+                    parts.append(f"{field}[{index}]:type={_structure_type(item)}")
+                    continue
+                parts.append(f"{field}[{index}]:" + _object_keys(item))
+                if isinstance(item.get("type"), str):
+                    parts.append(f"{field}[{index}].type={item['type']}")
+                content = item.get("content")
+                if isinstance(content, list):
+                    parts.append(f"{field}[{index}].content:array,len={len(content)}")
+                    for block_index, block in enumerate(content):
+                        if isinstance(block, dict):
+                            parts.append(
+                                f"{field}[{index}].content[{block_index}]:"
+                                + _object_keys(block)
+                            )
+                            if "type" in block:
+                                parts.append(
+                                    f"{field}[{index}].content[{block_index}].type="
+                                    f"{block['type']}"
+                                    if isinstance(block["type"], str)
+                                    else f"type={_structure_type(block['type'])}"
+                                )
+                        else:
+                            parts.append(
+                                f"{field}[{index}].content[{block_index}]:"
+                                f"type={_structure_type(block)}"
+                            )
+                elif "content" in item:
+                    parts.append(
+                        f"{field}[{index}].content:type={_structure_type(content)}"
+                    )
+        else:
+            parts.append(f"{field}:type={_structure_type(value)}")
+            if isinstance(value, dict):
+                parts.append(f"{field}." + _object_keys(value))
+    return "; ".join(parts)
+
+
 def _looks_like_context_error(payload: Any) -> bool:
     """Whether an error is about the conversation being too large.
 
@@ -241,7 +320,16 @@ class OpenRouterGateway:
                 f"{type(reason).__name__}"
             ) from None
 
-        parsed = self._parse_body(text)
+        try:
+            parsed = self._parse_body(text)
+        except GatewayError:
+            # The status is authoritative even when an HTTP error body is not
+            # JSON. Do not misclassify that provider failure as a parse failure.
+            if status != 200:
+                raise GatewayError(
+                    f"model provider returned HTTP {status}"
+                ) from None
+            raise
 
         if status != 200:
             if _looks_like_context_error(parsed):
@@ -345,14 +433,38 @@ class OpenRouterGateway:
         if not isinstance(payload, dict):
             raise GatewayError(
                 "model provider returned a body this gateway cannot use "
-                "(expected an object)"
+                f"(expected an object; {_safe_structure_summary(payload)})"
             )
 
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices:
+            # Some OpenRouter model routes return the Responses API shape even
+            # through this endpoint: text is in output[].content[] rather than
+            # choices[].message.content. Keep accepting the established chat
+            # shape above, and adapt only this provider response shape at the
+            # gateway boundary.
+            output = payload.get("output")
+            if isinstance(output, list):
+                text_parts: list[str] = []
+                for item in output:
+                    if not isinstance(item, dict) or item.get("type") != "message":
+                        continue
+                    content = item.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "output_text" and isinstance(
+                            block.get("text"), str
+                        ):
+                            text_parts.append(block["text"])
+                if text_parts:
+                    return ModelResponse(text="".join(text_parts))
+
             raise GatewayError(
                 "model provider returned a body this gateway cannot use "
-                "(no choices)"
+                f"(no choices; {_safe_structure_summary(payload)})"
             )
 
         first = choices[0]

@@ -154,6 +154,12 @@ class ModelRouter:
     def route(self, request: RouteRequest) -> RouteDecision:
         """Choose a model for ``request``.
 
+        An explicitly configured agent default is authoritative: it is selected
+        before task/tier routing and is never replaced by a tier fallback. This
+        keeps an unavailable agent default observable rather than silently
+        changing the model. Agents without a configured default follow the
+        existing tier algorithm unchanged.
+
         Never raises for an unserviceable request. A RED tier, a missing tier,
         and a slot on a provider with no gateway all produce a decision with
         :attr:`RouteDecision.selection` ``NONE`` and a specific reason, because
@@ -187,6 +193,37 @@ class ModelRouter:
                     f"{', '.join(self._registry.tier_names()) or 'none'}"
                 ),
                 tier_reason=tier_reason,
+                agent=request.agent,
+            )
+
+        configured_default = self._registry.agent_defaults.get(request.agent.strip().lower())
+        if configured_default is not None:
+            slot = ModelSlot(
+                configured_default.model,
+                configured_default.provider,
+                configured_default.enabled,
+            )
+            state = self._registry.slot_state(slot)
+            if state is not SlotState.CONFIGURED:
+                return RouteDecision(
+                    tier=reported,
+                    selection=SelectionKind.NONE,
+                    health=Health.RED,
+                    reason=(
+                        f"agent-specific default {slot.key!r} is not usable "
+                        f"({self._explain(slot, state)}); refusing fallback"
+                    ),
+                    tier_reason=f"agent default for {request.agent}",
+                    agent=request.agent,
+                )
+            return RouteDecision(
+                tier=reported,
+                model=slot.model,
+                provider=slot.provider,
+                selection=SelectionKind.PRIMARY,
+                health=Health.GREEN,
+                reason=f"agent-specific default {slot.key!r} is enabled and available",
+                tier_reason=f"agent default for {request.agent}",
                 agent=request.agent,
             )
 
