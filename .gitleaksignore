@@ -1,0 +1,10 @@
+# Reviewed historical false positives from Forge's security tests and docs.
+# Each entry targets one exact commit/path/rule/line (not whole files or rules).
+# Do not add broad path/regex exclusions. Re-review any new finding.
+# Reviewed 2026-10-17, prior to public-release consideration.
+b8f12dfd3a5b6ed1bf21fc17d6467e6b7817065a:tests/test_models.py:generic-api-key:301
+cabf22de55d3bdf32238eef5c8e71b38e16d7efe:forge/tools/secrets.py:private-key:46
+cabf22de55d3bdf32238eef5c8e71b38e16d7efe:forge/tools/secrets.py:private-key:49
+cabf22de55d3bdf32238eef5c8e71b38e16d7efe:tests/test_secrets.py:private-key:27
+cabf22de55d3bdf32238eef5c8e71b38e16d7efe:tests/test_secrets.py:private-key:35
+cabf22de55d3bdf32238eef5c8e71b38e16d7efe:docs/byte-security-classification.md:private-key:142
