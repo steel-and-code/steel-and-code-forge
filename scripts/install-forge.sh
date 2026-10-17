@@ -121,52 +121,17 @@ else
 fi
 
 
-# Hermes supports OPENROUTER_API_KEY in ~/.hermes/.env. Offer deliberate
-# one-time credential sharing, even when Hermes was installed previously.
-# No secret is printed or passed as a CLI argument.
-if [[ -s "$KEY_FILE" ]] && { command -v hermes >/dev/null 2>&1 || [[ -x "$BIN_HOME/hermes" ]]; } && [[ -t 0 ]]; then
-  printf '\\nConfigure Hermes to use your Forge OpenRouter API key? [y/N]: '
+# Hermes manages its own credentials. Avoid editing upstream configuration
+# directly; its interactive model selector supports OpenRouter setup.
+if { command -v hermes >/dev/null 2>&1 || [[ -x "$BIN_HOME/hermes" ]]; } && [[ -t 0 ]]; then
+  printf '\nConfigure Hermes for OpenRouter now? [y/N]: '
   read -r configure_hermes || configure_hermes=""
   if [[ "$configure_hermes" =~ ^[Yy]([Ee][Ss])?$ ]]; then
-    HERMES_ENV="$HOME/.hermes/.env"
-    mkdir -p "$HOME/.hermes"
-    chmod 700 "$HOME/.hermes"
-    # Python reads the key from disk, never from argv. Preserve unrelated
-    # Hermes settings and atomically replace the OPENROUTER_API_KEY entry.
-    FORGE_HERMES_KEY_FILE="$KEY_FILE" FORGE_HERMES_ENV_FILE="$HERMES_ENV" python3 - <<'PY'
-import os
-from pathlib import Path
-import tempfile
-
-key = Path(os.environ["FORGE_HERMES_KEY_FILE"]).read_text().strip()
-target = Path(os.environ["FORGE_HERMES_ENV_FILE"])
-if not key or "\\n" in key or "\\r" in key:
-    raise SystemExit("Invalid Forge key; Hermes configuration skipped.")
-if target.is_symlink():
-    raise SystemExit("Hermes .env is a symlink; refusing to overwrite it.")
-existing = target.read_text() if target.exists() else ""
-lines = [line for line in existing.splitlines() if not line.lstrip().startswith("OPENROUTER_API_KEY=")]
-lines.append("OPENROUTER_API_KEY=" + key)
-fd, temp = tempfile.mkstemp(prefix=".hermes-env-", dir=str(target.parent))
-try:
-    with os.fdopen(fd, "w") as stream:
-        stream.write("\\n".join(lines) + "\\n")
-    os.chmod(temp, 0o600)
-    os.replace(temp, target)
-finally:
-    if os.path.exists(temp):
-        os.unlink(temp)
-PY
-    echo "Hermes OpenRouter credential configured. Select OpenRouter as its model provider:"
-    echo "  $BIN_HOME/hermes model"
-    printf 'Launch Hermes model selection now? [Y/n]: '
-    read -r select_hermes_model || select_hermes_model=""
-    if [[ ! "$select_hermes_model" =~ ^[Nn]([Oo])?$ ]]; then
-      if [[ -x "$BIN_HOME/hermes" ]]; then
-        "$BIN_HOME/hermes" model || echo "Hermes model selection incomplete; retry with: hermes model"
-      else
-        hermes model || echo "Hermes model selection incomplete; retry with: hermes model"
-      fi
+    echo "Select OpenRouter in Hermes and supply your own API key when prompted."
+    if [[ -x "$BIN_HOME/hermes" ]]; then
+      "$BIN_HOME/hermes" model || echo "Run hermes model later to finish setup."
+    else
+      hermes model || echo "Run hermes model later to finish setup."
     fi
   fi
 fi
