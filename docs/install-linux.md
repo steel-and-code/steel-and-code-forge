@@ -46,3 +46,23 @@ ISO integration, or Windows installer. Installing from the private repository
 requires access to it; a public distribution needs a published package/release.
 The project deliberately requires explicit workspace selection for agent runs.
 Forge safety approval rules remain unchanged. Keep OpenRouter keys private.
+
+## Optional Hermes Agent
+
+On an interactive installation, the script asks whether to install the separate
+Nous Research Hermes Agent. The default is **no**. Saying yes downloads the
+[official Hermes installer](https://hermes-agent.nousresearch.com/docs/getting-started/installation/)
+using HTTPS and executes it as the current user. Review the upstream installer
+if you do not trust its code; its dependencies and privileges are controlled by
+its upstream project, not Forge. An existing Hermes installation is preserved.
+
+Hermes may ask for its own provider/model settings. To configure it later:
+
+```bash
+~/.local/bin/hermes model
+```
+
+Forge's OpenRouter key is not automatically copied to Hermes. For a valid
+Hermes install and model setup, try `forge hermes --workspace /path/to/project
+"Say hello"` from a shell with `~/.local/bin` on PATH. Hermes remains an
+external tool and Forge does not control its internal execution permissions.
