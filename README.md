@@ -6,6 +6,13 @@ This repository holds the **orchestration layer and its safety stack**, the
 first agent runtime, and the local Workbench browser surface. There is no n8n
 wiring, no database, and no public HTTP API yet.
 
+## Installation (Linux preview)
+
+Clone the installer branch, then run `bash scripts/install-forge.sh`.
+See [docs/install-linux.md](docs/install-linux.md) for requirements, OpenRouter
+credential setup, optional Hermes installation, and limitations. The installer
+is a private preview and has not been validated on clean machines.
+
 ## What lives here
 
 ```
@@ -227,4 +234,4 @@ git-ignored and must never be committed.
 
 ## License
 
-Proprietary — Steel & Code.
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
