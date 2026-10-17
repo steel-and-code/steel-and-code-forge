@@ -86,6 +86,40 @@ else
   echo "Existing OpenRouter key preserved. To change it: forge setup-key"
 fi
 
+# Hermes is a separate upstream agent; never bundle its code or credentials.
+# Opt in explicitly before downloading or executing its installer.
+if command -v hermes >/dev/null 2>&1 || [[ -x "$BIN_HOME/hermes" ]]; then
+  echo "Hermes detected; keeping existing installation."
+elif [[ -t 0 ]]; then
+  printf '\nInstall optional Hermes Agent (Nous Research)? [y/N]: '
+  read -r install_hermes || install_hermes=""
+  if [[ "$install_hermes" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "Hermes skipped: curl is not installed." >&2
+    else
+      hermes_script="$(mktemp)"
+      if curl --proto '=https' --tlsv1.2 -fsSL \
+        https://hermes-agent.nousresearch.com/install.sh -o "$hermes_script"; then
+        echo "Running the official Hermes installer (upstream third-party code)."
+        if bash "$hermes_script"; then
+          if [[ -x "$BIN_HOME/hermes" ]] || command -v hermes >/dev/null 2>&1; then
+            echo "Hermes installed. Configure its provider using: hermes model"
+          else
+            echo "Hermes installer finished, but its launcher was not detected; check your PATH." >&2
+          fi
+        else
+          echo "Hermes setup failed; Forge installation remains usable." >&2
+        fi
+      else
+        echo "Hermes download failed; Forge installation remains usable." >&2
+      fi
+      rm -f -- "$hermes_script"
+    fi
+  fi
+else
+  echo "Hermes optional installation skipped (non-interactive run)."
+fi
+
 echo
 echo "Forge installation complete."
 echo "Command: $BIN_HOME/forge"
