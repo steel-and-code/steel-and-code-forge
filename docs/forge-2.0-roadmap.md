@@ -89,6 +89,21 @@ Time estimates are **rough effort ranges**, subject to the Phase 0 audit and ava
 
 **Acceptance scenario:** During an engineering task Byte encounters competing keyboard shortcut designs, displays numbered choices with a recommended option, waits for the Chief Architect's selection within the terminal application, then continues implementation without leaving the session or forgetting prior work.
 
+### Plan-first engineering and human-owned design decisions (Phases 1–2)
+
+**Observed Hermes behavior to reproduce:** Before changing code on a meaningful engineering assignment, Byte inspects the relevant implementation, summarizes its findings, and presents a specific implementation plan. Where a consequential design choice belongs to the Chief Architect, Byte identifies the choice, explains alternatives and trade-offs, makes a reasoned recommendation, and **waits for an explicit decision inside the same running engineering session**. After approval, Byte proceeds without losing conversation, project context, or its place in the workflow.
+
+- **Inspect first:** Ground proposed changes in actual repository structure, APIs, tests, and constraints rather than assuming how components work.
+- **Present a reviewable plan:** State intended behavior, files/components affected, risks, verification steps, and decisions requiring human input. Keep routine plans concise; use more detail for architectural or high-risk work.
+- **Separate decisions from implementation:** Byte may autonomously choose ordinary implementation details within agreed boundaries, but must escalate ambiguous or consequential architecture, user-experience, security, cost, or scope trade-offs.
+- **Recommend without taking control:** Present alternatives and a preferred option with justification; the Chief Architect decides. Don't silently interpret a recommendation as approval.
+- **Remain in session:** Pause the relevant action, accept the answer through an in-terminal selection or response, record the decision, and resume the original task. Do not exit the application, lose context, or restart a disconnected prompt.
+- **Respect separate safety gates:** Approval of a design plan is not permission to bypass restricted tool execution, file operations, spending limits, or Git approvals.
+- **Verify and report:** Check implementation against the accepted plan, run tests, report discrepancies, and ask again if material scope or architecture changes arise.
+- **Make it measurable:** Record plan proposals, human decisions, revisions, and the elapsed time awaiting decisions as opt-in research events.
+
+**Acceptance scenario:** Given an Outpost UI improvement, Byte reads the affected Qt/KDE code, proposes a focused plan, asks whether focus indicators should be placed in separate pane headers or a centralized banner, waits for the Chief Architect to choose, then implements and tests that choice within the same persistent session.
+
 ### Smart paste handling (Phase 1 — Byte Engineering Console)
 
 **Requirement from observing Hermes (October 18, 2026):** When the Chief Architect pastes a long engineering order into Byte's terminal conversation, keep the transcript readable instead of flooding the screen. Preserve the **complete original text** and show a compact, inspectable reference in the session.
