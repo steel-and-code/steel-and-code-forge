@@ -75,6 +75,20 @@ Time estimates are **rough effort ranges**, subject to the Phase 0 audit and ava
 
 **Exit criterion:** Byte can sustain a usable natural engineering conversation with accurate live session status.
 
+### In-session human decision gates (Phase 1 foundation; Phase 2 integration)
+
+**Requirement from observing Hermes (October 18, 2026):** Byte must recognize when an engineering choice belongs to the Chief Architect, present a concise question with selectable options, explain trade-offs, indicate a recommendation where appropriate, and **pause within the current running engineering conversation**. The user answers without exiting the TUI, spawning a separate questionnaire, restarting Byte, or losing task context. Byte then resumes precisely the suspended workflow with the chosen answer recorded as an explicit decision.
+
+- Support arrow-key/number selection and Enter confirmation; offer free-text/Other where useful. Respect the existing keyboard-first interface.
+- Distinguish **engineering decision gates** (architecture, UX, conventions, implementation trade-offs) from **safety approval gates** (permission to run tools, change files, mutate Git, spend money). A design choice never substitutes for a safety authorization.
+- Preserve pending decision, selected answer, original task, execution checkpoint, and relevant context across recoverable interruptions and application restarts.
+- Clearly show *waiting for human decision* versus *working*; never silently choose a default on timeout or unavailable input.
+- Ask only for genuinely human-owned or materially ambiguous choices; avoid burdening the user with routine implementation decisions.
+- Emit structured, privacy-conscious events for when a gate was raised, the options provided, human response, and elapsed wait time. This supports later research into human oversight and engineering role changes.
+- Test that the original TUI session remains alive, tool execution is paused safely, input is applied exactly once, and the agent resumes without replaying unsafe operations.
+
+**Acceptance scenario:** During an engineering task Byte encounters competing keyboard shortcut designs, displays numbered choices with a recommended option, waits for the Chief Architect's selection within the terminal application, then continues implementation without leaving the session or forgetting prior work.
+
 ### Phase 2 — Reliable single-agent engineering loop (about 3–4 weeks)
 
 - Read/search repository, inspect history, edit and patch files, execute approved commands, build, test, diagnose failures, retry and summarize.
