@@ -89,6 +89,19 @@ Time estimates are **rough effort ranges**, subject to the Phase 0 audit and ava
 
 **Acceptance scenario:** During an engineering task Byte encounters competing keyboard shortcut designs, displays numbered choices with a recommended option, waits for the Chief Architect's selection within the terminal application, then continues implementation without leaving the session or forgetting prior work.
 
+### Smart paste handling (Phase 1 — Byte Engineering Console)
+
+**Requirement from observing Hermes (October 18, 2026):** When the Chief Architect pastes a long engineering order into Byte's terminal conversation, keep the transcript readable instead of flooding the screen. Preserve the **complete original text** and show a compact, inspectable reference in the session.
+
+- Short messages display normally. Large multi-line pastes are automatically captured as one coherent message, stored in a session-managed, access-restricted text artifact, and represented by a concise preview (for example, `Engineering order received — 3,842 characters`).
+- The compact presentation must **not** truncate or summarize the content passed to the model. Byte must receive the complete message with its original line breaks and formatting.
+- Support expanding/viewing/copying the original pasted text, retaining a stable reference across the active engineering session and after resume as allowed by retention settings.
+- Support normal terminal paste workflows, including Outpost's `Alt+V` shortcut, without inadvertent message submission, broken indentation, or terminal escape sequence execution.
+- Avoid storing secrets in world-readable temporary files; use safe file permissions, clear lifecycle/cleanup rules, and explicit handling of sensitive content.
+- Test short versus large pastes, multi-line code blocks, Unicode, repeated pastes, interruptions, session restart, and exact content round-tripping.
+
+**Acceptance scenario:** Paste a full multi-paragraph engineering specification using `Alt+V`. The console shows a short collapsible/reference entry, the model receives the entire specification unchanged, and the user can inspect the original without leaving the session.
+
 ### Phase 2 — Reliable single-agent engineering loop (about 3–4 weeks)
 
 - Read/search repository, inspect history, edit and patch files, execute approved commands, build, test, diagnose failures, retry and summarize.
