@@ -31,5 +31,5 @@ One harmless Outpost task: approved Jira ticket → durable Forge job → Byte e
 ## Deferred
 Outpost GUI integration; production auto-deploy; mobile clients; parallel autonomous fleets; STEELCAST development through Forge.
 
-## Open-source licensing decision
-The README now states Steel & Code's intent to make Forge open source, with the license pending. Choose and approve a standard open-source license, then commit its full text as `LICENSE`. Public visibility alone does not grant open-source reuse rights.
+## License
+Forge is licensed under the [Apache License, Version 2.0](../LICENSE). Contributors should preserve license and attribution notices where applicable.
