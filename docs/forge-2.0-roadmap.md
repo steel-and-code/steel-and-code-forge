@@ -32,4 +32,4 @@ One harmless Outpost task: approved Jira ticket → durable Forge job → Byte e
 Outpost GUI integration; production auto-deploy; mobile clients; parallel autonomous fleets; STEELCAST development through Forge.
 
 ## Open-source licensing decision
-The repository's current README says `Proprietary — Steel & Code`. Choose a license and commit an actual `LICENSE` before advertising the repository as open source; do not silently change legal terms.
+The README now states Steel & Code's intent to make Forge open source, with the license pending. Choose and approve a standard open-source license, then commit its full text as `LICENSE`. Public visibility alone does not grant open-source reuse rights.
