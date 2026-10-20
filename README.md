@@ -157,4 +157,4 @@ git-ignored and must never be committed.
 
 ## License
 
-Steel & Code intends Forge to be open source. **License pending:** a standard open-source license has not yet been selected and added as `LICENSE`. Until then, the public repository is source-available, but reuse permissions have not been granted by an open-source license.
+Forge is open source under the [Apache License, Version 2.0](LICENSE).
