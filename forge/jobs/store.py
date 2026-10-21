@@ -172,6 +172,81 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE job_history ADD COLUMN reason TEXT",
         ),
     ),
+    (
+        3,
+        (
+            # FORGE-13: durable Jira intake. ticket_jobs is a pure ticket->job
+            # lineage (no state copy; terminal/open is joined from jobs).
+            # admissions dedupes authorized work requests; admission_denials is
+            # the append-only audit of refused admissions. intake_events dedupes
+            # canonical event content; delivery_ids binds a transport delivery id
+            # to its first valid content; intake_deliveries is the append-only
+            # audit of every delivery attempt (content_key is NULL for invalid).
+            """
+            CREATE TABLE ticket_jobs (
+                ticket_ref  TEXT NOT NULL,
+                cycle       INTEGER NOT NULL,
+                job_id      TEXT NOT NULL UNIQUE,
+                created_at  REAL NOT NULL,
+                PRIMARY KEY (ticket_ref, cycle)
+            )
+            """,
+            """
+            CREATE TABLE admissions (
+                admission_request_id TEXT PRIMARY KEY,
+                ticket_ref           TEXT NOT NULL,
+                cycle                INTEGER NOT NULL,
+                job_id               TEXT NOT NULL,
+                request_inputs_hash  TEXT NOT NULL,
+                actor_identity       TEXT NOT NULL,
+                actor_role           TEXT NOT NULL,
+                created_at           REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE admission_denials (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                admission_request_id TEXT NOT NULL,
+                ticket_ref           TEXT NOT NULL,
+                actor_identity       TEXT,
+                actor_role           TEXT,
+                reason               TEXT NOT NULL,
+                at                   REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE intake_events (
+                content_key   TEXT PRIMARY KEY,
+                issue_key     TEXT NOT NULL,
+                event_type    TEXT NOT NULL,
+                outcome       TEXT NOT NULL,
+                first_seen_at REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE delivery_ids (
+                delivery_id TEXT PRIMARY KEY,
+                content_key TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE intake_deliveries (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_id     TEXT,
+                content_key     TEXT,
+                issue_key       TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                jira_version    TEXT,
+                jira_updated_at REAL,
+                status          TEXT,
+                outcome         TEXT NOT NULL,
+                job_id          TEXT,
+                reason          TEXT,
+                at              REAL NOT NULL
+            )
+            """,
+        ),
+    ),
 )
 
 #: The current schema version. Kept equal to ``MIGRATIONS[-1][0]``; a change to
