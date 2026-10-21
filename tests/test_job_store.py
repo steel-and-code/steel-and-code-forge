@@ -12,6 +12,11 @@ the claims genuinely race rather than merely run in sequence.
 
 from __future__ import annotations
 
+import os
+import pathlib
+import sqlite3
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -42,6 +47,41 @@ from forge.jobs.state import (
 
 OWNER = "alice"
 OTHER = "bob"
+
+#: Repo root, used to make ``forge`` importable in the subprocess workers.
+ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+
+# Subprocess workers. Each polls for a ``go`` marker file so the processes
+# genuinely race on the database rather than merely running in sequence. The
+# workers accept ``path`` as argv[1]; the rest of argv is worker-specific.
+
+_FIRST_OPEN_WORKER = r"""
+import os, sys, time
+go_file = sys.argv[2]
+while not os.path.exists(go_file):
+    time.sleep(0.001)
+from forge.jobs.store import SqliteJobStore, SCHEMA_VERSION
+s = SqliteJobStore(sys.argv[1])
+print(s.schema_version)
+s.close()
+"""
+
+_CLAIM_WORKER = r"""
+import os, sys, time
+go_file, result_file = sys.argv[3], sys.argv[4]
+while not os.path.exists(go_file):
+    time.sleep(0.001)
+from forge.jobs.store import SqliteJobStore
+from forge.jobs.state import BudgetCheck
+s = SqliteJobStore(sys.argv[1])
+try:
+    s.claim("job-1", sys.argv[2], budget_check=BudgetCheck.approved())
+    open(result_file, "w").write("ok:" + sys.argv[2])
+except Exception as exc:
+    open(result_file, "w").write(type(exc).__name__)
+finally:
+    s.close()
+"""
 
 
 def _job(job_id: str = "job-1", *, budget: float | None = 10.0) -> Job:
@@ -479,3 +519,86 @@ def test_store_imports_no_process_network_or_credential_modules():
     )
     for token in forbidden:
         assert token not in text, f"store.py imports or reads {token!r}"
+
+
+# --------------------------------------------------------------------------
+# Cross-process: simultaneous init and concurrent claims (OS processes)
+# --------------------------------------------------------------------------
+
+
+def test_simultaneous_first_open_initializes_once(path, tmp_path):
+    # Six OS processes open a brand-new database at the same time. Exactly one
+    # migration must win; the rest must observe the already-applied schema and
+    # open cleanly -- none may raise on a duplicate table.
+    go_file = str(tmp_path / "go")
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _FIRST_OPEN_WORKER, path, go_file],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(6)
+    ]
+    open(go_file, "w").close()
+    for p in procs:
+        out, err = p.communicate(timeout=30)
+        assert p.returncode == 0, err.decode()
+        assert out.decode().strip() == str(SCHEMA_VERSION)
+
+    with SqliteJobStore(path) as s:
+        assert s.schema_version == SCHEMA_VERSION
+
+
+def test_concurrent_claims_across_os_processes(path, tmp_path):
+    starter = SqliteJobStore(path)
+    starter.save(_job())
+    starter.close()
+
+    go_file = str(tmp_path / "go")
+    owners = (OWNER, OTHER)
+    result_files = [str(tmp_path / f"result-{i}") for i in range(len(owners))]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CLAIM_WORKER, path, owner, go_file, rf],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for owner, rf in zip(owners, result_files)
+    ]
+    open(go_file, "w").close()
+    for p in procs:
+        _, err = p.communicate(timeout=30)
+        assert p.returncode == 0, err.decode()
+
+    results = [pathlib.Path(rf).read_text() for rf in result_files]
+    winners = [r for r in results if r.startswith("ok:")]
+    refusals = [r for r in results if not r.startswith("ok:")]
+    assert len(winners) == 1, results
+    assert refusals == ["InvalidTransition"], results
+
+    winner = winners[0].split(":", 1)[1]
+    with SqliteJobStore(path) as s:
+        job = s.load("job-1")
+        assert job.state is JobState.CLAIMED
+        assert job.owner == winner
+
+
+# --------------------------------------------------------------------------
+# Reject a schema newer than this implementation supports
+# --------------------------------------------------------------------------
+
+
+def test_newer_schema_version_is_rejected(path):
+    with SqliteJobStore(path) as s:
+        assert s.schema_version == SCHEMA_VERSION
+
+    # Simulate a database produced by a future Forge.
+    conn = sqlite3.connect(path)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(MigrationError, match="newer"):
+        SqliteJobStore(path)

@@ -146,40 +146,73 @@ SCHEMA_VERSION: int = MIGRATIONS[-1][0]
 #: Default SQLite busy timeout (milliseconds) for concurrent openers.
 DEFAULT_BUSY_TIMEOUT_MS: int = 5000
 
+#: ``PRAGMA journal_mode=WAL`` writes to the file and can hit SQLITE_BUSY when a
+#: peer process is mid-creation or mid-WAL-switch on a brand-new database; the
+#: busy handler does not reliably retry that specific pragma, so retry here.
+_WAL_ATTEMPTS: int = 20
+_WAL_RETRY_SLEEP: float = 0.05
+
+
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Switch to WAL, retrying the first-open race on a fresh database."""
+    for attempt in range(_WAL_ATTEMPTS):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if attempt == _WAL_ATTEMPTS - 1:
+                raise
+            time.sleep(_WAL_RETRY_SLEEP)
+
 
 def _connect(path: str, busy_timeout_ms: int) -> sqlite3.Connection:
     """Open a connection configured for durability and concurrent writers."""
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    conn.execute("PRAGMA synchronous=FULL")
+    _enable_wal(conn)
     _migrate(conn)
     return conn
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Bring ``conn`` up to :data:`SCHEMA_VERSION`, one migration per txn.
+    """Bring ``conn`` up to :data:`SCHEMA_VERSION` in one writer transaction.
 
-    Idempotent and race-safe: two connections opening the same file for the
-    first time serialise on the ``BEGIN IMMEDIATE`` writer lock, and the second
-    sees ``user_version`` already advanced and applies nothing.
+    The writer lock is acquired *before* the version is read, so two processes
+    opening a fresh file concurrently cannot both decide to run the same
+    migration: the writer lock serialises the read-decide-apply-commit cycle,
+    and a second connection's read sees the version the first already wrote.
+
+    A database whose version is *newer* than this implementation supports is
+    rejected rather than silently opened -- that database was written by a
+    future Forge and must not be read as if it were current.
     """
-    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    while current < SCHEMA_VERSION:
-        _version, statements = MIGRATIONS[current]
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for statement in statements:
-                conn.execute(statement)
-            conn.execute(f"PRAGMA user_version = {current + 1}")
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if current > SCHEMA_VERSION:
             raise MigrationError(
-                f"migration to schema version {current + 1} failed"
-            ) from None
-        current += 1
+                f"database schema version {current} is newer than the "
+                f"supported version {SCHEMA_VERSION}; refusing to open"
+            )
+        if current < SCHEMA_VERSION:
+            try:
+                for version, statements in MIGRATIONS[current:]:
+                    for statement in statements:
+                        conn.execute(statement)
+                    conn.execute(f"PRAGMA user_version = {version}")
+            except MigrationError:
+                raise
+            except Exception as exc:
+                raise MigrationError(
+                    f"migration to schema version {SCHEMA_VERSION} failed"
+                ) from exc
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 # --------------------------------------------------------------------------
