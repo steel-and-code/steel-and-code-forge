@@ -1,14 +1,12 @@
-"""Forge job contract: Phase A surface.
+"""Forge job contract: Phase A surface plus the durable store (Phase B).
 
 ``state`` is the job model and its deterministic transitions; ``idempotency`` is
-the duplicate-event key and its storage contract. Together they are the
-"explicit Jira -> Forge job contract" issue #3 asks for, as a pure, testable
-value layer -- no execution, no network, no credentials, no persistence.
+the duplicate-event key and its storage contract; ``store`` is the durable,
+SQLite-backed implementation of :class:`JobStore` and :class:`DedupeStore`.
 
-The interfaces that need durable, transactional storage (:class:`JobStore`,
-:class:`BudgetLedger`, :class:`DedupeStore`) are defined but deliberately not
-wired to anything here. Exactly-once execution is a later requirement that the
-pure module does not claim.
+The pure value layer (no execution, no network, no credentials, no persistence)
+is unchanged by the addition of ``store``: the durable layer builds on it
+without modifying it.
 """
 
 from .idempotency import (
@@ -33,22 +31,42 @@ from .state import (
     new_job,
     transition,
 )
+from .store import (
+    SCHEMA_VERSION,
+    ConcurrencyConflict,
+    JobAlreadyExists,
+    JobNotFound,
+    JobRecord,
+    JobStoreError,
+    MigrationError,
+    SqliteDedupeStore,
+    SqliteJobStore,
+)
 
 __all__ = [
     "BASELINE_TOOLS",
     "TERMINAL_STATES",
+    "SCHEMA_VERSION",
     "BudgetCheck",
     "BudgetLedger",
     "BudgetRefused",
     "ClaimConflict",
+    "ConcurrencyConflict",
     "DedupeStore",
     "InvalidTransition",
     "Job",
+    "JobAlreadyExists",
     "JobEvent",
+    "JobNotFound",
+    "JobRecord",
     "JobState",
     "JobStore",
+    "JobStoreError",
     "JobTransitionError",
     "MemoryDedupeStore",
+    "MigrationError",
+    "SqliteDedupeStore",
+    "SqliteJobStore",
     "event_key",
     "idempotency_key",
     "new_job",
