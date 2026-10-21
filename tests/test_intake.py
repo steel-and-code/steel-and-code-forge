@@ -9,6 +9,7 @@ cross-process races.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sqlite3
 import subprocess
@@ -182,6 +183,41 @@ def test_equivalent_reordered_inputs_are_duplicate_not_conflict(store):
     b = _admit_kwargs(allowed_tools=("write_file", "read_file"))
     assert store.admit_job("req-1", "OUT-1", OPERATOR, **a).outcome is AdmissionOutcome.CREATED
     assert store.admit_job("req-1", "OUT-1", OPERATOR, **b).outcome is AdmissionOutcome.DUPLICATE
+
+
+def test_generator_inputs_are_materialized_once(store):
+    result = store.admit_job(
+        "req-1", "OUT-1", OPERATOR,
+        repo="outpost",
+        allowed_tools=(x for x in ("read_file", "write_file")),
+        budget=10.0,
+        allowed_repos=(r for r in ("outpost",)),
+    )
+    assert result.outcome is AdmissionOutcome.CREATED
+    # The generator was not exhausted by the fingerprint: the full set survives.
+    row = store._conn.execute(
+        "SELECT allowed_tools FROM jobs WHERE id = 'jira:OUT-1:1'"
+    ).fetchone()
+    assert json.loads(row["allowed_tools"]) == ["read_file", "write_file"]
+
+
+def test_generator_inputs_reordered_equivalent_are_duplicate(store):
+    a = store.admit_job(
+        "req-1", "OUT-1", OPERATOR,
+        repo="outpost",
+        allowed_tools=(x for x in ("read_file", "write_file")),
+        budget=10.0,
+        allowed_repos=(r for r in ("outpost",)),
+    )
+    assert a.outcome is AdmissionOutcome.CREATED
+    b = store.admit_job(
+        "req-1", "OUT-1", OPERATOR,
+        repo="outpost",
+        allowed_tools=(x for x in ("write_file", "read_file")),
+        budget=10.0,
+        allowed_repos=(r for r in ("outpost",)),
+    )
+    assert b.outcome is AdmissionOutcome.DUPLICATE
 
 
 def test_distinct_request_while_open_is_open_exists_not_bound(store):

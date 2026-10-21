@@ -373,13 +373,21 @@ class SqliteIntakeStore:
                 raise
             raise AuthorizationRefused("admission requires the operator role")
 
+        # Canonicalize each collection ONCE and reuse the materialized tuples for
+        # BOTH the request fingerprint and job construction. Without this, a
+        # generator passed as allowed_tools/allowed_repos/baseline_tools would be
+        # consumed by the fingerprint, leaving new_job() an exhausted iterable.
+        tools = tuple(sorted(set(allowed_tools)))
+        repos = None if allowed_repos is None else tuple(sorted(set(allowed_repos)))
+        baseline = tuple(sorted(set(baseline_tools)))
+
         request_hash = _request_inputs_hash(
             ticket_ref=ticket_ref,
             repo=repo,
-            allowed_tools=allowed_tools,
+            allowed_tools=tools,
             budget=budget,
-            allowed_repos=allowed_repos,
-            baseline_tools=baseline_tools,
+            allowed_repos=repos,
+            baseline_tools=baseline,
             global_budget=global_budget,
         )
 
@@ -428,10 +436,10 @@ class SqliteIntakeStore:
                 job_id=job_id,
                 ticket_ref=ticket_ref,
                 repo=repo,
-                allowed_tools=allowed_tools,
+                allowed_tools=tools,
                 budget=budget,
-                baseline_tools=baseline_tools,
-                allowed_repos=allowed_repos,
+                baseline_tools=baseline,
+                allowed_repos=repos,
                 global_budget=global_budget,
             )
             now = self._clock()
