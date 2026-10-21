@@ -2,7 +2,8 @@
 
 The exhaustive transition test pins every ``(state, event)`` pair -- the
 acceptance criterion "deterministic state transitions" -- so a change to the
-machine cannot silently alter an edge without failing here.
+machine cannot silently alter an edge without failing here. FORGE-12 adds actor
+roles (worker/operator), the RECOVER event, and the operator-gated fail-from-ready.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ import pytest
 from forge.jobs.state import (
     BASELINE_TOOLS,
     TERMINAL_STATES,
+    Actor,
+    ActorRole,
+    AuthorizationRefused,
     BudgetCheck,
     BudgetRefused,
     ClaimConflict,
@@ -28,7 +32,8 @@ from forge.jobs.state import (
 )
 
 # Every state where a claim's owner is still attached. A job in one of these was
-# claimed by "alice" at some point; only release (and terminal states) drop it.
+# claimed by "alice" at some point; only release/recover (and terminal states)
+# drop it.
 OWNED_STATES = (
     JobState.CLAIMED,
     JobState.RUNNING,
@@ -37,6 +42,11 @@ OWNED_STATES = (
 )
 
 OWNER = "alice"
+
+#: The owning worker and the operator, as the acting Actor values the machine
+#: now takes instead of a bare owner string.
+WORKER = Actor(OWNER)
+OPERATOR = Actor("operator", ActorRole.OPERATOR)
 
 
 def _job(state: JobState = JobState.READY, *, owner: str | None = None) -> Job:
@@ -62,7 +72,6 @@ def _by_owner() -> Job:
 # --------------------------------------------------------------------------
 # Construction and validation
 # --------------------------------------------------------------------------
-
 
 def test_defaults_are_ready_unowned_with_no_budget():
     job = new_job(job_id="j", ticket_ref="T-1", repo="r")
@@ -177,7 +186,9 @@ def test_baseline_matches_byte_tools():
 # --------------------------------------------------------------------------
 
 # (state, event) -> successor state, or None to expect InvalidTransition.
-# Budget-bearing events (claim, start) get a valid owner and BudgetCheck.approved.
+# Budget-bearing events (claim, start) get a valid worker actor and an approved
+# budget check. RECOVER gets an operator actor; FAIL gets the worker on owned
+# states and the operator on READY.
 TRANSITIONS: dict[JobState, dict[JobEvent, JobState]] = {
     JobState.READY: {
         JobEvent.CLAIM: JobState.CLAIMED,
@@ -186,21 +197,25 @@ TRANSITIONS: dict[JobState, dict[JobEvent, JobState]] = {
     JobState.CLAIMED: {
         JobEvent.START: JobState.RUNNING,
         JobEvent.RELEASE: JobState.READY,
+        JobEvent.RECOVER: JobState.READY,
         JobEvent.FAIL: JobState.FAILED,
     },
     JobState.RUNNING: {
         JobEvent.BLOCK: JobState.BLOCKED,
         JobEvent.SUBMIT: JobState.REVIEW,
         JobEvent.COMPLETE: JobState.DONE,
+        JobEvent.RECOVER: JobState.READY,
         JobEvent.FAIL: JobState.FAILED,
     },
     JobState.BLOCKED: {
         JobEvent.UNBLOCK: JobState.RUNNING,
+        JobEvent.RECOVER: JobState.READY,
         JobEvent.FAIL: JobState.FAILED,
     },
     JobState.REVIEW: {
         JobEvent.REVISE: JobState.RUNNING,
         JobEvent.COMPLETE: JobState.DONE,
+        JobEvent.RECOVER: JobState.READY,
         JobEvent.FAIL: JobState.FAILED,
     },
     JobState.DONE: {},
@@ -208,11 +223,22 @@ TRANSITIONS: dict[JobState, dict[JobEvent, JobState]] = {
 }
 
 
-def _ctx(event: JobEvent) -> dict:
+def _ctx(state: JobState, event: JobEvent) -> dict:
     if event in (JobEvent.CLAIM, JobEvent.START):
-        return {"owner": OWNER, "budget_check": BudgetCheck.approved()}
-    if event is JobEvent.RELEASE:
-        return {"owner": OWNER}
+        return {"actor": WORKER, "budget_check": BudgetCheck.approved()}
+    if event in (
+        JobEvent.RELEASE,
+        JobEvent.BLOCK,
+        JobEvent.UNBLOCK,
+        JobEvent.SUBMIT,
+        JobEvent.REVISE,
+        JobEvent.COMPLETE,
+    ):
+        return {"actor": WORKER}
+    if event is JobEvent.RECOVER:
+        return {"actor": OPERATOR}
+    if event is JobEvent.FAIL:
+        return {"actor": OPERATOR if state is JobState.READY else WORKER}
     return {}
 
 
@@ -231,10 +257,10 @@ def test_every_state_event_pair_is_deterministic(state: JobState, event: JobEven
 
     if expected is None:
         with pytest.raises(InvalidTransition):
-            transition(job, event, **_ctx(event))
+            transition(job, event, **_ctx(state, event))
         return
 
-    result = transition(job, event, **_ctx(event))
+    result = transition(job, event, **_ctx(state, event))
     assert result.state is expected
 
 
@@ -247,44 +273,53 @@ def test_transition_table_is_total():
 # Claim ownership
 # --------------------------------------------------------------------------
 
-
 def test_claim_sets_the_owner():
     job = _job(JobState.READY)
-    claimed = transition(job, JobEvent.CLAIM, owner=OWNER, budget_check=BudgetCheck.approved())
+    claimed = transition(job, JobEvent.CLAIM, actor=WORKER, budget_check=BudgetCheck.approved())
     assert claimed.state is JobState.CLAIMED
     assert claimed.owner == OWNER
 
 
-def test_claim_requires_an_owner():
+def test_claim_requires_an_actor():
     job = _job(JobState.READY)
-    for missing in (None, "", "   "):
-        with pytest.raises(ClaimConflict):
-            transition(job, JobEvent.CLAIM, owner=missing, budget_check=BudgetCheck.approved())
+    for missing in (None, Actor(""), Actor("   ")):
+        with pytest.raises(AuthorizationRefused):
+            transition(job, JobEvent.CLAIM, actor=missing, budget_check=BudgetCheck.approved())
 
 
 def test_start_requires_the_claim_owner():
     job = _by_owner()
     with pytest.raises(ClaimConflict, match="does not match"):
-        transition(job, JobEvent.START, owner="mallory", budget_check=BudgetCheck.approved())
+        transition(
+            job, JobEvent.START,
+            actor=Actor("mallory"), budget_check=BudgetCheck.approved(),
+        )
+
+
+def test_start_refuses_the_operator():
+    # The operator may recover and fail-from-ready, but may not drive a job.
+    job = _by_owner()
+    with pytest.raises(AuthorizationRefused):
+        transition(job, JobEvent.START, actor=OPERATOR, budget_check=BudgetCheck.approved())
 
 
 def test_release_requires_the_claim_owner():
     job = _by_owner()
-    with pytest.raises(ClaimConflict, match="does not match"):
-        transition(job, JobEvent.RELEASE, owner="mallory")
+    with pytest.raises(ClaimConflict):
+        transition(job, JobEvent.RELEASE, actor=Actor("mallory"))
 
 
 def test_release_returns_to_ready_and_clears_owner():
     job = _by_owner()
-    ready = transition(job, JobEvent.RELEASE, owner=OWNER)
+    ready = transition(job, JobEvent.RELEASE, actor=WORKER)
     assert ready.state is JobState.READY
     assert ready.owner is None
 
 
 def test_a_released_job_can_be_claimed_by_a_different_owner():
     job = _by_owner()
-    ready = transition(job, JobEvent.RELEASE, owner=OWNER)
-    reclaimed = transition(ready, JobEvent.CLAIM, owner="bob", budget_check=BudgetCheck.approved())
+    ready = transition(job, JobEvent.RELEASE, actor=WORKER)
+    reclaimed = transition(ready, JobEvent.CLAIM, actor=Actor("bob"), budget_check=BudgetCheck.approved())
     assert reclaimed.owner == "bob"
     assert reclaimed.state is JobState.CLAIMED
 
@@ -292,75 +327,124 @@ def test_a_released_job_can_be_claimed_by_a_different_owner():
 def test_a_claimed_job_cannot_be_claimed_again():
     job = _by_owner()
     with pytest.raises(InvalidTransition):
-        transition(job, JobEvent.CLAIM, owner="bob", budget_check=BudgetCheck.approved())
+        transition(job, JobEvent.CLAIM, actor=Actor("bob"), budget_check=BudgetCheck.approved())
+
+
+# --------------------------------------------------------------------------
+# Worker-authorization on the post-claim events (the FORGE-12 gap)
+# --------------------------------------------------------------------------
+
+def test_complete_requires_the_owning_worker():
+    job = _job(JobState.RUNNING, owner=OWNER)
+    with pytest.raises(ClaimConflict, match="does not match"):
+        transition(job, JobEvent.COMPLETE, actor=Actor("mallory"))
+
+
+def test_complete_refuses_the_operator():
+    job = _job(JobState.RUNNING, owner=OWNER)
+    with pytest.raises(AuthorizationRefused):
+        transition(job, JobEvent.COMPLETE, actor=OPERATOR)
+
+
+def test_worker_cannot_block_another_workers_job():
+    job = _job(JobState.RUNNING, owner=OWNER)
+    with pytest.raises(ClaimConflict, match="does not match"):
+        transition(job, JobEvent.BLOCK, actor=Actor("mallory"))
+
+
+# --------------------------------------------------------------------------
+# RECOVER (operator-only)
+# --------------------------------------------------------------------------
+
+def test_recover_requires_operator():
+    job = _by_owner()
+    with pytest.raises(AuthorizationRefused):
+        transition(job, JobEvent.RECOVER, actor=WORKER)
+
+
+def test_recover_returns_to_ready_and_clears_owner():
+    job = _job(JobState.RUNNING, owner=OWNER)
+    ready = transition(job, JobEvent.RECOVER, actor=OPERATOR)
+    assert ready.state is JobState.READY
+    assert ready.owner is None
+
+
+def test_recover_from_ready_is_invalid():
+    job = _job(JobState.READY)
+    with pytest.raises(InvalidTransition):
+        transition(job, JobEvent.RECOVER, actor=OPERATOR)
+
+
+def test_recover_from_terminal_is_invalid():
+    job = replace(_job(JobState.READY), state=JobState.DONE, owner=OWNER)
+    with pytest.raises(InvalidTransition):
+        transition(job, JobEvent.RECOVER, actor=OPERATOR)
 
 
 # --------------------------------------------------------------------------
 # Budget -- fail closed before paid execution
 # --------------------------------------------------------------------------
 
-
 def test_missing_budget_refuses_claim():
     job = replace(_job(JobState.READY), budget=None)
     with pytest.raises(BudgetRefused, match="no positive per-job budget"):
-        transition(job, JobEvent.CLAIM, owner=OWNER, budget_check=BudgetCheck.approved())
+        transition(job, JobEvent.CLAIM, actor=WORKER, budget_check=BudgetCheck.approved())
 
 
 def test_missing_budget_refuses_start():
     job = replace(_by_owner(), budget=None)
     with pytest.raises(BudgetRefused):
-        transition(job, JobEvent.START, owner=OWNER, budget_check=BudgetCheck.approved())
+        transition(job, JobEvent.START, actor=WORKER, budget_check=BudgetCheck.approved())
 
 
 def test_absent_budget_check_refuses_claim():
     job = _job(JobState.READY)
     with pytest.raises(BudgetRefused, match="budget authorization"):
-        transition(job, JobEvent.CLAIM, owner=OWNER, budget_check=None)
+        transition(job, JobEvent.CLAIM, actor=WORKER, budget_check=None)
 
 
 def test_absent_budget_check_refuses_start():
     job = _by_owner()
     with pytest.raises(BudgetRefused):
-        transition(job, JobEvent.START, owner=OWNER, budget_check=None)
+        transition(job, JobEvent.START, actor=WORKER, budget_check=None)
 
 
 def test_exhausted_per_job_budget_refuses():
     job = _job(JobState.READY)
     check = BudgetCheck(per_job_allowed=False, global_allowed=True, detail="job budget exhausted")
     with pytest.raises(BudgetRefused):
-        transition(job, JobEvent.CLAIM, owner=OWNER, budget_check=check)
+        transition(job, JobEvent.CLAIM, actor=WORKER, budget_check=check)
 
 
 def test_exhausted_global_budget_refuses():
     job = _job(JobState.READY)
     check = BudgetCheck(per_job_allowed=True, global_allowed=False, detail="monthly cap reached")
     with pytest.raises(BudgetRefused, match="monthly cap reached"):
-        transition(job, JobEvent.CLAIM, owner=OWNER, budget_check=check)
+        transition(job, JobEvent.CLAIM, actor=WORKER, budget_check=check)
 
 
 def test_start_rechecks_budget_even_after_claim_passed():
     claimed = transition(
         _job(JobState.READY),
         JobEvent.CLAIM,
-        owner=OWNER,
+        actor=WORKER,
         budget_check=BudgetCheck.approved(),
     )
     exhausted = BudgetCheck(per_job_allowed=False, global_allowed=True, detail="spent at claim")
     with pytest.raises(BudgetRefused):
-        transition(claimed, JobEvent.START, owner=OWNER, budget_check=exhausted)
+        transition(claimed, JobEvent.START, actor=WORKER, budget_check=exhausted)
 
 
 def test_budget_refusal_leaves_the_job_unchanged():
     job = _by_owner()
     with pytest.raises(BudgetRefused):
-        transition(job, JobEvent.START, owner=OWNER, budget_check=None)
+        transition(job, JobEvent.START, actor=WORKER, budget_check=None)
     assert job.state is JobState.CLAIMED
 
 
 # --------------------------------------------------------------------------
 # Crash / recovery -- no silent terminal state
 # --------------------------------------------------------------------------
-
 
 def test_no_event_is_a_default():
     # There is no transition that marks a job done without an explicit complete.
@@ -370,59 +454,60 @@ def test_no_event_is_a_default():
 
 def test_running_job_stays_running_across_other_events():
     job = _job(JobState.RUNNING, owner=OWNER)
-    # Neither claim nor start nor submit silently completes it; the wrong-event
-    # refusals are the only other outcomes, and complete is the sole -> done.
     with pytest.raises(InvalidTransition):
-        transition(job, JobEvent.RELEASE, owner=OWNER)
+        transition(job, JobEvent.RELEASE, actor=WORKER)
 
 
 def test_fail_is_explicit_and_terminal():
     job = _job(JobState.RUNNING, owner=OWNER)
-    failed = transition(job, JobEvent.FAIL)
+    failed = transition(job, JobEvent.FAIL, actor=WORKER)
     assert failed.state is JobState.FAILED
 
 
-def test_fail_from_ready_records_a_rejection():
+def test_fail_from_ready_requires_operator():
+    # A pre-flight rejection of an unclaimed job is now an operator/system action.
     job = _job(JobState.READY)
-    failed = transition(job, JobEvent.FAIL)
+    with pytest.raises(AuthorizationRefused):
+        transition(job, JobEvent.FAIL, actor=WORKER)
+    failed = transition(job, JobEvent.FAIL, actor=OPERATOR)
     assert failed.state is JobState.FAILED
     assert failed.owner is None
 
 
 def test_a_failed_job_cannot_be_revived_implicitly():
-    failed = transition(_job(JobState.RUNNING, owner=OWNER), JobEvent.FAIL)
+    failed = transition(_job(JobState.RUNNING, owner=OWNER), JobEvent.FAIL, actor=WORKER)
     with pytest.raises(InvalidTransition):
-        transition(failed, JobEvent.CLAIM, owner=OWNER, budget_check=BudgetCheck.approved())
+        transition(failed, JobEvent.CLAIM, actor=WORKER, budget_check=BudgetCheck.approved())
 
 
 def test_a_done_job_is_terminal():
-    done = transition(_job(JobState.RUNNING, owner=OWNER), JobEvent.COMPLETE)
+    done = transition(_job(JobState.RUNNING, owner=OWNER), JobEvent.COMPLETE, actor=WORKER)
     assert done.state is JobState.DONE
     assert done.terminal
     with pytest.raises(InvalidTransition):
-        transition(done, JobEvent.FAIL)
+        transition(done, JobEvent.FAIL, actor=WORKER)
 
 
 def test_blocked_review_loop_is_recoverable():
     # running -> block -> unblock -> submit -> revise -> complete
     running = _job(JobState.RUNNING, owner=OWNER)
-    blocked = transition(running, JobEvent.BLOCK)
-    unblocked = transition(blocked, JobEvent.UNBLOCK)
+    blocked = transition(running, JobEvent.BLOCK, actor=WORKER)
+    unblocked = transition(blocked, JobEvent.UNBLOCK, actor=WORKER)
     assert unblocked.state is JobState.RUNNING
 
-    review = transition(unblocked, JobEvent.SUBMIT)
+    review = transition(unblocked, JobEvent.SUBMIT, actor=WORKER)
     assert review.state is JobState.REVIEW
 
-    revised = transition(review, JobEvent.REVISE)
+    revised = transition(review, JobEvent.REVISE, actor=WORKER)
     assert revised.state is JobState.RUNNING
 
-    done = transition(revised, JobEvent.COMPLETE)
+    done = transition(revised, JobEvent.COMPLETE, actor=WORKER)
     assert done.state is JobState.DONE
 
 
 def test_transition_is_pure_and_returns_a_new_job():
     job = _by_owner()
-    result = transition(job, JobEvent.START, owner=OWNER, budget_check=BudgetCheck.approved())
+    result = transition(job, JobEvent.START, actor=WORKER, budget_check=BudgetCheck.approved())
     assert result is not job
     assert result.state is JobState.RUNNING
     assert job.state is JobState.CLAIMED  # original untouched
@@ -432,17 +517,16 @@ def test_transition_is_pure_and_returns_a_new_job():
 # Exceptions are a coherent family
 # --------------------------------------------------------------------------
 
-
 def test_refusals_are_job_transition_errors():
     assert issubclass(InvalidTransition, JobTransitionError)
     assert issubclass(BudgetRefused, JobTransitionError)
     assert issubclass(ClaimConflict, JobTransitionError)
+    assert issubclass(AuthorizationRefused, JobTransitionError)
 
 
 # --------------------------------------------------------------------------
 # Structural: this module cannot enable unattended execution
 # --------------------------------------------------------------------------
-
 
 def test_jobs_package_imports_no_process_network_or_credential_modules():
     import pathlib
