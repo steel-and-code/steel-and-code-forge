@@ -79,7 +79,6 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from .idempotency import DedupeStore
 from .state import (
@@ -90,6 +89,7 @@ from .state import (
     ClaimConflict,
     Job,
     JobEvent,
+    JobRecord,
     JobState,
     JobStore,
     JobTransitionError,
@@ -186,6 +186,16 @@ DEFAULT_BUSY_TIMEOUT_MS: int = 5000
 #: allow to lapse. Injectable so tests can use sub-second leases.
 DEFAULT_LEASE_TTL: float = 300.0
 
+#: States in which a job is owned and holds an active lease. A transition whose
+#: successor leaves this set clears ``lease_expires_at`` -- READY, DONE, and
+#: FAILED are unleased.
+_LEASED_STATES: tuple[JobState, ...] = (
+    JobState.CLAIMED,
+    JobState.RUNNING,
+    JobState.BLOCKED,
+    JobState.REVIEW,
+)
+
 #: ``PRAGMA journal_mode=WAL`` writes to the file and can hit SQLITE_BUSY when a
 #: peer process is mid-creation or mid-WAL-switch on a brand-new database; the
 #: busy handler does not reliably retry that specific pragma, so retry here.
@@ -258,28 +268,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # --------------------------------------------------------------------------
 # Records and errors
 # --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class JobRecord:
-    """A stored job plus its store-level metadata.
-
-    ``job`` is the reconstructed :class:`~forge.jobs.state.Job` value;
-    ``created_at`` / ``updated_at`` / ``version`` / ``lease_expires_at`` /
-    ``lease_generation`` are the persistence metadata the frozen, clock-free
-    ``Job`` value deliberately does not carry.
-
-    ``lease_expires_at`` and ``lease_generation`` are read-only diagnostics: they
-    let a caller *display* that a lease is stale, but the store's in-transaction
-    comparison remains the only authority on whether a lease has lapsed.
-    """
-
-    job: Job
-    created_at: float
-    updated_at: float
-    version: int
-    lease_expires_at: float | None
-    lease_generation: int
 
 
 class JobStoreError(Exception):
@@ -704,10 +692,26 @@ class SqliteJobStore(JobStore):
                 raise
 
             now = self._clock()
+            # A job that leaves a leased state (RELEASE -> READY, COMPLETE ->
+            # DONE, FAIL -> FAILED) is no longer held, so its lease is cleared
+            # atomically with the state write; a still-owned job keeps it.
+            lease_expires_at = (
+                row["lease_expires_at"]
+                if successor.state in _LEASED_STATES
+                else None
+            )
             updated = self._conn.execute(
-                "UPDATE jobs SET state = ?, owner = ?, updated_at = ?, "
-                "version = version + 1 WHERE id = ? AND version = ?",
-                (successor.state.value, successor.owner, now, job_id, row["version"]),
+                "UPDATE jobs SET state = ?, owner = ?, lease_expires_at = ?, "
+                "updated_at = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (
+                    successor.state.value,
+                    successor.owner,
+                    lease_expires_at,
+                    now,
+                    job_id,
+                    row["version"],
+                ),
             )
             if updated.rowcount != 1:
                 raise ConcurrencyConflict(

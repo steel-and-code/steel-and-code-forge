@@ -626,6 +626,74 @@ def test_fail_from_ready_requires_operator(store):
 
 
 # --------------------------------------------------------------------------
+# Lease clearing: leaving an owned state drops the lease atomically
+# --------------------------------------------------------------------------
+
+def test_release_clears_lease(path):
+    clock = _SteppedClock()
+    with SqliteJobStore(path, clock=clock, lease_ttl=100.0) as s:
+        s.save(_job())
+        rec = s.claim("job-1", WORKER, budget_check=BudgetCheck.approved())
+        assert s.get("job-1").lease_expires_at is not None
+
+        s.transition("job-1", JobEvent.RELEASE, actor=WORKER, generation=rec.lease_generation)
+
+        after = s.get("job-1")
+        assert after.job.state is JobState.READY
+        assert after.job.owner is None
+        assert after.lease_expires_at is None  # lease cleared
+        assert after.lease_generation == rec.lease_generation  # fence lineage kept
+
+
+def test_complete_clears_lease(path):
+    clock = _SteppedClock()
+    with SqliteJobStore(path, clock=clock, lease_ttl=100.0) as s:
+        s.save(_job())
+        rec = s.claim("job-1", WORKER, budget_check=BudgetCheck.approved())
+        s.transition(
+            "job-1", JobEvent.START,
+            actor=WORKER, budget_check=BudgetCheck.approved(),
+            generation=rec.lease_generation,
+        )
+        assert s.get("job-1").lease_expires_at is not None  # still leased while running
+
+        s.transition("job-1", JobEvent.COMPLETE, actor=WORKER, generation=rec.lease_generation)
+
+        after = s.get("job-1")
+        assert after.job.state is JobState.DONE
+        assert after.lease_expires_at is None  # terminal -> unleased
+
+
+def test_fail_clears_lease(path):
+    clock = _SteppedClock()
+    with SqliteJobStore(path, clock=clock, lease_ttl=100.0) as s:
+        s.save(_job())
+        rec = s.claim("job-1", WORKER, budget_check=BudgetCheck.approved())
+        assert s.get("job-1").lease_expires_at is not None
+
+        s.transition("job-1", JobEvent.FAIL, actor=WORKER, generation=rec.lease_generation)
+
+        after = s.get("job-1")
+        assert after.job.state is JobState.FAILED
+        assert after.lease_expires_at is None  # terminal -> unleased
+
+
+def test_start_keeps_the_lease(path):
+    clock = _SteppedClock()
+    with SqliteJobStore(path, clock=clock, lease_ttl=100.0) as s:
+        s.save(_job())
+        rec = s.claim("job-1", WORKER, budget_check=BudgetCheck.approved())
+        original_expiry = rec.lease_expires_at
+        s.transition(
+            "job-1", JobEvent.START,
+            actor=WORKER, budget_check=BudgetCheck.approved(),
+            generation=rec.lease_generation,
+        )
+        # A still-owned transition must not disturb the lease.
+        assert s.get("job-1").lease_expires_at == original_expiry
+
+
+# --------------------------------------------------------------------------
 # Restart-safe persistence and recovery
 # --------------------------------------------------------------------------
 

@@ -75,6 +75,7 @@ from enum import Enum
 
 __all__ = [
     "Job",
+    "JobRecord",
     "JobState",
     "JobEvent",
     "Actor",
@@ -300,6 +301,35 @@ class Job:
         return tool in self.allowed_tools
 
 
+@dataclass(frozen=True)
+class JobRecord:
+    """A claimed/stored job plus its persistence metadata, as a value.
+
+    ``job`` is the :class:`Job` value; ``created_at`` / ``updated_at`` /
+    ``version`` / ``lease_expires_at`` / ``lease_generation`` are the
+    persistence metadata the frozen, clock-free ``Job`` deliberately does not
+    carry. It holds timestamps and counters as plain values -- it never reads
+    the clock -- so the value layer's "no clock" invariant is preserved.
+
+    ``claim`` returns one so the caller receives the lease-generation fencing
+    token it must present on later renew/mutation calls. ``lease_expires_at``
+    and ``lease_generation`` are read-only diagnostics: they let a caller
+    *display* that a lease is stale, but the durable store's in-transaction
+    comparison remains the only authority on whether a lease has lapsed.
+
+    This type lives in the value/contract module (not the store) because the
+    :class:`JobStore` interface's ``claim`` returns it; the durable store
+    imports and re-exports it so ``forge.jobs.store.JobRecord`` stays valid.
+    """
+
+    job: Job
+    created_at: float
+    updated_at: float
+    version: int
+    lease_expires_at: float | None
+    lease_generation: int
+
+
 class JobStore:
     """Interface for durable, atomic job persistence, wired in a later phase.
 
@@ -319,13 +349,13 @@ class JobStore:
     def load(self, job_id: str) -> Job | None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def claim(self, job_id: str, actor: Actor) -> Job:  # pragma: no cover - interface
+    def claim(self, job_id: str, actor: Actor) -> JobRecord:  # pragma: no cover - interface
         """Atomically claim ``job_id`` for ``actor`` or raise on conflict.
 
-        The durable implementation returns a record that also carries the
-        lease-generation fencing token the caller must present on subsequent
-        renew/mutation calls; the value here is the claimed :class:`Job` alone
-        (the token is store metadata, never part of the frozen value).
+        Returns a :class:`JobRecord` carrying both the claimed :class:`Job` and
+        the lease-generation fencing token the caller must present on subsequent
+        renew/mutation calls. The token and lease metadata live on the record,
+        never on the frozen :class:`Job` value.
         """
         raise NotImplementedError
 
