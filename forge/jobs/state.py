@@ -1,4 +1,4 @@
-"""Forge job contract: states, permissions, budget, and claim ownership.
+"""Forge job contract: states, permissions, budget, actor roles, and claim ownership.
 
 Phase A of the Forge 2.0 roadmap (GitHub issue #3). This module defines the
 *shape* of a Jira -> Forge -> Byte job and the deterministic transitions between
@@ -32,9 +32,13 @@ layer does not introduce a second, weaker copy of them:
 *   **Fail closed on budget.** A missing or exhausted budget refuses the
     transitions that lead to paid execution (``claim`` and ``start``) as a
     :class:`BudgetRefused`, distinct from an invalid-state refusal.
-*   **Single-consumer claim.** ``claim`` sets an owner; ``start`` and
-    ``release`` require that owner; a second ``claim`` of an owned job raises
-    :class:`ClaimConflict`.
+*   **Single-consumer claim.** ``claim`` sets an owner from the acting actor's
+    identity; ``start`` and the other worker mutations require that identity; a
+    second ``claim`` of an owned job raises :class:`InvalidTransition`.
+*   **Actor roles narrow privilege.** A ``WORKER`` may hold and drive a job it
+    claims. An ``OPERATOR`` may only recover an owned job and fail an unowned
+    ``ready`` job. The operator role widens authorization-to-*act*, never budget,
+    never tool permissions, never the repo allowlist.
 *   **Explicit terminal states.** ``done`` and ``failed`` are reached only by an
     explicit ``complete`` or ``fail`` event. There is no default that marks a
     job done.
@@ -43,10 +47,23 @@ layer does not introduce a second, weaker copy of them:
     configuration. The allowlist is never read from the ticket; the ticket can
     name a repo, Forge decides whether it is allowed.
 
+Two things are true about :class:`ActorRole.OPERATOR` and worth stating plainly,
+because they are easy to misread as a security property they are not:
+
+*   ``ActorRole.OPERATOR`` is **not an authentication mechanism**. It is an enum
+    value carried in-process. The trusted Forge authorization layer is the only
+    thing that may conclude, from its own sources, that a caller is an operator,
+    and it is the only thing that may mint an :class:`Actor` with that role.
+*   This data model alone is **not a complete security boundary**. It is a shape
+    and a set of comparison points. The actual boundary is the authority that
+    constructs the ``Actor`` and the fact that it never derives role from a Jira
+    ticket, an agent prompt, or any worker-controlled input. That authority
+    lives upstream of this module; here, ``role`` is trusted input, not proof.
+
 The Jira payload becomes a job only through :func:`new_job`, which is the single
 validation boundary. A ticket cannot declare its own permissions, its own
-budget, or its own allowlist: those are Forge inputs, and the model is shaped so
-they cannot arrive any other way.
+budget, its own allowlist, or its own acting role: those are Forge inputs, and
+the model is shaped so they cannot arrive any other way.
 """
 
 from __future__ import annotations
@@ -58,8 +75,11 @@ from enum import Enum
 
 __all__ = [
     "Job",
+    "JobRecord",
     "JobState",
     "JobEvent",
+    "Actor",
+    "ActorRole",
     "TERMINAL_STATES",
     "BASELINE_TOOLS",
     "BudgetCheck",
@@ -69,9 +89,56 @@ __all__ = [
     "InvalidTransition",
     "BudgetRefused",
     "ClaimConflict",
+    "AuthorizationRefused",
     "new_job",
     "transition",
 ]
+
+
+# --------------------------------------------------------------------------
+# Actors and roles
+# --------------------------------------------------------------------------
+
+
+class ActorRole(str, Enum):
+    """The privilege class of an acting party.
+
+    ``WORKER`` is the default: it may hold and drive a job it claims, and only
+    its own. ``OPERATOR`` is the recovery/oversight role: it may recover an
+    owned job and fail an unowned ``ready`` job, and nothing else.
+
+    ``OPERATOR`` is **not an authentication mechanism**. This enum is a claim
+    about privilege class carried in-process; the trusted Forge authorization
+    layer is what decides, from its own sources, that a given caller is an
+    operator, and it is the only thing that may mint an :class:`Actor` with
+    this role. A role value arriving from a ticket, a prompt, or worker input
+    is untrusted input, not proof of anything.
+    """
+
+    WORKER = "worker"
+    OPERATOR = "operator"
+
+
+@dataclass(frozen=True)
+class Actor:
+    """The acting party for one transition, an immutable value.
+
+    Attributes:
+        identity: The caller's identifier. Sets ``Job.owner`` on ``claim`` and
+            must equal ``job.owner`` for every worker mutation.
+        role: The caller's privilege class (:class:`ActorRole`). Defaults to
+            ``WORKER``.
+
+    ``role`` is **not authentication**. This value records what privilege class
+    the caller *claims*; it is meaningful only because the trusted Forge
+    authorization layer -- never a Jira ticket, an agent prompt, or worker
+    input -- is the sole producer of ``Actor`` values with ``role=OPERATOR``.
+    This data model is a shape and a comparison point, not a security boundary
+    by itself; the boundary is the authority that constructs the ``Actor``.
+    """
+
+    identity: str
+    role: ActorRole = ActorRole.WORKER
 
 
 # --------------------------------------------------------------------------
@@ -106,6 +173,9 @@ class JobEvent(str, Enum):
     ``complete`` and ``fail`` are the only routes into a terminal state.
     ``release`` exists as the recovery path for a claim that was taken but never
     started; it returns the job to ``ready`` and is gated on the owner matching.
+    ``recover`` is the operator-only path back to ``ready`` for a job whose
+    worker's lease has lapsed or been abandoned; it is always explicit and never
+    a timeout default.
     """
 
     CLAIM = "claim"
@@ -117,6 +187,7 @@ class JobEvent(str, Enum):
     REVISE = "revise"
     COMPLETE = "complete"
     FAIL = "fail"
+    RECOVER = "recover"
 
 
 #: The Forge-wide tool baseline a job's ``allowed_tools`` narrows. Kept equal to
@@ -210,7 +281,7 @@ class Job:
         budget: Per-job spending ceiling, or ``None`` for unset. ``None`` means
             the job cannot pass its budget guard, so it cannot execute.
         owner: The claim holder, or ``None`` before a successful ``claim``.
-            Sets the identity that ``start`` and ``release`` must match.
+            Sets the identity that worker mutations must match.
     """
 
     id: str
@@ -228,6 +299,35 @@ class Job:
     def allows(self, tool: str) -> bool:
         """Whether ``tool`` is within this job's (narrowed) permissions."""
         return tool in self.allowed_tools
+
+
+@dataclass(frozen=True)
+class JobRecord:
+    """A claimed/stored job plus its persistence metadata, as a value.
+
+    ``job`` is the :class:`Job` value; ``created_at`` / ``updated_at`` /
+    ``version`` / ``lease_expires_at`` / ``lease_generation`` are the
+    persistence metadata the frozen, clock-free ``Job`` deliberately does not
+    carry. It holds timestamps and counters as plain values -- it never reads
+    the clock -- so the value layer's "no clock" invariant is preserved.
+
+    ``claim`` returns one so the caller receives the lease-generation fencing
+    token it must present on later renew/mutation calls. ``lease_expires_at``
+    and ``lease_generation`` are read-only diagnostics: they let a caller
+    *display* that a lease is stale, but the durable store's in-transaction
+    comparison remains the only authority on whether a lease has lapsed.
+
+    This type lives in the value/contract module (not the store) because the
+    :class:`JobStore` interface's ``claim`` returns it; the durable store
+    imports and re-exports it so ``forge.jobs.store.JobRecord`` stays valid.
+    """
+
+    job: Job
+    created_at: float
+    updated_at: float
+    version: int
+    lease_expires_at: float | None
+    lease_generation: int
 
 
 class JobStore:
@@ -249,12 +349,24 @@ class JobStore:
     def load(self, job_id: str) -> Job | None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def claim(self, job_id: str, owner: str) -> Job:  # pragma: no cover - interface
-        """Atomically claim ``job_id`` for ``owner`` or raise on conflict."""
+    def claim(self, job_id: str, actor: Actor) -> JobRecord:  # pragma: no cover - interface
+        """Atomically claim ``job_id`` for ``actor`` or raise on conflict.
+
+        Returns a :class:`JobRecord` carrying both the claimed :class:`Job` and
+        the lease-generation fencing token the caller must present on subsequent
+        renew/mutation calls. The token and lease metadata live on the record,
+        never on the frozen :class:`Job` value.
+        """
         raise NotImplementedError
 
     def transition(  # pragma: no cover - interface
-        self, job_id: str, event: JobEvent, **ctx: object
+        self,
+        job_id: str,
+        event: JobEvent,
+        *,
+        actor: Actor | None = None,
+        budget_check: BudgetCheck | None = None,
+        generation: int | None = None,
     ) -> Job:
         """Apply one event to the stored job within a transaction."""
         raise NotImplementedError
@@ -291,6 +403,17 @@ class BudgetRefused(JobTransitionError):
 
 class ClaimConflict(JobTransitionError):
     """A claim is already held, or the supplied owner does not match it."""
+
+
+class AuthorizationRefused(JobTransitionError):
+    """The actor lacks the required identity or role for this event.
+
+    Distinct from :class:`ClaimConflict`, which is specifically "already owned
+    / owner mismatch". This one is the role-and-presence refusal: no actor was
+    supplied, its identity is empty, it is a worker acting on another worker's
+    job, or an event requires the operator role (or the worker role) and the
+    actor does not carry it.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -410,17 +533,36 @@ def _invalid(state: JobState, event: JobEvent) -> InvalidTransition:
     )
 
 
-def _require_owner_present(owner: str | None) -> None:
-    if owner is None or not owner.strip():
-        raise ClaimConflict("a non-empty owner is required for this transition")
+def _require_actor_present(actor: Actor | None) -> Actor:
+    if not isinstance(actor, Actor):
+        raise AuthorizationRefused("an Actor is required for this transition")
+    if not isinstance(actor.identity, str) or not actor.identity.strip():
+        raise AuthorizationRefused("the actor requires a non-empty identity")
+    return actor
 
 
-def _require_owner_match(owner: str | None, expected: str | None) -> None:
-    _require_owner_present(owner)
-    if owner != expected:
+def _require_worker_owner(actor: Actor | None, expected: str | None) -> None:
+    """Require a WORKER actor whose identity equals the job's owner."""
+    actor = _require_actor_present(actor)
+    if actor.role is not ActorRole.WORKER:
+        raise AuthorizationRefused("only the owning worker may perform this transition")
+    if actor.identity != expected:
         raise ClaimConflict(
-            f"owner {owner!r} does not match the job's claim owner {expected!r}"
+            f"actor {actor.identity!r} does not match the job's owner {expected!r}"
         )
+
+
+def _require_operator(actor: Actor | None) -> None:
+    """Require an OPERATOR actor (trusted-boundary role)."""
+    actor = _require_actor_present(actor)
+    if actor.role is not ActorRole.OPERATOR:
+        raise AuthorizationRefused("this transition requires the operator role")
+
+
+def _require_claim_actor(actor: Actor | None) -> str:
+    """Require a present, non-empty actor and return its identity (any role)."""
+    actor = _require_actor_present(actor)
+    return actor.identity
 
 
 def _require_budget(job: Job, budget_check: BudgetCheck | None) -> None:
@@ -453,7 +595,7 @@ def transition(
     job: Job,
     event: JobEvent,
     *,
-    owner: str | None = None,
+    actor: Actor | None = None,
     budget_check: BudgetCheck | None = None,
 ) -> Job:
     """Apply ``event`` to ``job``, returning the successor :class:`Job`.
@@ -465,19 +607,25 @@ def transition(
 
     Guards:
 
-    *   ``claim`` sets ``owner`` (required, non-empty) and checks budget.
-    *   ``start`` and ``release`` require ``owner`` to equal the claim holder.
+    *   ``claim`` sets ``owner`` from ``actor.identity`` (required, non-empty)
+        and checks budget. Any role may claim a ``ready`` job.
+    *   ``start``, ``release``, ``block``, ``unblock``, ``submit``, ``revise``
+        and ``complete`` require a WORKER actor whose identity equals the claim
+        holder. A non-owner or non-worker actor is refused (:class:`ClaimConflict`
+        or :class:`AuthorizationRefused`).
+    *   ``fail`` requires the owning WORKER on an owned job, or an OPERATOR on a
+        ``ready`` job. ``recover`` requires an OPERATOR and moves an owned job
+        back to ``ready``, clearing the owner.
     *   ``claim`` and ``start`` both check budget -- fail closed *before* paid
-        execution begins, and a job may be re-checked at ``start`` even though
-        it passed at ``claim``.
-    *   ``complete`` and ``fail`` are the only routes into terminal states; a
-        job is never marked done by a default.
+        execution begins.
 
     Args:
         job: The current job.
         event: The event to apply.
-        owner: The actor's identity. Required and stored on ``claim``; must
-            match ``job.owner`` on ``start`` and ``release``; ignored elsewhere.
+        actor: The acting party. Required on every event except where a terminal
+            or state refusal fires first; its ``identity`` is stored on ``claim``
+            and matched on worker mutations, and its ``role`` gates ``recover``
+            and ``fail``-from-``ready``.
         budget_check: Pre-computed budget authorization, required on ``claim``
             and ``start``.
     """
@@ -491,52 +639,54 @@ def transition(
     if event is JobEvent.CLAIM:
         if state is not JobState.READY:
             raise _invalid(state, event)
-        _require_owner_present(owner)
+        identity = _require_claim_actor(actor)
         _require_budget(job, budget_check)
-        return replace(job, state=JobState.CLAIMED, owner=owner)
+        return replace(job, state=JobState.CLAIMED, owner=identity)
 
     if event is JobEvent.START:
         if state is not JobState.CLAIMED:
             raise _invalid(state, event)
-        _require_owner_match(owner, job.owner)
+        _require_worker_owner(actor, job.owner)
         _require_budget(job, budget_check)
         return replace(job, state=JobState.RUNNING)
 
     if event is JobEvent.RELEASE:
         if state is not JobState.CLAIMED:
             raise _invalid(state, event)
-        _require_owner_match(owner, job.owner)
+        _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.READY, owner=None)
 
     if event is JobEvent.BLOCK:
         if state is not JobState.RUNNING:
             raise _invalid(state, event)
+        _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.BLOCKED)
 
     if event is JobEvent.UNBLOCK:
         if state is not JobState.BLOCKED:
             raise _invalid(state, event)
+        _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.RUNNING)
 
     if event is JobEvent.SUBMIT:
         if state is not JobState.RUNNING:
             raise _invalid(state, event)
+        _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.REVIEW)
 
     if event is JobEvent.REVISE:
         if state is not JobState.REVIEW:
             raise _invalid(state, event)
+        _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.RUNNING)
 
     if event is JobEvent.COMPLETE:
         if state not in (JobState.RUNNING, JobState.REVIEW):
             raise _invalid(state, event)
+        _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.DONE)
 
     if event is JobEvent.FAIL:
-        # Explicitly from any non-terminal state: a pre-flight rejection of an
-        # unclaimed job is as legitimate a failure as a worker crash, and both
-        # are recorded, never defaulted.
         if state not in (
             JobState.READY,
             JobState.CLAIMED,
@@ -545,6 +695,21 @@ def transition(
             JobState.REVIEW,
         ):
             raise _invalid(state, event)
+        if state is JobState.READY:
+            _require_operator(actor)
+        else:
+            _require_worker_owner(actor, job.owner)
         return replace(job, state=JobState.FAILED)
+
+    if event is JobEvent.RECOVER:
+        if state not in (
+            JobState.CLAIMED,
+            JobState.RUNNING,
+            JobState.BLOCKED,
+            JobState.REVIEW,
+        ):
+            raise _invalid(state, event)
+        _require_operator(actor)
+        return replace(job, state=JobState.READY, owner=None)
 
     raise _invalid(state, event)

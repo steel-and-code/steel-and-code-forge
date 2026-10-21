@@ -1,4 +1,4 @@
-"""Durable, SQLite-backed job persistence (FORGE-11).
+"""Durable, SQLite-backed job persistence (FORGE-11, FORGE-12).
 
 This module gives the Phase A ``JobStore`` and ``DedupeStore`` interfaces a
 real, restart-safe implementation. It is the layer that turns the pure
@@ -6,56 +6,71 @@ real, restart-safe implementation. It is the layer that turns the pure
 cross-process atomicity -- into a store whose ``claim`` and ``transition`` are
 transactional and durable.
 
-What is *not* moved or reimplemented here:
+FORGE-12 adds durable leases, lease-generation fencing, and the operator
+recovery path on top of the FORGE-11 store, without moving any of the state
+machine here. What is *not* moved or reimplemented:
 
 *   The state machine. :func:`forge.jobs.state.transition` stays the single
     source of truth for what ``(state, event)`` is legal and for every
-    ownership/budget refusal. This store loads a row, passes it to that pure
-    function, and writes back the successor. The machine is exercised, not
-    copied, so requirement "preserve the existing state machine" holds by
-    construction.
+    ownership/role/budget refusal. This store loads a row, passes it to that
+    pure function, and writes back the successor. The machine is exercised, not
+    copied.
 *   Idempotency key derivation. :func:`~forge.jobs.idempotency.idempotency_key`
-    and :func:`~forge.jobs.idempotency.event_key` are untouched. Only the
-    durable *storage* behind ``DedupeStore`` is added.
+    and :func:`~forge.jobs.idempotency.event_key` are untouched.
 
 Design decisions (deliberate):
 
-*   **Timestamps live in the store, not on the value.** ``Job`` is frozen and
-    clock-free by house invariant ("no clock/default transitions"). Row
-    ``created_at`` / ``updated_at`` are store metadata, surfaced through
+*   **Timestamps and leases live in the store, not on the value.** ``Job`` is
+    frozen and clock-free by house invariant ("no clock/default transitions").
+    Row ``created_at`` / ``updated_at`` / ``lease_expires_at`` and the
+    ``lease_generation`` counter are store metadata, surfaced through
     :class:`JobRecord`, never added to ``Job``.
 *   **One authoritative mutation path.** ``save`` is intake/registration only
-    (it refuses a duplicate id). Every state change runs through ``transition``
-    or its ``claim`` convenience, inside a ``BEGIN IMMEDIATE`` transaction with
-    an optimistic version-guarded update. A progressed job is never silently
+    (it refuses a duplicate id). Every state change runs through ``transition``,
+    ``claim``, or ``recover`` inside a ``BEGIN IMMEDIATE`` transaction with an
+    optimistic version-guarded update. A progressed job is never silently
     overwritten.
 *   **Fail closed on budget.** ``claim`` and ``start`` require a
     :class:`~forge.jobs.state.BudgetCheck`; an absent or failing check refuses
-    (``BudgetRefused``) exactly as the pure machine does. The durable
-    ``BudgetLedger`` remains deferred -- this store persists the per-job budget
-    *ceiling*, but does not meter cross-process spend. No caller-supplied
-    authorization is invented by the store.
+    exactly as the pure machine does. The durable ``BudgetLedger`` remains
+    deferred.
 *   **Refusals are audited, not swallowed.** A refused transition records a
     ``job_history`` row with ``from_state == to_state`` and ``outcome`` set to
-    the exception class name, then re-raises -- the caller is never handed an
-    unchanged job as if nothing happened, and the attempt is visible in the
-    audit trail.
-*   **No general exactly-once claim.** Atomic ``claim`` and durable dedupe make
-    *claim ownership* and *duplicate-event recognition* safe across processes.
-    They do **not** make external side effects exactly-once: recording a key
-    and committing an outcome must still be one transaction at the call site
-    (the later intake phase), which this store does not attempt to promise.
+    the exception class name, then re-raises.
+*   **No general exactly-once claim.** Atomic ``claim``, durable dedupe, and
+    lease fencing make *claim ownership* and *duplicate-event recognition* safe
+    across processes. They do **not** make external side effects exactly-once:
+    recording a key and committing an outcome must still be one transaction at
+    the call site (the later intake phase). A recovered-and-re-run job may
+    repeat its side effects; fencing only guarantees no two workers hold a live
+    lease at once.
+
+Leases and fencing (FORGE-12):
+
+*   A claim mints a lease (``lease_expires_at = now + lease_ttl``) and bumps
+    ``lease_generation``. The generation is the worker's *fencing token*: every
+    renew and worker mutation must present the generation the worker was handed
+    at claim time. A mismatched generation means the claim was superseded (by a
+    same-identity re-claim or an operator recovery) and is refused with
+    :class:`LeaseExpired`.
+*   A worker mutation is refused as :class:`LeaseExpired` once the lease has
+    lapsed. Renewal after expiry is refused the same way (no self-healing); the
+    only way forward is an explicit operator :meth:`SqliteJobStore.recover`.
+*   Leases never expire a job *into* a state. "Expired" is a liveness label on
+    the row, not a transition: a job is never auto-marked done or failed by a
+    timeout.
 
 Concurrency model: every write opens a ``BEGIN IMMEDIATE`` transaction (the
 writer lock), so read-then-write is serialised across connections and processes
-against a shared file. The version-guarded ``UPDATE`` is a second, correctness
-defence that raises :class:`ConcurrencyConflict` if a row changed underneath --
-defence in depth, not the primary mechanism.
+against a shared file. The version-guarded ``UPDATE ... WHERE id = ? AND
+version = ?`` is a second, correctness defence that raises
+:class:`ConcurrencyConflict` if a row changed underneath. The generation fence
+is a third, lease-specific defence: it guards ownership continuity, which the
+version counter (bumped on every write) does not.
 
 This module is stdlib-only (``sqlite3``), matching the zero-runtime-dependency
 rule in ``pyproject.toml``. It imports no subprocess, network, or credential
-module, so the existing ``forge/jobs`` structural import-scan in
-``tests/test_job_state.py`` continues to pass over it.
+module.
 """
 
 from __future__ import annotations
@@ -64,13 +79,17 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from .idempotency import DedupeStore
 from .state import (
+    Actor,
+    ActorRole,
+    AuthorizationRefused,
     BudgetCheck,
+    ClaimConflict,
     Job,
     JobEvent,
+    JobRecord,
     JobState,
     JobStore,
     JobTransitionError,
@@ -79,11 +98,13 @@ from .state import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    "DEFAULT_LEASE_TTL",
     "JobRecord",
     "JobStoreError",
     "JobNotFound",
     "JobAlreadyExists",
     "ConcurrencyConflict",
+    "LeaseExpired",
     "MigrationError",
     "SqliteJobStore",
     "SqliteDedupeStore",
@@ -137,6 +158,20 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        2,
+        (
+            # FORGE-12: durable leases + fencing + actor/role audit. Additive
+            # only, so a v1 database upgrades in place with no rewrite. Owned
+            # rows from a v1 database carry lease_expires_at = NULL, which the
+            # store treats as expired (operator-recoverable, fail-closed).
+            "ALTER TABLE jobs ADD COLUMN lease_expires_at REAL",
+            "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE job_history ADD COLUMN actor_identity TEXT",
+            "ALTER TABLE job_history ADD COLUMN actor_role TEXT",
+            "ALTER TABLE job_history ADD COLUMN reason TEXT",
+        ),
+    ),
 )
 
 #: The current schema version. Kept equal to ``MIGRATIONS[-1][0]``; a change to
@@ -145,6 +180,21 @@ SCHEMA_VERSION: int = MIGRATIONS[-1][0]
 
 #: Default SQLite busy timeout (milliseconds) for concurrent openers.
 DEFAULT_BUSY_TIMEOUT_MS: int = 5000
+
+#: Default lease duration (seconds) handed to a worker at claim time. A worker
+#: renews on a shorter heartbeat cadence; this is the ceiling it must never
+#: allow to lapse. Injectable so tests can use sub-second leases.
+DEFAULT_LEASE_TTL: float = 300.0
+
+#: States in which a job is owned and holds an active lease. A transition whose
+#: successor leaves this set clears ``lease_expires_at`` -- READY, DONE, and
+#: FAILED are unleased.
+_LEASED_STATES: tuple[JobState, ...] = (
+    JobState.CLAIMED,
+    JobState.RUNNING,
+    JobState.BLOCKED,
+    JobState.REVIEW,
+)
 
 #: ``PRAGMA journal_mode=WAL`` writes to the file and can hit SQLITE_BUSY when a
 #: peer process is mid-creation or mid-WAL-switch on a brand-new database; the
@@ -220,21 +270,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class JobRecord:
-    """A stored job plus its store-level metadata.
-
-    ``job`` is the reconstructed :class:`~forge.jobs.state.Job` value;
-    ``created_at`` / ``updated_at`` / ``version`` are the persistence metadata
-    the frozen, clock-free ``Job`` value deliberately does not carry.
-    """
-
-    job: Job
-    created_at: float
-    updated_at: float
-    version: int
-
-
 class JobStoreError(Exception):
     """Base for errors the durable store raises that are not value-level
     transition refusals. The transition refusals themselves
@@ -262,8 +297,86 @@ class ConcurrencyConflict(JobStoreError):
     correctness backstop, not the normal path."""
 
 
+class LeaseExpired(JobStoreError):
+    """The acting worker's lease has lapsed, or its generation is stale.
+
+    Raised when a worker mutation or renewal presents no live lease, renews
+    after expiry, or carries a generation token that no longer matches the
+    stored one (the claim was superseded by a re-claim or an operator recovery).
+    The only forward path from here is an explicit operator recovery."""
+
+
 class MigrationError(JobStoreError):
     """A schema migration failed; the database was left at its prior version."""
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+
+def _record_history(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    event: str,
+    from_state: str | None,
+    to_state: str,
+    owner: str | None,
+    outcome: str,
+    at: float,
+    actor: Actor | None = None,
+    reason: str | None = None,
+) -> None:
+    """Append one audit row, separating the acting party from the job owner.
+
+    ``owner`` is the *job's* owner snapshot at the moment of the event (distinct
+    from whoever acted); ``actor_identity`` / ``actor_role`` record the acting
+    party, and ``reason`` carries the operator's justification on a recovery.
+    """
+    conn.execute(
+        "INSERT INTO job_history (job_id, event, from_state, to_state, owner, "
+        "outcome, at, actor_identity, actor_role, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job_id,
+            event,
+            from_state,
+            to_state,
+            owner,
+            outcome,
+            at,
+            actor.identity if actor is not None else None,
+            actor.role.value if actor is not None else None,
+            reason,
+        ),
+    )
+
+
+def _enforce_lease(
+    job_id: str, row: sqlite3.Row, generation: int | None, now: float
+) -> None:
+    """Refuse a worker mutation unless its lease is live and un-superseded.
+
+    Two independent checks, both failing closed:
+
+    *   the lease must exist and not have lapsed; a NULL or past expiry means
+        the row is either legacy-unleased or stale, and only an operator
+        recovery can move it;
+    *   the presented generation token must equal the stored one; a mismatch
+        means the claim was superseded by a re-claim or a recovery.
+    """
+    lease_expires_at = row["lease_expires_at"]
+    if lease_expires_at is None or lease_expires_at < now:
+        raise LeaseExpired(
+            f"job {job_id!r} lease is not live; an operator recovery is required"
+        )
+    if generation is None:
+        raise LeaseExpired(f"job {job_id!r} requires a lease generation token")
+    if generation != row["lease_generation"]:
+        raise LeaseExpired(
+            f"job {job_id!r} lease generation is stale; the claim was superseded"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -280,6 +393,9 @@ class SqliteJobStore(JobStore):
 
     ``clock`` is the timestamp source (default ``time.time``); inject a
     deterministic callable to make tests independent of the wall clock.
+    ``lease_ttl`` is the lease duration handed out at claim time (default
+    :data:`DEFAULT_LEASE_TTL`); inject a small value so lease-expiry tests do
+    not sleep.
 
     Every mutating method first runs migrations, so opening a store against a
     fresh or an older file brings it to :data:`SCHEMA_VERSION`.
@@ -291,9 +407,11 @@ class SqliteJobStore(JobStore):
         *,
         clock: Callable[[], float] = time.time,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        lease_ttl: float = DEFAULT_LEASE_TTL,
     ) -> None:
         self._path = path
         self._clock = clock
+        self._lease_ttl = float(lease_ttl)
         self._conn = _connect(path, busy_timeout_ms)
 
     # -- lifecycle ---------------------------------------------------------
@@ -328,7 +446,8 @@ class SqliteJobStore(JobStore):
         """Return the stored job *and* its metadata, or ``None`` if absent."""
         row = self._conn.execute(
             "SELECT id, ticket_ref, repo, state, allowed_tools, budget, owner, "
-            "created_at, updated_at, version FROM jobs WHERE id = ?",
+            "created_at, updated_at, version, lease_expires_at, lease_generation "
+            "FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
         if row is None:
@@ -338,6 +457,8 @@ class SqliteJobStore(JobStore):
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             version=row["version"],
+            lease_expires_at=row["lease_expires_at"],
+            lease_generation=row["lease_generation"],
         )
 
     # -- intake ------------------------------------------------------------
@@ -347,7 +468,8 @@ class SqliteJobStore(JobStore):
 
         This is the only way a job enters the store. It persists the validated
         value, records a ``register`` history entry, and returns the job
-        unchanged. State changes afterwards must go through ``transition``.
+        unchanged. State changes afterwards must go through ``transition``,
+        ``claim``, or ``recover``.
         """
         if not isinstance(job, Job):
             raise TypeError(f"save expects a Job, got {job!r}")
@@ -375,10 +497,15 @@ class SqliteJobStore(JobStore):
                     now,
                 ),
             )
-            self._conn.execute(
-                "INSERT INTO job_history (job_id, event, from_state, to_state, "
-                "owner, outcome, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (job.id, "register", None, job.state.value, job.owner, "ok", now),
+            _record_history(
+                self._conn,
+                job_id=job.id,
+                event="register",
+                from_state=None,
+                to_state=job.state.value,
+                owner=job.owner,
+                outcome="ok",
+                at=now,
             )
             self._conn.execute("COMMIT")
         except Exception:
@@ -390,92 +517,397 @@ class SqliteJobStore(JobStore):
     # -- mutation ----------------------------------------------------------
 
     def claim(
-        self, job_id: str, owner: str, budget_check: BudgetCheck | None = None
-    ) -> Job:
-        """Atomically claim ``job_id`` for ``owner``.
+        self, job_id: str, actor: Actor, budget_check: BudgetCheck | None = None
+    ) -> JobRecord:
+        """Atomically claim ``job_id`` for ``actor``.
 
-        ``budget_check`` failures close exactly as the pure machine does: an
-        absent authorization refuses before paid execution. A job that is not
-        ``ready`` (already claimed, running, or terminal) is refused.
+        Sets the owner from ``actor.identity``, mints a lease (``now + lease_ttl``)
+        and a fresh generation token, and returns the resulting
+        :class:`JobRecord` so the caller holds the token it must present on
+        later renew/mutation calls.
+
+        ``budget_check`` failures close exactly as the pure machine does. A job
+        that is not ``ready`` is refused.
         """
-        return self.transition(job_id, JobEvent.CLAIM, owner=owner, budget_check=budget_check)
+        if not isinstance(actor, Actor):
+            raise TypeError(f"claim expects an Actor, got {actor!r}")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT id, ticket_ref, repo, state, allowed_tools, budget, "
+                "owner, created_at, updated_at, version, lease_generation "
+                "FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise JobNotFound(job_id)
+            job = _row_to_job(row)
+
+            try:
+                successor = _transition(
+                    job, JobEvent.CLAIM, actor=actor, budget_check=budget_check
+                )
+            except JobTransitionError as exc:
+                _record_history(
+                    self._conn,
+                    job_id=job_id,
+                    event=JobEvent.CLAIM.value,
+                    from_state=job.state.value,
+                    to_state=job.state.value,
+                    owner=job.owner,
+                    outcome=type(exc).__name__,
+                    at=self._clock(),
+                    actor=actor,
+                )
+                self._conn.execute("COMMIT")
+                raise
+
+            now = self._clock()
+            new_generation = row["lease_generation"] + 1
+            lease_expires_at = now + self._lease_ttl
+            updated = self._conn.execute(
+                "UPDATE jobs SET state = ?, owner = ?, updated_at = ?, "
+                "lease_expires_at = ?, lease_generation = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (
+                    successor.state.value,
+                    successor.owner,
+                    now,
+                    lease_expires_at,
+                    new_generation,
+                    job_id,
+                    row["version"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ConcurrencyConflict(
+                    f"job {job_id!r} changed between read and write"
+                )
+            _record_history(
+                self._conn,
+                job_id=job_id,
+                event=JobEvent.CLAIM.value,
+                from_state=job.state.value,
+                to_state=successor.state.value,
+                owner=successor.owner,
+                outcome="ok",
+                at=now,
+                actor=actor,
+            )
+            self._conn.execute("COMMIT")
+            return JobRecord(
+                job=successor,
+                created_at=row["created_at"],
+                updated_at=now,
+                version=row["version"] + 1,
+                lease_expires_at=lease_expires_at,
+                lease_generation=new_generation,
+            )
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     def transition(
         self,
         job_id: str,
         event: JobEvent,
         *,
-        owner: str | None = None,
+        actor: Actor | None = None,
         budget_check: BudgetCheck | None = None,
+        generation: int | None = None,
     ) -> Job:
         """Apply ``event`` to the stored job inside one transaction.
 
-        Loads the row, runs the pure :func:`~forge.jobs.state.transition`, then
-        writes the successor and its history entry atomically. Ownership and
-        budget refusals raised by the pure machine are recorded to history
-        (with ``from_state == to_state`` and the refusal as ``outcome``) and
-        re-raised; nothing about the stored job changes.
+        Loads the row, enforces the lease/generation fence for worker-driven
+        events, runs the pure :func:`~forge.jobs.state.transition`, then writes
+        the successor and its history entry atomically. Ownership, role and
+        budget refusals raised by the pure machine are recorded to history (with
+        ``from_state == to_state`` and the refusal as ``outcome``) and re-raised.
+
+        ``claim`` and ``recover`` are served by their dedicated methods; passing
+        either here is a programming error and raises ``ValueError``.
         """
         if not isinstance(event, JobEvent):
             raise TypeError(f"event must be a JobEvent, got {event!r}")
+        if event in (JobEvent.CLAIM, JobEvent.RECOVER):
+            raise ValueError(
+                f"the {event.value!r} operation is served by its dedicated "
+                "method (claim() / recover()), not transition()"
+            )
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
                 "SELECT id, ticket_ref, repo, state, allowed_tools, budget, "
-                "owner, version FROM jobs WHERE id = ?",
+                "owner, version, lease_generation, lease_expires_at "
+                "FROM jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if row is None:
                 raise JobNotFound(job_id)
             job = _row_to_job(row)
-            version = row["version"]
+            now = self._clock()
 
             try:
+                # The lease/generation fence is a property of the owning
+                # worker's lease, so it applies only when the actor IS the
+                # owner. A non-owner worker is refused by the pure machine's
+                # identity check (ClaimConflict), not by the fence.
+                if (
+                    actor is not None
+                    and actor.role is ActorRole.WORKER
+                    and actor.identity == row["owner"]
+                ):
+                    _enforce_lease(job_id, row, generation, now)
                 successor = _transition(
-                    job,
-                    event,
-                    owner=owner,
-                    budget_check=budget_check,
+                    job, event, actor=actor, budget_check=budget_check
                 )
+            except LeaseExpired as exc:
+                _record_history(
+                    self._conn,
+                    job_id=job_id,
+                    event=event.value,
+                    from_state=job.state.value,
+                    to_state=job.state.value,
+                    owner=job.owner,
+                    outcome=type(exc).__name__,
+                    at=self._clock(),
+                    actor=actor,
+                )
+                self._conn.execute("COMMIT")
+                raise
             except JobTransitionError as exc:
-                self._conn.execute(
-                    "INSERT INTO job_history (job_id, event, from_state, "
-                    "to_state, owner, outcome, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        job_id,
-                        event.value,
-                        job.state.value,
-                        job.state.value,
-                        owner,
-                        type(exc).__name__,
-                        self._clock(),
-                    ),
+                _record_history(
+                    self._conn,
+                    job_id=job_id,
+                    event=event.value,
+                    from_state=job.state.value,
+                    to_state=job.state.value,
+                    owner=job.owner,
+                    outcome=type(exc).__name__,
+                    at=self._clock(),
+                    actor=actor,
                 )
                 self._conn.execute("COMMIT")
                 raise
 
             now = self._clock()
+            # A job that leaves a leased state (RELEASE -> READY, COMPLETE ->
+            # DONE, FAIL -> FAILED) is no longer held, so its lease is cleared
+            # atomically with the state write; a still-owned job keeps it.
+            lease_expires_at = (
+                row["lease_expires_at"]
+                if successor.state in _LEASED_STATES
+                else None
+            )
             updated = self._conn.execute(
-                "UPDATE jobs SET state = ?, owner = ?, updated_at = ?, "
-                "version = version + 1 WHERE id = ? AND version = ?",
-                (successor.state.value, successor.owner, now, job_id, version),
+                "UPDATE jobs SET state = ?, owner = ?, lease_expires_at = ?, "
+                "updated_at = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (
+                    successor.state.value,
+                    successor.owner,
+                    lease_expires_at,
+                    now,
+                    job_id,
+                    row["version"],
+                ),
             )
             if updated.rowcount != 1:
                 raise ConcurrencyConflict(
                     f"job {job_id!r} changed between read and write"
                 )
+            _record_history(
+                self._conn,
+                job_id=job_id,
+                event=event.value,
+                from_state=job.state.value,
+                to_state=successor.state.value,
+                owner=successor.owner,
+                outcome="ok",
+                at=now,
+                actor=actor,
+            )
+            self._conn.execute("COMMIT")
+            return successor
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def renew(self, job_id: str, actor: Actor, generation: int) -> float:
+        """Extend the owning worker's lease, returning the new expiry.
+
+        A store-level liveness operation, not a state transition: it requires the
+        owning WORKER (identity + role), a matching, un-expired lease, and the
+        current generation token. Renewal after expiry is refused
+        (:class:`LeaseExpired`) -- there is no implicit grace period and no
+        worker self-healing once the lease lapses. Appends a ``renew`` audit row.
+        """
+        if not isinstance(actor, Actor):
+            raise TypeError(f"renew expects an Actor, got {actor!r}")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT id, state, owner, version, lease_generation, "
+                "lease_expires_at FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise JobNotFound(job_id)
+            now = self._clock()
+
+            try:
+                if actor.role is not ActorRole.WORKER:
+                    raise AuthorizationRefused("only the owning worker may renew a lease")
+                if actor.identity != row["owner"]:
+                    raise ClaimConflict(
+                        f"actor {actor.identity!r} does not match the job's owner"
+                    )
+                _enforce_lease(job_id, row, generation, now)
+            except (LeaseExpired, JobTransitionError) as exc:
+                _record_history(
+                    self._conn,
+                    job_id=job_id,
+                    event="renew",
+                    from_state=row["state"],
+                    to_state=row["state"],
+                    owner=row["owner"],
+                    outcome=type(exc).__name__,
+                    at=now,
+                    actor=actor,
+                )
+                self._conn.execute("COMMIT")
+                raise
+
+            new_expiry = now + self._lease_ttl
             self._conn.execute(
-                "INSERT INTO job_history (job_id, event, from_state, to_state, "
-                "owner, outcome, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "UPDATE jobs SET lease_expires_at = ?, updated_at = ? WHERE id = ?",
+                (new_expiry, now, job_id),
+            )
+            _record_history(
+                self._conn,
+                job_id=job_id,
+                event="renew",
+                from_state=row["state"],
+                to_state=row["state"],
+                owner=row["owner"],
+                outcome="ok",
+                at=now,
+                actor=actor,
+            )
+            self._conn.execute("COMMIT")
+            return new_expiry
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def recover(
+        self, job_id: str, actor: Actor, reason: str, *, force: bool = False
+    ) -> Job:
+        """Operator-only, atomic recovery of an owned job back to ``ready``.
+
+        Returns the job to ``ready``, clears the owner and lease, and bumps the
+        generation in the same transaction -- atomically invalidating the prior
+        worker's token so any in-flight worker mutation or renewal fences closed.
+
+        ``actor`` must carry role ``OPERATOR`` (that authority is established by
+        the trusted Forge boundary, not by this store). ``reason`` is mandatory
+        and non-empty; it is recorded verbatim in the audit trail. Recovering a
+        job whose lease is *still live* additionally requires ``force=True`` --
+        the explicit operator acknowledgment that a healthy lease is being
+        overridden.
+        """
+        if not isinstance(actor, Actor):
+            raise TypeError(f"recover expects an Actor, got {actor!r}")
+        if actor.role is not ActorRole.OPERATOR:
+            raise AuthorizationRefused("recovery requires the operator role")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("recover requires a non-empty reason")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT id, ticket_ref, repo, state, allowed_tools, budget, "
+                "owner, version, lease_generation, lease_expires_at "
+                "FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise JobNotFound(job_id)
+            job = _row_to_job(row)
+            now = self._clock()
+
+            lease_live = (
+                row["lease_expires_at"] is not None
+                and row["lease_expires_at"] >= now
+            )
+            if lease_live and not force:
+                _record_history(
+                    self._conn,
+                    job_id=job_id,
+                    event=JobEvent.RECOVER.value,
+                    from_state=job.state.value,
+                    to_state=job.state.value,
+                    owner=job.owner,
+                    outcome="AuthorizationRefused",
+                    at=now,
+                    actor=actor,
+                    reason=reason,
+                )
+                self._conn.execute("COMMIT")
+                raise AuthorizationRefused(
+                    f"job {job_id!r} has a live lease; recovering it requires "
+                    "explicit operator authorization (force=True)"
+                )
+
+            try:
+                successor = _transition(job, JobEvent.RECOVER, actor=actor)
+            except JobTransitionError as exc:
+                _record_history(
+                    self._conn,
+                    job_id=job_id,
+                    event=JobEvent.RECOVER.value,
+                    from_state=job.state.value,
+                    to_state=job.state.value,
+                    owner=job.owner,
+                    outcome=type(exc).__name__,
+                    at=now,
+                    actor=actor,
+                    reason=reason,
+                )
+                self._conn.execute("COMMIT")
+                raise
+
+            new_generation = row["lease_generation"] + 1
+            updated = self._conn.execute(
+                "UPDATE jobs SET state = ?, owner = ?, lease_expires_at = NULL, "
+                "lease_generation = ?, updated_at = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
                 (
-                    job_id,
-                    event.value,
-                    job.state.value,
                     successor.state.value,
                     successor.owner,
-                    "ok",
+                    new_generation,
                     now,
+                    job_id,
+                    row["version"],
                 ),
+            )
+            if updated.rowcount != 1:
+                raise ConcurrencyConflict(
+                    f"job {job_id!r} changed between read and write"
+                )
+            _record_history(
+                self._conn,
+                job_id=job_id,
+                event=JobEvent.RECOVER.value,
+                from_state=job.state.value,
+                to_state=successor.state.value,
+                owner=successor.owner,
+                outcome="ok",
+                at=now,
+                actor=actor,
+                reason=reason,
             )
             self._conn.execute("COMMIT")
             return successor
