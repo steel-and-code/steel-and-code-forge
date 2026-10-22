@@ -19,7 +19,13 @@ import threading
 import pytest
 
 from forge.jobs.intake import AdmissionOutcome, SqliteIntakeStore, job_id_for
-from forge.jobs.state import Actor, ActorRole, AuthorizationRefused, JobEvent
+from forge.jobs.state import (
+    Actor,
+    ActorRole,
+    AuthorizationRefused,
+    JobEvent,
+    new_job,
+)
 from forge.jobs.store import SqliteJobStore
 
 WORKER = Actor("alice")
@@ -379,6 +385,80 @@ def test_dedupe_across_process_restart(path, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# OS-process concurrent admission race
+# --------------------------------------------------------------------------
+
+_ADMIT_WORKER = r"""
+import os, sys, time
+go_file, db_path, req_id, out_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+while not os.path.exists(go_file):
+    time.sleep(0.001)
+from forge.jobs.intake import SqliteIntakeStore
+from forge.jobs.state import Actor, ActorRole
+s = SqliteIntakeStore(db_path)
+r = s.admit_job(req_id, "OUT-1", Actor("operator", ActorRole.OPERATOR),
+                repo="outpost", allowed_tools=("read_file", "write_file"),
+                budget=10.0, allowed_repos=("outpost",))
+with open(out_file, "w") as f:
+    f.write(r.outcome.value)
+s.close()
+"""
+
+
+def test_os_process_concurrent_admission_yields_one_job(path, tmp_path):
+    """Two separate OS processes race to admit the SAME ticket cycle.
+
+    Each holds its own connection on the shared file and its own
+    ``admission_request_id``, released by a common go-marker so they genuinely
+    race on the writer lock. Exactly one must mint cycle 1; the loser must
+    observe the open job (``open_exists``) rather than mint a second job. This
+    is the cross-process analogue of ``test_concurrent_admissions_yield_one_created``
+    (which only used two threads in one process).
+    """
+    # Pre-create + migrate the file so the subprocesses race on admission, not
+    # on first-open/WAL (that race is covered separately by the job-store suite).
+    with SqliteIntakeStore(path):
+        pass
+
+    go_file = str(tmp_path / "go")
+    procs = []
+    for req in ("req-a", "req-b"):
+        out_file = str(tmp_path / f"out-{req}")
+        p = subprocess.Popen(
+            [sys.executable, "-c", _ADMIT_WORKER, go_file, path, req, out_file],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        procs.append((p, out_file))
+
+    open(go_file, "w").close()  # release both workers at once
+    for p, _ in procs:
+        _, err = p.communicate(timeout=30)
+        assert p.returncode == 0, err.decode()
+
+    outcomes = sorted(pathlib.Path(out).read_text() for _, out in procs)
+    assert outcomes == ["created", "open_exists"], outcomes
+
+    with SqliteIntakeStore(path) as s:
+        conn = s._conn
+        assert conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) AS c FROM ticket_jobs").fetchone()["c"]
+            == 1
+        )
+        assert conn.execute("SELECT cycle FROM ticket_jobs").fetchone()["cycle"] == 1
+        # Exactly one admission bound; the loser was an audited open-cycle denial.
+        assert (
+            conn.execute("SELECT COUNT(*) AS c FROM admissions").fetchone()["c"]
+            == 1
+        )
+        assert conn.execute(
+            "SELECT reason FROM admission_denials"
+        ).fetchone()["reason"] == "open cycle exists"
+
+
+# --------------------------------------------------------------------------
 # Schema invariants
 # --------------------------------------------------------------------------
 
@@ -409,3 +489,72 @@ def test_schema_version_is_current(path):
         from forge.jobs.store import SCHEMA_VERSION
 
         assert s.schema_version == SCHEMA_VERSION
+
+
+# --------------------------------------------------------------------------
+# Shared job-insert path
+# --------------------------------------------------------------------------
+
+def test_save_and_admit_job_rows_are_identical(tmp_path):
+    """``save`` (registration) and ``admit_job`` (admission) share one helper.
+
+    Both write a ``jobs`` row through the single ``_insert_job_row``; this pins
+    that the two call sites cannot drift apart on the row's authoritative
+    columns, so a schema change to the row shape resolves in exactly one place.
+    """
+    job = new_job(
+        job_id="jira:OUT-1:1",
+        ticket_ref="OUT-1",
+        repo="outpost",
+        allowed_tools=("read_file",),
+        budget=10.0,
+    )
+    save_path = str(tmp_path / "save.db")
+    with SqliteJobStore(save_path) as store:
+        store.save(job)
+
+    admit_path = str(tmp_path / "admit.db")
+    with SqliteIntakeStore(admit_path) as intake:
+        intake.admit_job(
+            "req-1",
+            "OUT-1",
+            OPERATOR,
+            repo="outpost",
+            allowed_tools=("read_file",),
+            budget=10.0,
+        )
+
+    cols = (
+        "id",
+        "ticket_ref",
+        "repo",
+        "state",
+        "allowed_tools",
+        "budget",
+        "owner",
+        "version",
+    )
+
+    def row_of(db_path):
+        with sqlite3.connect(db_path) as raw:
+            raw.row_factory = sqlite3.Row
+            return dict(raw.execute(f"SELECT {', '.join(cols)} FROM jobs").fetchone())
+
+    assert row_of(save_path) == row_of(admit_path)
+
+
+def test_jobs_insert_is_authored_once_and_delegated():
+    """The ``jobs`` row INSERT lives in exactly one place and intake delegates.
+
+    ``forge/jobs/store.py`` authors the INSERT verbatim once (the shared helper);
+    ``forge/jobs/intake.py`` must not re-spell it, or the two can drift. This is
+    the mechanical form of the "one authoritative copy" house rule.
+    """
+    import forge.jobs.intake
+    import forge.jobs.store
+
+    store_text = pathlib.Path(forge.jobs.store.__file__).read_text(encoding="utf-8")
+    intake_text = pathlib.Path(forge.jobs.intake.__file__).read_text(encoding="utf-8")
+
+    assert store_text.count("INSERT INTO jobs (id, ticket_ref") == 1
+    assert "INSERT INTO jobs" not in intake_text
