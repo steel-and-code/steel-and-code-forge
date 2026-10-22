@@ -428,6 +428,34 @@ def _record_history(
     )
 
 
+def _insert_job_row(conn: sqlite3.Connection, *, job: Job, now: float) -> None:
+    """Insert a freshly-validated :class:`Job` as its ``jobs`` row.
+
+    Emits exactly one ``INSERT`` and performs **no** transaction control: the
+    caller owns the surrounding ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK``,
+    which is what keeps ``save`` (registration) and ``admit_job`` (admission)
+    atomic with their respective lineage/audit writes. This helper is the single
+    place the ``jobs`` row's column list is spelled out, so a schema change to
+    the row shape updates both call sites at once instead of drifting.
+    """
+    conn.execute(
+        "INSERT INTO jobs (id, ticket_ref, repo, state, allowed_tools, "
+        "budget, owner, created_at, updated_at, version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        (
+            job.id,
+            job.ticket_ref,
+            job.repo,
+            job.state.value,
+            json.dumps(list(job.allowed_tools)),
+            job.budget,
+            job.owner,
+            now,
+            now,
+        ),
+    )
+
+
 def _enforce_lease(
     job_id: str, row: sqlite3.Row, generation: int | None, now: float
 ) -> None:
@@ -556,22 +584,7 @@ class SqliteJobStore(JobStore):
             ).fetchone()
             if exists is not None:
                 raise JobAlreadyExists(job.id)
-            self._conn.execute(
-                "INSERT INTO jobs (id, ticket_ref, repo, state, allowed_tools, "
-                "budget, owner, created_at, updated_at, version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                (
-                    job.id,
-                    job.ticket_ref,
-                    job.repo,
-                    job.state.value,
-                    json.dumps(list(job.allowed_tools)),
-                    job.budget,
-                    job.owner,
-                    now,
-                    now,
-                ),
-            )
+            _insert_job_row(self._conn, job=job, now=now)
             _record_history(
                 self._conn,
                 job_id=job.id,

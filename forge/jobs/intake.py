@@ -54,7 +54,7 @@ from .state import (
     AuthorizationRefused,
     new_job,
 )
-from .store import DEFAULT_BUSY_TIMEOUT_MS, _connect, _record_history
+from .store import DEFAULT_BUSY_TIMEOUT_MS, _connect, _insert_job_row, _record_history
 
 __all__ = [
     "DeliveryOutcome",
@@ -357,6 +357,22 @@ class SqliteIntakeStore:
 
         Denied admissions (unauthorized, changed inputs, open cycle) are audited
         durably in ``admission_denials``; none creates a job.
+
+        Idempotency is keyed on ``admission_request_id`` plus the canonical
+        inputs; the actor's identity is **not** part of the fingerprint and is
+        not compared on a repeat. A retry of the same request id with identical
+        inputs from a *different* operator is therefore recognised as a
+        DUPLICATE of the original job (the ``admissions`` row keeps the
+        *minting* operator's identity), not a conflict. Request-id uniqueness
+        across operators is an upstream concern, enforced by the trusted layer
+        that issues admission requests — this store records, it does not police.
+
+        ``CREATED`` means admitted, not executable. A job admitted with
+        ``budget=None`` (or one whose tools are further narrowed) is held in
+        ``ready`` but cannot be claimed or started: ``claim``/``start`` fail
+        closed without a positive budget ceiling and a budget authorization, so
+        an un-budgeted admission blocks at execution, not at intake. Callers
+        must not read a CREATED result as "this job will run".
         """
         if not isinstance(actor, Actor) or actor.role is not ActorRole.OPERATOR:
             # Audit the denial durably and COMMIT it BEFORE raising, so the outer
@@ -443,22 +459,7 @@ class SqliteIntakeStore:
                 global_budget=global_budget,
             )
             now = self._clock()
-            self._conn.execute(
-                "INSERT INTO jobs (id, ticket_ref, repo, state, allowed_tools, "
-                "budget, owner, created_at, updated_at, version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                (
-                    job.id,
-                    job.ticket_ref,
-                    job.repo,
-                    job.state.value,
-                    json.dumps(list(job.allowed_tools)),
-                    job.budget,
-                    job.owner,
-                    now,
-                    now,
-                ),
-            )
+            _insert_job_row(self._conn, job=job, now=now)
             _record_history(
                 self._conn,
                 job_id=job.id,
