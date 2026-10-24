@@ -34,6 +34,12 @@ state the server already holds, a **command** changes something.
     thread, so the response returns immediately and the stream carries what
     happens next.
 
+``POST /api/run-hermes``
+    Start one text-only Hermes task, through the external adapter. ``202`` with
+    a run id, the same as ``/api/run``. The child runs with no tools, and its
+    ``text``, ``model``, and ``session_id`` surface in ``GET /api/status``
+    under ``hermes_result`` when it completes.
+
 ``POST /api/approvals/{id}``
     The decision. A command, not an event, so it is a POST rather than a frame
     on the stream.
@@ -221,6 +227,18 @@ class MoveOrderRequest(BaseModel):
 
 class RunRequest(BaseModel):
     """``POST /api/run`` body."""
+
+    task: str = Field(min_length=1, max_length=8000)
+
+
+class RunHermesRequest(BaseModel):
+    """``POST /api/run-hermes`` body.
+
+    ``task`` is required, exactly as :class:`RunRequest`. There is deliberately
+    no ``profile`` field: the Hermes profile a run executes under is a fixed
+    safety decision owned by the adapter (the dedicated text-only profile), so
+    no browser request can name an unrestricted one.
+    """
 
     task: str = Field(min_length=1, max_length=8000)
 
@@ -766,6 +784,36 @@ def create_app(
         except SessionBusy as busy:
             # 409, not a queue. One process, one run; pretending otherwise would
             # imply a task the operator asked for is going to happen.
+            return JSONResponse(
+                {"detail": str(busy), "run_id": busy.run_id, "state": session.state.value},
+                status_code=409,
+            )
+        except ValueError as invalid:
+            raise HTTPException(status_code=422, detail=str(invalid)) from invalid
+
+        return JSONResponse(
+            {"run_id": run_id, "state": session.state.value}, status_code=202
+        )
+
+    @app.post("/api/run-hermes")
+    async def api_run_hermes(
+        body: RunHermesRequest, request: Request, _: None = Depends(guarded)
+    ) -> JSONResponse:
+        """Start one text-only Hermes run on a worker thread.
+
+        ``202``: accepted and running. The Hermes child is spawned by the
+        adapter under its dedicated text-only profile -- no tools, no network,
+        no filesystem -- so the only things Forge observes are the task text and
+        the final result. The run's ``text``, ``model``, and ``session_id``
+        surface in ``GET /api/status`` under ``hermes_result`` when it completes.
+
+        ``409`` when a run (native or Hermes) is already in flight; ``422``
+        when the task is empty; ``500`` when the session was built without a
+        Hermes runner, which is a wiring error rather than a request error.
+        """
+        try:
+            run_id = session.submit_hermes(body.task)
+        except SessionBusy as busy:
             return JSONResponse(
                 {"detail": str(busy), "run_id": busy.run_id, "state": session.state.value},
                 status_code=409,

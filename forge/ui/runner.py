@@ -31,7 +31,10 @@ from typing import Callable
 from ..agents.byte import assemble_system_prompt
 from ..agents.profile import AgentProfile
 from ..agents.runtime import AgentRuntime
-from ..events import EventSink
+from ..events import EventSink, emit
+from ..external.base import ExternalAgent, ExternalInvocation, ExternalResult
+from ..external.hermes import HERMES
+from ..external.runner import spawn
 from ..models.base import ModelGateway
 from ..tools.approval import Approver
 from ..tools.dispatcher import ToolDispatcher
@@ -40,7 +43,7 @@ from ..tools.workspace import Workspace
 from .broker import SseBroker
 from .channel import WebApprovalChannel
 
-__all__ = ["build_runtime", "build_dispatcher"]
+__all__ = ["build_runtime", "build_dispatcher", "build_hermes_runner"]
 
 
 def build_dispatcher(
@@ -129,3 +132,66 @@ def runtime_factory(
         )
 
     return factory
+
+
+def build_hermes_runner(
+    workspace: Workspace,
+    *,
+    adapter: ExternalAgent = HERMES,
+) -> Callable[[SseBroker, str], ExternalResult]:
+    """Build a runner that executes one text-only Hermes task.
+
+    This is the Studio Workbench's *second* run path, and it is deliberately
+    narrower than the native one. The native path composes
+    ``ModelGateway -> ToolDispatcher -> AgentRuntime`` with Forge's classifier
+    and approval layer; this one invokes Hermes as an external subprocess whose
+    capability boundary is fixed in the adapter -- a mandatory dedicated
+    text-only profile (``-t``/``--toolsets`` is never used), a minimal
+    environment, and no ``--yolo``, asserted in ``tests/test_external_hermes.py``.
+    Forge can see the task text and the result, but never the child's tool
+    calls, which is exactly why this path grants no tools and must not grow any
+    without a separate, reviewed change to the adapter's ``capabilities``.
+
+    The returned callable matches what :class:`~forge.ui.session.WorkbenchSession`
+    needs: it takes the broker and the task and returns the parsed
+    :class:`ExternalResult`. There is intentionally no profile argument -- the
+    profile is a fixed safety decision owned by the adapter, never a value a
+    browser request can choose. Events are emitted through the broker so the
+    existing SSE activity feed carries the run.
+
+    Args:
+        workspace: The run's fixed root, passed as the child's ``--in``
+            directory.
+        adapter: The external agent to invoke. Defaults to the shared Hermes
+            adapter; a test passes a stub that records its argv instead of
+            spawning a process.
+    """
+
+    def run(broker: SseBroker, task: str) -> ExternalResult:
+        invocation = ExternalInvocation(
+            agent=adapter.name,
+            task=task,
+            workspace=str(workspace.root),
+        )
+        emit(broker, "hermes.started", task=task)
+        outcome = spawn(adapter, invocation)
+        result = outcome.result
+        if outcome.launch_error:
+            emit(broker, "hermes.failed", detail=outcome.launch_error)
+        elif outcome.timed_out or not result.ok:
+            emit(
+                broker,
+                "hermes.failed",
+                detail=result.detail or "the run reported failure",
+            )
+        else:
+            emit(
+                broker,
+                "hermes.result",
+                text=result.text,
+                model=result.model,
+                session_id=result.session_id,
+            )
+        return result
+
+    return run

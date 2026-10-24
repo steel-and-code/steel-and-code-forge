@@ -59,12 +59,18 @@ def hermes_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the adapter resolve, without needing Hermes installed.
 
     Patches ``HermesAdapter._resolve`` only. Everything downstream -- argv,
-    environment, gating, parsing -- runs for real.
+    environment, gating, parsing -- runs for real. ``verify`` is also
+    neutralised: the pre-flight profile check is the adapter's own concern and
+    is covered in ``test_external_hermes.py`` (and by a dedicated refusal test
+    below), so these CLI tests exercise the run path without a live Hermes.
     """
     from forge.external.hermes import HermesAdapter
 
     monkeypatch.setattr(
         HermesAdapter, "_resolve", lambda self: "/bin/true", raising=True
+    )
+    monkeypatch.setattr(
+        HermesAdapter, "verify", lambda self, invocation: None, raising=True
     )
 
 
@@ -136,16 +142,20 @@ def test_the_spawn_reports_the_model_hermes_chose(
     assert "hermes chose model" in result.out
 
 
-def test_the_spawn_uses_the_workspace_and_the_pinned_toolset(
+def test_the_spawn_uses_the_workspace_and_the_pinned_textonly_profile(
     workspace_dir: Path, hermes_on_path: None, spawns: list[dict[str, object]]
 ) -> None:
     """The two argv properties that make the run safe and contained."""
+    from forge.external.hermes import TEXT_ONLY_PROFILE
+
     run(["hermes", "--workspace", str(workspace_dir), "a question"])
 
     assert len(spawns) == 1, "the CLI did not spawn anything"
     argv = spawns[0]["cmd"]
-    assert "--toolsets" in argv
-    assert argv[argv.index("--toolsets") + 1] == "none"
+    # The capability boundary is the dedicated profile, never a toolset flag.
+    assert "--profile" in argv
+    assert argv[argv.index("--profile") + 1] == TEXT_ONLY_PROFILE
+    assert "--toolsets" not in argv
     assert argv[argv.index("--in") + 1] == str(workspace_dir)
     # And the subprocess's own cwd is the workspace, not wherever Forge ran.
     assert spawns[0]["cwd"] == str(workspace_dir)
@@ -249,6 +259,28 @@ def test_a_shell_escape_task_refuses_and_spawns_nothing(
 
     assert result.code == EXIT_USAGE
     assert not spawns
+
+
+def test_a_failed_verification_refuses_and_spawns_nothing(
+    workspace_dir: Path, hermes_on_path: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-flight profile check failing is a refusal, not a launch.
+
+    If the dedicated text-only profile is missing or misconfigured, ``verify``
+    returns a reason and Forge refuses with an actionable message -- no process
+    starts. This is the enforcement half of the boundary; the argv half is
+    ``test_the_spawn_uses_the_workspace_and_the_pinned_textonly_profile``.
+    """
+    from forge.external.hermes import HermesAdapter
+
+    def _refuse(self: HermesAdapter, invocation: object) -> str:
+        return "the forge-textonly profile is not configured text-only"
+
+    monkeypatch.setattr(HermesAdapter, "verify", _refuse)
+    result = run(["hermes", "--workspace", str(workspace_dir), "a question"])
+
+    assert result.code == EXIT_USAGE
+    assert "not configured text-only" in result.err
 
 
 def test_the_refusal_explains_itself(

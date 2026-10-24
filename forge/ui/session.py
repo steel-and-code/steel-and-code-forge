@@ -57,6 +57,7 @@ from ..agents.profile import AgentProfile
 from ..agents.runtime import AgentRuntime, MaxTurnsExceeded
 from ..agents.state import ConversationStateStore
 from ..events import emit
+from ..external.base import ExternalResult
 from ..models.base import GatewayError
 from ..tools.workspace import Workspace
 from .broker import SseBroker
@@ -134,6 +135,7 @@ class _RunRecord:
     started: str
     thread: threading.Thread | None = None
     summary: RunSummary | None = None
+    hermes: ExternalResult | None = None
     error: str | None = None
     finished_at: str | None = None
     max_turns: int | None = None
@@ -163,6 +165,12 @@ class WorkbenchSession:
             :class:`WebApprovalChannel` bound to this session is created, which
             is what lets the session drive the ``WAITING_FOR_APPROVAL``
             transition itself.
+        hermes_runner: The external-Hermes execution path, from
+            :func:`forge.ui.runner.build_hermes_runner`. When ``None``, the
+            session has no Hermes path and :meth:`submit_hermes` refuses. It is
+            a separate runner from ``runtime_factory`` because a Hermes run is a
+            subprocess Forge cannot observe, not an ``AgentRuntime``; the two
+            share the state machine and the broker but nothing else.
 
     Not thread-safe for construction and use at the same time: build it, then
     serve. After that, every public method is callable from the event loop.
@@ -177,12 +185,14 @@ class WorkbenchSession:
         runtime_factory: Callable[[SseBroker, WebApprovalChannel], AgentRuntime],
         broker: SseBroker | None = None,
         channel: WebApprovalChannel | None = None,
+        hermes_runner: Callable[[SseBroker, str], ExternalResult] | None = None,
     ) -> None:
         self.workspace = workspace
         self.profile = profile
         self.model_id = model_id
         self.broker = broker if broker is not None else SseBroker()
         self._runtime_factory = runtime_factory
+        self._hermes_runner = hermes_runner
         self._conversation_states = ConversationStateStore()
 
         self._lock = threading.Lock()
@@ -314,6 +324,88 @@ class WorkbenchSession:
             record.finished_at = _now_iso()
         self._set_state(UiSessionState.COMPLETED)
 
+    def submit_hermes(self, task: str) -> str:
+        """Start one text-only Hermes run on a worker thread. Returns the run id.
+
+        The same one-run-at-a-time rule as :meth:`submit`, the same refusal on
+        an empty task, and the same run id shape. What differs is the executor:
+        the thread calls the injected Hermes runner, which spawns the external
+        subprocess, rather than the native ``AgentRuntime``. The profile the
+        child runs under is not a parameter: it is a fixed safety decision owned
+        by the adapter, so no caller can name an unrestricted profile.
+
+        Raises:
+            ValueError: ``task`` is empty.
+            SessionBusy: a run is already in flight.
+            RuntimeError: this session was built without a Hermes runner, so
+                there is no Hermes path to take.
+        """
+        if self._hermes_runner is None:
+            raise RuntimeError(
+                "this workbench session has no Hermes runner; the external "
+                "Hermes path was not wired in"
+            )
+
+        cleaned = task.strip()
+        if not cleaned:
+            raise ValueError("no task given; nothing to run")
+
+        run_id = uuid.uuid4().hex
+        record = _RunRecord(run_id=run_id, task=cleaned, started=_now_iso())
+
+        with self._lock:
+            existing = self._record
+            if (
+                existing is not None
+                and existing.thread is not None
+                and existing.thread.is_alive()
+            ):
+                raise SessionBusy(existing.run_id)
+            self._record = record
+
+        self._set_state(UiSessionState.RUNNING)
+        self._emit_event("run.submitted", run_id=run_id, task=cleaned)
+
+        thread = threading.Thread(
+            target=self._execute_hermes,
+            args=(record,),
+            name=f"forge-workbench-hermes-{run_id[:8]}",
+            daemon=True,
+        )
+        record.thread = thread
+        thread.start()
+        return run_id
+
+    def _execute_hermes(self, record: _RunRecord) -> None:
+        """The Hermes worker body, on its own thread.
+
+        Mirrors :meth:`_execute` in shape: any exception is converted to a
+        failed state, never swallowed. The difference is that the "runtime" is
+        the injected Hermes runner -- a subprocess Forge cannot observe -- so
+        there is no turn budget, no tool-call count, and no approval state to
+        record. What survives is the parsed :class:`ExternalResult`, whose text,
+        model, and session id become the run's observable outcome.
+        """
+        runner = self._hermes_runner
+        if runner is None:  # pragma: no cover - guarded by submit_hermes
+            self._fail(record, "no Hermes runner configured")
+            return
+
+        try:
+            result = runner(self.broker, record.task)
+        except Exception as exc:  # noqa: BLE001 - worker boundary
+            self._fail(record, f"{exc.__class__.__name__}: {exc}")
+            return
+
+        with self._lock:
+            record.hermes = result
+            record.activity = "Completed" if result.ok else "Failed"
+            record.finished_at = _now_iso()
+        if result.ok:
+            self._set_state(UiSessionState.COMPLETED)
+        else:
+            self._set_state(UiSessionState.FAILED)
+
     def _fail(self, record: _RunRecord, message: str) -> None:
         with self._lock:
             record.error = message
@@ -396,6 +488,13 @@ class WorkbenchSession:
                     {"tool": tool, "detail": detail}
                     for tool, detail in record.summary.denied
                 ],
+            }
+        if record.hermes is not None:
+            body["hermes_result"] = {
+                "text": record.hermes.text,
+                "model": record.hermes.model,
+                "session_id": record.hermes.session_id,
+                "ok": record.hermes.ok,
             }
         return body
 

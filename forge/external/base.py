@@ -159,6 +159,19 @@ class ExternalAgent(Protocol):
         """One operator-readable line: what this agent is and what it can do."""
         ...
 
+    def verify(self, invocation: ExternalInvocation) -> str | None:
+        """Pre-flight safety check, run before the child is spawned.
+
+        Returns a refusal reason to block the run, or ``None`` to proceed. An
+        adapter with no pre-flight constraint returns ``None``. ``spawn`` calls
+        this exactly once, before building argv or the child environment, and a
+        non-``None`` result becomes a fail-closed refusal rather than a
+        launched process -- the same shape as a refused spawn, because a
+        capability boundary that cannot be *confirmed* is a boundary that was
+        not enforced.
+        """
+        ...
+
     def argv(self, invocation: ExternalInvocation) -> tuple[str, ...]:
         """The exact argv Forge will execute.
 

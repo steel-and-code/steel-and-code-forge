@@ -21,8 +21,12 @@ decision below rests on it:
     ``terminal``, ``file``, ``code_execution``, and ``computer_use`` being enabled
     by default, an unrestricted Hermes has strictly more authority than Byte or
     Neighbor -- including out-of-workspace reads that Forge's classifier denies.
-*   ``-t/--toolsets`` is a *real* restriction: with ``-t file`` the terminal tool
-    is genuinely absent. This is the lever that makes a safe MVP possible.
+*   ``-t/--toolsets`` values are names from the toolset registry. The historical
+    ``-t none`` "grant nothing" value is **no longer a registered name** -- as of
+    Hermes v0.22.5 it fails closed with ``invalid_params`` and the run never
+    starts (safe, but it also does no work). The enforced mechanism is therefore
+    a dedicated profile whose ``agent.disabled_toolsets`` is ``["all"]``, not a
+    per-invocation toolset flag -- see :data:`TEXT_ONLY_PROFILE`.
 
 Model ownership
 ---------------
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from typing import Mapping
 
@@ -51,7 +56,7 @@ from .base import (
     ExternalUnavailable,
 )
 
-__all__ = ["HERMES", "HermesAdapter"]
+__all__ = ["HERMES", "HermesAdapter", "TEXT_ONLY_PROFILE"]
 
 
 #: Where to look for the Hermes executable. Not hardcoded to one absolute path:
@@ -59,27 +64,39 @@ __all__ = ["HERMES", "HermesAdapter"]
 #: is where an operator's own environment says it is.
 HERMES_PROGRAM = "hermes"
 
-#: The toolset value that grants Hermes **nothing**.
+#: The one Hermes profile Forge may ever run the child under.
 #:
-#: **This is the load-bearing safety constant of the whole external-agent MVP,
-#: and it was established by adversarial testing rather than by reading the
-#: help text.** What that testing found:
+#: **This is the load-bearing safety constant of the whole external-agent MVP.**
+#: It replaces the historical ``-t none`` toolset value, which is no longer a
+#: registered name -- as of Hermes v0.22.5 it fails closed with
+#: ``invalid_params`` and the run never starts, so it is neither a grant nor a
+#: working run. The verified replacement, confirmed against the installed binary
+#: by *doing* rather than asking, is a dedicated profile configured with
+#: ``agent.disabled_toolsets = ["all"]``:
 #:
-#: *   **Omitting ``-t`` grants everything.** Hermes falls back to the operator's
-#:     configured toolsets, which on this machine include ``terminal``, ``file``,
-#:     ``code_execution``, ``browser``, and ``computer_use``.
-#: *   **``-t ""`` grants everything too.** An empty string is silently ignored,
-#:     which is the most dangerous possible reading: it *looks* like a
-#:     restriction and is not one.
-#: *   ``-t none`` genuinely blocks. Verified by asking Hermes to *do* the thing
-#:     rather than to report its tools: with ``none`` it could not run a shell
-#:     command, could not read ``/etc/hostname``, and could not fetch a URL.
-#:     Adding ``web`` to it granted network and nothing else.
+#: *   ``resolve_toolset("all")`` spans every registered toolset, and
+#:     ``disabled_toolsets`` is subtracted *after* enabling, so ``["all"]``
+#:     leaves the child with zero tools -- every built-in and plugin toolset,
+#:     and every MCP server alias, is removed from the schema.
+#: *   ``hermes -p forge-textonly tools list`` then reports every toolset
+#:     ``disabled`` and none ``enabled``, and the child's stream carries no
+#:     ``tool_use`` events for a text-only task.
+#: *   Omitting the restriction (a profile with no ``disabled_toolsets``, or the
+#:     child's *default* profile) would grant the operator's full configured
+#:     toolsets -- ``terminal``, ``file``, ``code_execution``, ``browser``,
+#:     ``computer_use``. There is no zero-tool ``-t`` value and no safe fallback,
+#:     so the profile is mandatory and :meth:`HermesAdapter.verify` confirms it
+#:     before anything is spawned.
 #:
-#: Note that asking the model "do you have tools?" is worthless as evidence --
-#: with ``-t ""`` it answered ``NO-TOOLS`` and then ran the command anyway. Only
-#: an attempt to act is a test. See ``tests/test_external_hermes.py``.
-NO_CAPABILITIES_TOOLSET = "none"
+#: The profile is *required to pre-exist and be correctly configured*; Forge
+#: verifies it and fails closed if it is missing, misconfigured, or
+#: unverifiable. Forge never creates or clones it (that would mean copying
+#: credentials), and never falls back to a different profile. The one-time setup
+#: is:
+#:
+#:     hermes profile create forge-textonly --clone
+#:     hermes -p forge-textonly config set agent.disabled_toolsets '["all"]'
+TEXT_ONLY_PROFILE = "forge-textonly"
 
 #: Environment variables passed through to the child.
 #:
@@ -147,9 +164,10 @@ class HermesAdapter:
         in a flag an operator can widen from a shell. ``--toolsets`` is therefore
         not offered on ``forge hermes``.
 
-        The enforcement is :data:`NO_CAPABILITIES_TOOLSET` passed as ``-t`` in
-        :meth:`argv`, and its absence would be a silent grant of *everything* --
-        see the constant's comment for the measurements behind that.
+        The enforcement is the dedicated :data:`TEXT_ONLY_PROFILE` passed as
+        ``--profile`` in :meth:`argv`, whose ``agent.disabled_toolsets`` is
+        ``["all"]``, and :meth:`verify` confirms that boundary before anything
+        is spawned.
         """
         return ()
 
@@ -162,6 +180,86 @@ class HermesAdapter:
             "the Hermes Agent, invoked as an external runtime; text-only in "
             "the Forge MVP (no tools, no network, no filesystem). Hermes "
             "chooses its own model."
+        )
+
+    def verify(self, invocation: ExternalInvocation) -> str | None:
+        """Confirm the text-only profile is present and grants nothing.
+
+        Two probes, both non-model subprocesses, run against the *same* Hermes
+        program and the *same* minimal environment as :meth:`argv` will launch,
+        so a verification cannot pass against a different profile than the run
+        uses:
+
+        1. ``config get agent.disabled_toolsets`` -- must contain ``all``.
+        2. ``tools list`` -- the *effective* inventory must list zero enabled
+           toolsets (this covers built-in toolsets, plugin toolsets, and any
+           MCP-server alias, so a profile that only *claims* to be restricted
+           is caught by what the resolver actually yields).
+
+        Returns a refusal reason, or ``None`` to proceed. A probe that cannot
+        run, cannot parse, or cannot confirm is a refusal -- a capability
+        boundary that cannot be confirmed is a boundary that was not enforced.
+        """
+        program = self._resolve()
+        if program is None:
+            # ``available()`` gates the launch; a program that vanished between
+            # then and now is equally a refusal.
+            return (
+                f"the Hermes Agent was not found ({self._program!r}); cannot "
+                f"verify the {TEXT_ONLY_PROFILE} profile"
+            )
+        env = self.environment(invocation)
+
+        rc, out, err = self._probe(
+            program,
+            env,
+            "--profile",
+            TEXT_ONLY_PROFILE,
+            "config",
+            "get",
+            "agent.disabled_toolsets",
+        )
+        reason = _verify_disabled_config(rc, out, err)
+        if reason:
+            return reason
+
+        rc, out, err = self._probe(
+            program,
+            env,
+            "--profile",
+            TEXT_ONLY_PROFILE,
+            "tools",
+            "list",
+        )
+        return _verify_inventory(rc, out, err)
+
+    def _probe(
+        self, program: str, env: Mapping[str, str], *args: str
+    ) -> tuple[int, str, str]:
+        """Run one verification subprocess, returning ``(exit, stdout, stderr)``.
+
+        Returns a tuple rather than raising, so a missing program, a timeout, or
+        a nonzero exit is a value the caller turns into a refusal -- matching
+        how :func:`forge.external.runner.spawn` treats a failed launch.
+        """
+        import subprocess
+
+        try:
+            completed = subprocess.run(  # noqa: S603 - argv is a tuple, shell=False
+                [program, *args],
+                capture_output=True,
+                text=True,
+                timeout=30.0,
+                env=dict(env),
+            )
+        except OSError as exc:
+            return 1, "", f"verification probe could not run: {exc}"
+        except subprocess.TimeoutExpired:
+            return 1, "", "verification probe timed out"
+        return (
+            completed.returncode,
+            completed.stdout or "",
+            completed.stderr or "",
         )
 
     def _resolve(self) -> str | None:
@@ -190,22 +288,20 @@ class HermesAdapter:
                                    directory Forge was launched from, which is
                                    not a safety decision. Verified necessary --
                                    a plain ``cd`` did not move Hermes.
-        ``-t none``               **grants no tools at all.** The MVP's safety
-                                   boundary. Measured, not assumed: omitting the
-                                   flag grants the operator's full configured
-                                   toolsets, and ``-t ""`` grants them too
-                                   because an empty value is ignored. Only
-                                   ``none`` blocks, verified by having Hermes
-                                   attempt a shell command, a file read, and a
-                                   fetch with all three refused.
+        ``--profile <name>``       the dedicated text-only profile, always. This
+                                   is the capability boundary: the child runs as
+                                   :data:`TEXT_ONLY_PROFILE`, whose
+                                   ``agent.disabled_toolsets`` is ``["all"]``,
+                                   never as the operator's default profile.
         ``--source tool``          tags the session so Forge-driven runs do not
                                    clutter the operator's own session list.
         ``--max-turns``            the invocation's advisory turn ceiling.
 
         **Absent, deliberately:** ``--yolo`` (never -- it bypasses Hermes's own
         approvals), ``--model``/``--provider`` (Hermes owns those),
-        ``--toolsets`` (capability is fixed, not selectable), ``--tui`` (no
-        terminal), ``--accept-hooks`` (auto-approves shell hooks).
+        ``--toolsets``/``-t`` (there is no zero-tool value; capability is fixed
+        by the profile, not selectable per run), ``--tui`` (no terminal),
+        ``--accept-hooks`` (auto-approves shell hooks).
         """
         program = self._resolve()
         if program is None:
@@ -226,8 +322,8 @@ class HermesAdapter:
             invocation.workspace,
             "--source",
             "tool",
-            "--toolsets",
-            NO_CAPABILITIES_TOOLSET,
+            "--profile",
+            TEXT_ONLY_PROFILE,
         )
         if invocation.max_turns is not None:
             argv += ("--max-turns", str(int(invocation.max_turns)))
@@ -413,6 +509,124 @@ def _failure_detail(
             f"output were not valid events"
         )
     return "Hermes emitted no result event, so forge cannot confirm the run succeeded"
+
+
+#: One-time setup an operator runs to provision the text-only profile. Forge
+#: verifies the profile exists and is correctly configured but never creates or
+#: clones it itself -- cloning copies credentials, which is the operator's act.
+_SETUP_HINT = (
+    f"create the {TEXT_ONLY_PROFILE} Hermes profile with:\n"
+    f"  hermes profile create {TEXT_ONLY_PROFILE} --clone\n"
+    f"  hermes -p {TEXT_ONLY_PROFILE} config set agent.disabled_toolsets '[\"all\"]'"
+)
+
+
+def _verify_disabled_config(
+    returncode: int, stdout: str, stderr: str
+) -> str | None:
+    """Refuse unless ``agent.disabled_toolsets`` is exactly ``["all"]``.
+
+    The config value is the *claim*; :func:`_verify_inventory` checks the
+    *effect*. This probe exists so a misconfigured profile gets a precise
+    message naming the value, rather than a generic inventory refusal.
+    """
+    message = (stderr or stdout or "").strip()
+    if returncode != 0:
+        if "does not exist" in message:
+            return f"the {TEXT_ONLY_PROFILE} Hermes profile does not exist; {_SETUP_HINT}"
+        return (
+            f"could not read the {TEXT_ONLY_PROFILE} profile's "
+            f"agent.disabled_toolsets (exit {returncode}); refusing to run"
+        )
+    if _parse_disabled_toolsets(stdout) != ["all"]:
+        value = (stdout or "").strip() or "unset"
+        return (
+            f"the {TEXT_ONLY_PROFILE} profile is not configured text-only: "
+            f"agent.disabled_toolsets is {value!r}, expected ['all']; refusing to run"
+        )
+    return None
+
+
+def _parse_disabled_toolsets(stdout: str) -> list[str]:
+    """Parse ``config get agent.disabled_toolsets`` output into value tokens.
+
+    Accepts the YAML list form (``  - all``), an inline list (``['all']``,
+    ``["all"]``), or a bare value, so the check does not depend on the exact
+    serialisation the CLI chooses.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        return [v.strip().strip("\"'") for v in text[1:-1].split(",") if v.strip()]
+    values: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            values.append(stripped[2:].strip().strip("\"'"))
+        elif stripped and not stripped.startswith("#"):
+            values.append(stripped.strip("\"'"))
+    return values
+
+
+def _verify_inventory(
+    returncode: int, stdout: str, stderr: str
+) -> str | None:
+    """Refuse unless the *effective* tool inventory lists zero enabled toolsets.
+
+    This is the enforcement check, and it is stronger than the config value: it
+    reads what the resolver actually yields, so a profile that configures
+    ``["all"]`` but still surfaces a tool -- through a plugin, an MCP server, or
+    a platform bundle -- is refused, not trusted.
+    """
+    message = (stderr or stdout or "").strip()
+    if returncode != 0:
+        if "does not exist" in message:
+            return f"the {TEXT_ONLY_PROFILE} Hermes profile does not exist; {_SETUP_HINT}"
+        return (
+            f"could not verify the {TEXT_ONLY_PROFILE} profile's tool inventory "
+            f"(exit {returncode}); refusing to run"
+        )
+    if not (stdout or "").strip():
+        return (
+            f"could not verify the {TEXT_ONLY_PROFILE} profile's tool inventory "
+            f"(empty output); refusing to run"
+        )
+    enabled = _enabled_toolset_names(stdout)
+    if enabled:
+        return (
+            f"the {TEXT_ONLY_PROFILE} profile grants toolsets "
+            f"({', '.join(enabled)}); refusing to run"
+        )
+    return None
+
+
+def _enabled_toolset_names(stdout: str) -> list[str]:
+    """Toolset names shown as ``enabled`` in ``hermes tools list`` output.
+
+    A line is *enabled* when it carries a checkmark or the word ``enabled``.
+    ``✗ disabled`` lines contain neither (``disabled`` has no ``enabled``
+    word-boundary), so they are correctly skipped.
+    """
+    names: list[str] = []
+    for line in (stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped or not _looks_enabled(stripped):
+            continue
+        tokens = stripped.split()
+        if "enabled" in tokens:
+            index = tokens.index("enabled")
+            if index + 1 < len(tokens):
+                names.append(tokens[index + 1])
+    return names
+
+
+def _looks_enabled(line: str) -> bool:
+    return (
+        "\u2713" in line  # ✓
+        or "\u2705" in line  # ✅
+        or re.search(r"\benabled\b", line, re.IGNORECASE) is not None
+    )
 
 
 # Re-exported for the protocol's sake; ``ExternalAgent`` is structural, so this

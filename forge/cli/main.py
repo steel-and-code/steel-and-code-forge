@@ -1628,7 +1628,7 @@ def _run_workbench(
     from ..ui import UiUnavailable
     from ..ui.broker import SseBroker
     from ..ui.models import ModelHealth
-    from ..ui.runner import runtime_factory
+    from ..ui.runner import build_hermes_runner, runtime_factory
     from ..ui.security import (
         InvalidLanAddress,
         LanConfig,
@@ -1723,6 +1723,10 @@ def _run_workbench(
             model_id=model_id,
         ),
         broker=broker,
+        # The external-Hermes path. Wired here because the route exists only
+        # when the session was built with a runner; without it, submit_hermes
+        # refuses at request time rather than silently doing nothing.
+        hermes_runner=build_hermes_runner(workspace),
     )
 
     # The health snapshot comes from the same resolution order `forge route` and
