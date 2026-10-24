@@ -17,18 +17,25 @@ two that changed the design:
 
 *   Hermes's **process exit code is always 0**, even for a failed run, so the
     ``result`` event is authoritative. ``test_parse_*`` pins that.
-*   **Omitting ``-t`` grants every tool**, and ``-t ""`` does too -- an empty
-    value is silently ignored, which looks like a restriction and is not one.
-    Only ``none`` blocks. ``test_argv_pins_the_no_capability_toolset`` exists
-    because getting this wrong would look correct in every other test here.
+*   **There is no safe toolset flag value.** The historical ``-t none`` "grant
+    nothing" value is no longer a registered name (as of v0.22.5 it fails
+    closed with ``invalid_params``), and omitting ``-t`` or ``-t ""`` grants
+    the operator's full toolsets. So the capability boundary is a dedicated
+    profile -- ``agent.disabled_toolsets = ["all"]`` -- pinned in
+    ``test_argv_pins_the_textonly_profile``, and confirmed before launch by the
+    adapter's ``verify``. Getting this wrong would look correct in most other
+    tests here.
 
-Nothing in this file spawns a process or contacts a network.
+Nothing in this file spawns a process or contacts a network (the one exception
+is the adapter's ``verify``, which runs non-model CLI probes and is exercised
+through its pure parse helpers, not a live Hermes).
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -45,9 +52,13 @@ from forge.external.base import (
 )
 from forge.external.gating import gate_task
 from forge.external.hermes import (
-    NO_CAPABILITIES_TOOLSET,
     PASSTHROUGH_ENV,
+    TEXT_ONLY_PROFILE,
     HermesAdapter,
+    _enabled_toolset_names,
+    _parse_disabled_toolsets,
+    _verify_disabled_config,
+    _verify_inventory,
 )
 from forge.tools.workspace import Classification, Workspace
 
@@ -119,26 +130,41 @@ def test_the_native_registry_is_unchanged_by_the_external_package() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_argv_pins_the_no_capability_toolset(workspace: Workspace) -> None:
+def test_argv_pins_the_textonly_profile(workspace: Workspace) -> None:
     """**The load-bearing assertion of the external-agent MVP.**
 
-    Omitting the flag grants Hermes the operator's full configured toolsets --
-    ``terminal``, ``file``, ``code_execution``, ``browser``,
-    ``computer_use`` -- and ``-t ""`` grants them too, because an empty value is
-    silently ignored. Only ``none`` blocks. Verified by having real Hermes attempt
-    a shell command, a file read, and a fetch: all three were refused.
+    The capability boundary is the dedicated text-only profile, not a toolset
+    flag. The historical ``-t none`` value is no longer a registered Hermes
+    toolset name -- as of v0.22.5 it fails closed with ``invalid_params`` -- so
+    omitting a ``--profile`` (which would fall back to the operator's default,
+    fully-tooled profile) or naming any other profile is a silent grant of every
+    tool Hermes has.
 
-    So the value must be present *and* correct. An argv without it is not a
-    regression in one test; it is a silent grant of every tool Hermes has, and it
-    would pass every other test in this file.
+    So the profile must be present *and* exact. An argv without ``--profile
+    <forge-textonly>`` is not a regression in one test; it is a silent grant of
+    every tool Hermes has, and it would pass most other tests in this file.
     """
     argv = HermesAdapter("/bin/true").argv(_invocation(workspace))
 
-    assert "--toolsets" in argv
-    index = argv.index("--toolsets")
-    assert argv[index + 1] == NO_CAPABILITIES_TOOLSET == "none"
-    # An empty value is the specific trap; assert it is not what we pass.
-    assert argv[index + 1] != ""
+    assert "--profile" in argv
+    assert argv.count("--profile") == 1  # exactly once
+    assert argv[argv.index("--profile") + 1] == TEXT_ONLY_PROFILE
+    # The value is the fixed profile, never a caller's and never empty.
+    assert argv[argv.index("--profile") + 1] != ""
+
+
+def test_argv_never_emits_a_toolset_flag(workspace: Workspace) -> None:
+    """No ``-t``/``--toolsets``, because there is no zero-tool value.
+
+    The historical ``-t none`` "grant nothing" value is gone from the registry,
+    and every remaining value either names real toolsets or is silently
+    ignored. Capability is fixed by the profile, so the flag must simply be
+    absent -- its presence at all is the regression.
+    """
+    argv = HermesAdapter("/bin/true").argv(_invocation(workspace))
+
+    assert "--toolsets" not in argv
+    assert "-t" not in argv
 
 
 def test_argv_never_passes_yolo(workspace: Workspace) -> None:
@@ -231,50 +257,24 @@ def test_max_turns_is_omitted_when_unset(workspace: Workspace) -> None:
     assert "--max-turns" not in argv
 
 
-def test_argv_passes_profile_when_set(workspace: Workspace) -> None:
-    """``--profile <name>`` is the agent-switch for Hermes-backed profiles.
+def test_argv_always_runs_the_dedicated_textonly_profile(
+    workspace: Workspace,
+) -> None:
+    """The profile is fixed, so no caller can name an unrestricted one.
 
-    Forge reports and passes the name; it never resolves or validates it,
-    because Hermes owns its profiles. The flag must appear exactly once, as
-    its own element followed by the name, so a profile name with shell
-    metacharacters stays inert data.
+    ``ExternalInvocation`` carries no profile field at all -- the value was
+    removed rather than defaulted, so there is no seam for a browser request or
+    a future caller to widen the capability boundary by naming the default
+    profile. The adapter itself is the only place the profile name lives.
     """
-    invocation = ExternalInvocation(
-        agent="hermes", task="t", workspace=str(workspace.root), profile="byte"
-    )
+    # An invocation cannot even *express* a profile.
+    invocation = _invocation(workspace)
+    assert not hasattr(invocation, "profile")
+
     argv = HermesAdapter("/bin/true").argv(invocation)
 
-    assert "--profile" in argv
-    assert argv[argv.index("--profile") + 1] == "byte"
-
-
-def test_argv_omits_profile_when_unset(workspace: Workspace) -> None:
-    """No profile means no flag: the child falls back to its own default.
-
-    A caller that never names a profile must not emit a ``--profile`` it did
-    not ask for, so the adapter's argv stays byte-for-byte the pre-profile
-    shape for every existing caller.
-    """
-    argv = HermesAdapter("/bin/true").argv(_invocation(workspace))
-
-    assert "--profile" not in argv
-
-
-def test_argv_never_grants_a_toolset_beyond_none(workspace: Workspace) -> None:
-    """The one toolset Hermes may receive is ``none``.
-
-    The acceptance criterion is negative: the adapter must never emit
-    ``terminal``, ``file``, ``code_execution``, ``browser``, ``computer_use``,
-    or ``web`` as a toolset value. A future widening of the adapter would be a
-    silent grant of capability, so it is refused here rather than assumed.
-    """
-    argv = HermesAdapter("/bin/true").argv(_invocation(workspace))
-
-    index = argv.index("--toolsets")
-    value = argv[index + 1]
-    assert value == "none"
-    for banned in ("terminal", "file", "code_execution", "browser", "computer_use", "web"):
-        assert banned != value, f"toolset must be 'none', not {banned!r}"
+    assert argv.count("--profile") == 1
+    assert argv[argv.index("--profile") + 1] == TEXT_ONLY_PROFILE
 
 
 def test_a_missing_hermes_is_an_unavailable_error(workspace: Workspace) -> None:
@@ -447,6 +447,132 @@ def test_parse_reports_the_model_hermes_chose() -> None:
     result = HermesAdapter().parse(stdout, "", 0)
 
     assert result.model == "stealth/space-bunny-alpha"
+
+
+# --------------------------------------------------------------------------
+# Verification: the profile boundary is confirmed before launch
+# --------------------------------------------------------------------------
+
+
+def _tools_list(*enabled: str) -> str:
+    """A ``hermes tools list``-shaped sample with ``enabled`` named as enabled."""
+    all_toolsets = (
+        "web", "terminal", "file", "code_execution", "browser", "delegation",
+    )
+    lines = ["Built-in toolsets (cli):"]
+    for name in all_toolsets:
+        lines.append(
+            f"  ✓ enabled  {name}" if name in enabled else f"  ✗ disabled  {name}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def test_verify_disabled_config_accepts_all() -> None:
+    assert _verify_disabled_config(0, "  - all\n", "") is None
+    assert _verify_disabled_config(0, "['all']", "") is None
+    assert _verify_disabled_config(0, '["all"]', "") is None
+
+
+def test_verify_disabled_config_rejects_a_different_value() -> None:
+    reason = _verify_disabled_config(0, "  - web\n", "")
+    assert reason is not None
+    assert "not configured text-only" in reason
+    assert "web" in reason
+
+
+def test_verify_disabled_config_refuses_a_missing_profile() -> None:
+    reason = _verify_disabled_config(
+        1, "", "Error: Profile 'forge-textonly' does not exist."
+    )
+    assert reason is not None
+    assert "does not exist" in reason
+    assert "profile create" in reason  # the message names the setup command
+
+
+def test_verify_inventory_accepts_all_disabled() -> None:
+    assert _verify_inventory(0, _tools_list(), "") is None
+
+
+def test_verify_inventory_rejects_an_enabled_toolset() -> None:
+    reason = _verify_inventory(0, _tools_list("terminal"), "")
+    assert reason is not None
+    assert "grants toolsets" in reason
+    assert "terminal" in reason
+
+
+def test_verify_inventory_rejects_empty_output() -> None:
+    reason = _verify_inventory(0, "", "")
+    assert reason is not None
+
+
+def test_verify_inventory_rejects_a_missing_profile() -> None:
+    reason = _verify_inventory(
+        1, "", "Error: Profile 'forge-textonly' does not exist."
+    )
+    assert reason is not None
+    assert "does not exist" in reason
+
+
+def test_parse_disabled_toolsets_handles_yaml_inline_and_bare() -> None:
+    assert _parse_disabled_toolsets("  - all\n") == ["all"]
+    assert _parse_disabled_toolsets("['all']") == ["all"]
+    assert _parse_disabled_toolsets('["all"]') == ["all"]
+    assert _parse_disabled_toolsets("all") == ["all"]
+    assert _parse_disabled_toolsets("   \n") == []
+
+
+def test_enabled_toolset_names_skips_disabled_lines() -> None:
+    assert set(_enabled_toolset_names(_tools_list("file", "web"))) == {"file", "web"}
+    assert _enabled_toolset_names(_tools_list()) == []
+
+
+def test_verify_returns_none_when_both_probes_pass(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``verify`` runs the config probe then the inventory probe, and passes."""
+    adapter = HermesAdapter("/bin/true")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_probe(program: str, env: Mapping, *args: str) -> tuple[int, str, str]:
+        calls.append(args)
+        if "config" in args:
+            return 0, "  - all\n", ""
+        return 0, _tools_list(), ""
+
+    monkeypatch.setattr(adapter, "_probe", fake_probe)
+    assert adapter.verify(_invocation(workspace)) is None
+    assert len(calls) == 2
+
+
+def test_verify_short_circuits_on_a_misconfigured_profile(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wrong config value stops the run before the inventory is even checked."""
+    adapter = HermesAdapter("/bin/true")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_probe(program: str, env: Mapping, *args: str) -> tuple[int, str, str]:
+        calls.append(args)
+        if "config" in args:
+            return 0, "  - web\n", ""
+        return 0, _tools_list(), ""
+
+    monkeypatch.setattr(adapter, "_probe", fake_probe)
+    reason = adapter.verify(_invocation(workspace))
+
+    assert reason is not None
+    assert "not configured text-only" in reason
+    assert len(calls) == 1  # never reached the inventory probe
+
+
+def test_verify_refuses_when_a_probe_fails_closed(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe that cannot run is a refusal, not a silent pass."""
+    adapter = HermesAdapter("/bin/true")
+    monkeypatch.setattr(adapter, "_probe", lambda *a: (1, "", "verification probe timed out"))
+
+    assert adapter.verify(_invocation(workspace)) is not None
 
 
 # --------------------------------------------------------------------------

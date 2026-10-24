@@ -75,10 +75,6 @@ class ExternalInvocation:
             subprocess is an unbounded run.
         max_turns: An advisory limit the adapter may pass through if the child
             supports one.
-        profile: The Hermes profile to run the child under. ``None`` means the
-            child's own default. Passed through as ``--profile`` only when set,
-            so an adapter that has no notion of a profile is unaffected and a
-            caller that never names one does not emit a flag it did not ask for.
     """
 
     agent: str
@@ -86,7 +82,6 @@ class ExternalInvocation:
     workspace: str
     timeout: float = 900.0
     max_turns: int | None = None
-    profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +157,19 @@ class ExternalAgent(Protocol):
 
     def describe(self) -> str:
         """One operator-readable line: what this agent is and what it can do."""
+        ...
+
+    def verify(self, invocation: ExternalInvocation) -> str | None:
+        """Pre-flight safety check, run before the child is spawned.
+
+        Returns a refusal reason to block the run, or ``None`` to proceed. An
+        adapter with no pre-flight constraint returns ``None``. ``spawn`` calls
+        this exactly once, before building argv or the child environment, and a
+        non-``None`` result becomes a fail-closed refusal rather than a
+        launched process -- the same shape as a refused spawn, because a
+        capability boundary that cannot be *confirmed* is a boundary that was
+        not enforced.
+        """
         ...
 
     def argv(self, invocation: ExternalInvocation) -> tuple[str, ...]:

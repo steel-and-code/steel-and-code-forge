@@ -138,23 +138,26 @@ def build_hermes_runner(
     workspace: Workspace,
     *,
     adapter: ExternalAgent = HERMES,
-) -> Callable[[SseBroker, str, str | None], ExternalResult]:
+) -> Callable[[SseBroker, str], ExternalResult]:
     """Build a runner that executes one text-only Hermes task.
 
     This is the Studio Workbench's *second* run path, and it is deliberately
     narrower than the native one. The native path composes
     ``ModelGateway -> ToolDispatcher -> AgentRuntime`` with Forge's classifier
     and approval layer; this one invokes Hermes as an external subprocess whose
-    capability boundary is fixed in the adapter -- ``-t none``, a minimal
+    capability boundary is fixed in the adapter -- a mandatory dedicated
+    text-only profile (``-t``/``--toolsets`` is never used), a minimal
     environment, and no ``--yolo``, asserted in ``tests/test_external_hermes.py``.
     Forge can see the task text and the result, but never the child's tool
     calls, which is exactly why this path grants no tools and must not grow any
     without a separate, reviewed change to the adapter's ``capabilities``.
 
     The returned callable matches what :class:`~forge.ui.session.WorkbenchSession`
-    needs: it takes the broker, the task, and an optional Hermes profile, and it
-    returns the parsed :class:`ExternalResult`. Events are emitted through the
-    broker so the existing SSE activity feed carries the run.
+    needs: it takes the broker and the task and returns the parsed
+    :class:`ExternalResult`. There is intentionally no profile argument -- the
+    profile is a fixed safety decision owned by the adapter, never a value a
+    browser request can choose. Events are emitted through the broker so the
+    existing SSE activity feed carries the run.
 
     Args:
         workspace: The run's fixed root, passed as the child's ``--in``
@@ -164,14 +167,13 @@ def build_hermes_runner(
             spawning a process.
     """
 
-    def run(broker: SseBroker, task: str, profile: str | None) -> ExternalResult:
+    def run(broker: SseBroker, task: str) -> ExternalResult:
         invocation = ExternalInvocation(
             agent=adapter.name,
             task=task,
             workspace=str(workspace.root),
-            profile=profile,
         )
-        emit(broker, "hermes.started", task=task, profile=profile or "")
+        emit(broker, "hermes.started", task=task)
         outcome = spawn(adapter, invocation)
         result = outcome.result
         if outcome.launch_error:

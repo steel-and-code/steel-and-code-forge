@@ -234,15 +234,13 @@ class RunRequest(BaseModel):
 class RunHermesRequest(BaseModel):
     """``POST /api/run-hermes`` body.
 
-    ``task`` is required, exactly as :class:`RunRequest`. ``profile`` is the
-    optional Hermes profile to run under; it is passed through to the child as
-    ``--profile`` only when present, so omitting it runs the child's own
-    default. A profile name is an opaque string to Forge -- it never resolves,
-    creates, or validates one, because Hermes owns its profiles.
+    ``task`` is required, exactly as :class:`RunRequest`. There is deliberately
+    no ``profile`` field: the Hermes profile a run executes under is a fixed
+    safety decision owned by the adapter (the dedicated text-only profile), so
+    no browser request can name an unrestricted one.
     """
 
     task: str = Field(min_length=1, max_length=8000)
-    profile: str | None = Field(default=None, max_length=120)
 
 
 class ApprovalRequestBody(BaseModel):
@@ -804,17 +802,17 @@ def create_app(
         """Start one text-only Hermes run on a worker thread.
 
         ``202``: accepted and running. The Hermes child is spawned by the
-        adapter with ``-t none`` -- no tools, no network, no filesystem -- so
-        the only things Forge observes are the task text and the final result.
-        The run's ``text``, ``model``, and ``session_id`` surface in
-        ``GET /api/status`` under ``hermes_result`` when it completes.
+        adapter under its dedicated text-only profile -- no tools, no network,
+        no filesystem -- so the only things Forge observes are the task text and
+        the final result. The run's ``text``, ``model``, and ``session_id``
+        surface in ``GET /api/status`` under ``hermes_result`` when it completes.
 
         ``409`` when a run (native or Hermes) is already in flight; ``422``
         when the task is empty; ``500`` when the session was built without a
         Hermes runner, which is a wiring error rather than a request error.
         """
         try:
-            run_id = session.submit_hermes(body.task, body.profile)
+            run_id = session.submit_hermes(body.task)
         except SessionBusy as busy:
             return JSONResponse(
                 {"detail": str(busy), "run_id": busy.run_id, "state": session.state.value},

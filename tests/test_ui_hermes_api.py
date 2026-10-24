@@ -6,7 +6,8 @@ Hermes Agent as a text-only subprocess. What is under test here is not Hermes --
 there is no network, no process, and no credential in any of these tests -- but
 the loop Forge owns around it: the route's guards, the run id, the
 ``hermes_result`` that ``GET /api/status`` exposes after completion, and the
-fact that the profile travels to the child as ``--profile`` only when asked.
+fact that no profile travels from the request to the child -- the profile is a
+fixed adapter decision, so a request cannot name one.
 
 The subprocess itself is faked by monkeypatching ``forge.ui.runner.spawn``, so
 no test here opens a socket or starts a child. The adapter's argv and
@@ -143,7 +144,7 @@ def test_run_hermes_returns_202_and_status_reflects_the_result(
 
     response = harness.client.post(
         "/api/run-hermes",
-        json={"task": "summarise this", "profile": "byte"},
+        json={"task": "summarise this"},
         headers=harness.headers(token=harness.token.value),
     )
 
@@ -160,9 +161,10 @@ def test_run_hermes_returns_202_and_status_reflects_the_result(
         "ok": True,
     }
 
-    # The invocation Forge built carried the profile the caller asked for.
+    # The invocation Forge built carries no profile: the profile is a fixed
+    # adapter decision, never a value a caller can name.
     assert len(recorded) == 1
-    assert recorded[0].profile == "byte"
+    assert not hasattr(recorded[0], "profile")
     assert recorded[0].agent == "hermes"
 
     # The result event reached the broker with the fields the page renders.
@@ -174,24 +176,30 @@ def test_run_hermes_returns_202_and_status_reflects_the_result(
     assert result_events[0].get("session_id") == "sess-0001"
 
 
-def test_run_hermes_omits_profile_when_not_requested(
+def test_run_hermes_ignores_an_unexpected_profile_field(
     workspace: Workspace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A task without a profile must not invent one."""
+    """The request cannot name a profile, even by smuggling one in.
+
+    ``RunHermesRequest`` has no profile field and ``ExternalInvocation`` has
+    none either, so a body carrying ``"profile": "default"`` is inert data --
+    it can neither widen nor change the fixed text-only profile the adapter
+    runs under.
+    """
     recorded: list = []
     harness = HermesHarness(workspace, _canned_result(), recorded=recorded)
     monkeypatch.setattr("forge.ui.runner.spawn", harness.fake_spawn)
 
     response = harness.client.post(
         "/api/run-hermes",
-        json={"task": "summarise this"},
+        json={"task": "summarise this", "profile": "default"},
         headers=harness.headers(token=harness.token.value),
     )
     assert response.status_code == 202
     harness._wait_for_terminal()
 
     assert len(recorded) == 1
-    assert recorded[0].profile is None
+    assert not hasattr(recorded[0], "profile")
 
 
 def test_run_hermes_refuses_without_a_token(workspace: Workspace) -> None:

@@ -77,6 +77,25 @@ def spawn(
         returned as values, because each has an operator-readable message and
         turning one into a traceback would discard it.
     """
+    # Pre-flight. An adapter may declare a ``verify`` hook that confirms its
+    # own capability boundary (for Hermes: that the dedicated text-only profile
+    # exists and grants nothing). A refusal is a fail-closed launch error -- no
+    # process is started -- because a boundary that cannot be confirmed is a
+    # boundary that was not enforced.
+    verify = getattr(agent, "verify", None)
+    if verify is not None:
+        reason = verify(invocation)
+        if reason:
+            return ExternalRun(
+                result=ExternalResult(
+                    agent=agent.name,
+                    ok=False,
+                    exit_code=1,
+                    detail=reason,
+                ),
+                launch_error=reason,
+            )
+
     argv = agent.argv(invocation)
     child_env = agent.environment(invocation)
 

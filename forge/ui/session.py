@@ -185,7 +185,7 @@ class WorkbenchSession:
         runtime_factory: Callable[[SseBroker, WebApprovalChannel], AgentRuntime],
         broker: SseBroker | None = None,
         channel: WebApprovalChannel | None = None,
-        hermes_runner: Callable[[SseBroker, str, str | None], ExternalResult] | None = None,
+        hermes_runner: Callable[[SseBroker, str], ExternalResult] | None = None,
     ) -> None:
         self.workspace = workspace
         self.profile = profile
@@ -324,13 +324,15 @@ class WorkbenchSession:
             record.finished_at = _now_iso()
         self._set_state(UiSessionState.COMPLETED)
 
-    def submit_hermes(self, task: str, profile: str | None = None) -> str:
+    def submit_hermes(self, task: str) -> str:
         """Start one text-only Hermes run on a worker thread. Returns the run id.
 
         The same one-run-at-a-time rule as :meth:`submit`, the same refusal on
         an empty task, and the same run id shape. What differs is the executor:
         the thread calls the injected Hermes runner, which spawns the external
-        subprocess, rather than the native ``AgentRuntime``.
+        subprocess, rather than the native ``AgentRuntime``. The profile the
+        child runs under is not a parameter: it is a fixed safety decision owned
+        by the adapter, so no caller can name an unrestricted profile.
 
         Raises:
             ValueError: ``task`` is empty.
@@ -362,13 +364,11 @@ class WorkbenchSession:
             self._record = record
 
         self._set_state(UiSessionState.RUNNING)
-        self._emit_event(
-            "run.submitted", run_id=run_id, task=cleaned, profile=profile or ""
-        )
+        self._emit_event("run.submitted", run_id=run_id, task=cleaned)
 
         thread = threading.Thread(
             target=self._execute_hermes,
-            args=(record, profile),
+            args=(record,),
             name=f"forge-workbench-hermes-{run_id[:8]}",
             daemon=True,
         )
@@ -376,7 +376,7 @@ class WorkbenchSession:
         thread.start()
         return run_id
 
-    def _execute_hermes(self, record: _RunRecord, profile: str | None) -> None:
+    def _execute_hermes(self, record: _RunRecord) -> None:
         """The Hermes worker body, on its own thread.
 
         Mirrors :meth:`_execute` in shape: any exception is converted to a
@@ -392,7 +392,7 @@ class WorkbenchSession:
             return
 
         try:
-            result = runner(self.broker, record.task, profile)
+            result = runner(self.broker, record.task)
         except Exception as exc:  # noqa: BLE001 - worker boundary
             self._fail(record, f"{exc.__class__.__name__}: {exc}")
             return
