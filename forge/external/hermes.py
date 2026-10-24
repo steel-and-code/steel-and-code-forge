@@ -201,6 +201,10 @@ class HermesAdapter:
         ``--source tool``          tags the session so Forge-driven runs do not
                                    clutter the operator's own session list.
         ``--max-turns``            the invocation's advisory turn ceiling.
+        ``--profile <name>``       the Hermes profile to run under. Emitted only
+                                   when the invocation names one; a caller that
+                                   does not ask for a profile sends no flag, and
+                                   the child falls back to its own default.
 
         **Absent, deliberately:** ``--yolo`` (never -- it bypasses Hermes's own
         approvals), ``--model``/``--provider`` (Hermes owns those),
@@ -229,6 +233,8 @@ class HermesAdapter:
             "--toolsets",
             NO_CAPABILITIES_TOOLSET,
         )
+        if invocation.profile:
+            argv += ("--profile", invocation.profile)
         if invocation.max_turns is not None:
             argv += ("--max-turns", str(int(invocation.max_turns)))
         return argv

@@ -231,6 +231,52 @@ def test_max_turns_is_omitted_when_unset(workspace: Workspace) -> None:
     assert "--max-turns" not in argv
 
 
+def test_argv_passes_profile_when_set(workspace: Workspace) -> None:
+    """``--profile <name>`` is the agent-switch for Hermes-backed profiles.
+
+    Forge reports and passes the name; it never resolves or validates it,
+    because Hermes owns its profiles. The flag must appear exactly once, as
+    its own element followed by the name, so a profile name with shell
+    metacharacters stays inert data.
+    """
+    invocation = ExternalInvocation(
+        agent="hermes", task="t", workspace=str(workspace.root), profile="byte"
+    )
+    argv = HermesAdapter("/bin/true").argv(invocation)
+
+    assert "--profile" in argv
+    assert argv[argv.index("--profile") + 1] == "byte"
+
+
+def test_argv_omits_profile_when_unset(workspace: Workspace) -> None:
+    """No profile means no flag: the child falls back to its own default.
+
+    A caller that never names a profile must not emit a ``--profile`` it did
+    not ask for, so the adapter's argv stays byte-for-byte the pre-profile
+    shape for every existing caller.
+    """
+    argv = HermesAdapter("/bin/true").argv(_invocation(workspace))
+
+    assert "--profile" not in argv
+
+
+def test_argv_never_grants_a_toolset_beyond_none(workspace: Workspace) -> None:
+    """The one toolset Hermes may receive is ``none``.
+
+    The acceptance criterion is negative: the adapter must never emit
+    ``terminal``, ``file``, ``code_execution``, ``browser``, ``computer_use``,
+    or ``web`` as a toolset value. A future widening of the adapter would be a
+    silent grant of capability, so it is refused here rather than assumed.
+    """
+    argv = HermesAdapter("/bin/true").argv(_invocation(workspace))
+
+    index = argv.index("--toolsets")
+    value = argv[index + 1]
+    assert value == "none"
+    for banned in ("terminal", "file", "code_execution", "browser", "computer_use", "web"):
+        assert banned != value, f"toolset must be 'none', not {banned!r}"
+
+
 def test_a_missing_hermes_is_an_unavailable_error(workspace: Workspace) -> None:
     adapter = HermesAdapter("/nonexistent/path/to/hermes")
 
