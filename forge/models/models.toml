@@ -43,7 +43,7 @@ fallbacks = [
 
 [tiers.coding_standard]
 # The workhorse: editing code, running tests, following the tool loop.
-primary = { model = "openai/gpt-5.6-luna", provider = "openrouter" }
+primary = { model = "deepseek/deepseek-v3.2", provider = "openrouter" }
 fallbacks = [
     { model = "byte-coder", provider = "local" },
 ]
