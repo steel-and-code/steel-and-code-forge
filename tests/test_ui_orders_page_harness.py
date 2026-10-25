@@ -22,6 +22,7 @@ and ``test_ui_orders_board_ui.py``, none of which need a browser.
 from __future__ import annotations
 
 import subprocess
+from unittest import mock
 
 import pytest
 
@@ -34,21 +35,23 @@ def test_the_probe_reports_a_browser_that_cannot_load_http() -> None:
     Driven through a fake ``subprocess.run`` so the answer is the harness's own
     logic rather than a property of whatever Chromium happens to be installed.
     """
-    usable, reason = harness._chromium_can_serve_http(
-        run=lambda *a, **k: (_ for _ in ()).throw(
-            subprocess.TimeoutExpired(cmd="chromium", timeout=20)
+    # Mock CHROME to be a string so the early return doesn't happen
+    with mock.patch.object(harness, "CHROME", "/usr/bin/chromium"):
+        usable, reason = harness._chromium_can_serve_http(
+            run=lambda *a, **k: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(cmd="chromium", timeout=20)
+            )
         )
-    )
 
-    assert usable is False
-    assert reason
-    # The reason has to be actionable: it should say what failed and where the
-    # behaviour is still covered, so a reader is not left guessing whether the
-    # Order Board is broken.
-    lowered = reason.lower()
-    assert "chromium" in lowered
-    assert "http" in lowered
-    assert "test_ui_orders_store.py" in reason
+        assert usable is False
+        assert reason
+        # The reason has to be actionable: it should say what failed and where the
+        # behaviour is still covered, so a reader is not left guessing whether the
+        # Order Board is broken.
+        lowered = reason.lower()
+        assert "chromium" in lowered
+        assert "http" in lowered
+        assert "test_ui_orders_store.py" in reason
 
 
 def test_the_probe_passes_when_the_browser_loads_the_page() -> None:
@@ -58,10 +61,12 @@ def test_the_probe_passes_when_the_browser_loads_the_page() -> None:
         stdout = "<html><head><title>PROBE-OK</title></head><body/></html>"
         stderr = ""
 
-    usable, reason = harness._chromium_can_serve_http(run=lambda *a, **k: _Result())
+    # Mock CHROME to be a string so the early return doesn't happen
+    with mock.patch.object(harness, "CHROME", "/usr/bin/chromium"):
+        usable, reason = harness._chromium_can_serve_http(run=lambda *a, **k: _Result())
 
-    assert usable is True
-    assert reason == ""
+        assert usable is True
+        assert reason == ""
 
 
 def test_the_probe_fails_when_the_page_does_not_render() -> None:
@@ -76,12 +81,14 @@ def test_the_probe_fails_when_the_page_does_not_render() -> None:
         stdout = "<html><head><title>Some Other Page</title></head><body/></html>"
         stderr = ""
 
-    usable, reason = harness._chromium_can_serve_http(run=lambda *a, **k: _Result())
+    # Mock CHROME to be a string so the early return doesn't happen
+    with mock.patch.object(harness, "CHROME", "/usr/bin/chromium"):
+        usable, reason = harness._chromium_can_serve_http(run=lambda *a, **k: _Result())
 
-    assert usable is False
-    assert "did not render" in reason
-    # And it quotes the title it actually saw, so the diagnosis is checkable.
-    assert "Some Other Page" in reason
+        assert usable is False
+        assert "did not render" in reason
+        # And it quotes the title it actually saw, so the diagnosis is checkable.
+        assert "Some Other Page" in reason
 
 
 def test_the_probe_reports_a_browser_that_will_not_launch() -> None:
@@ -90,10 +97,12 @@ def test_the_probe_reports_a_browser_that_will_not_launch() -> None:
     def _raise(*args: object, **kwargs: object):
         raise OSError("Exec format error")
 
-    usable, reason = harness._chromium_can_serve_http(run=_raise)
+    # Mock CHROME to be a string so the early return doesn't happen
+    with mock.patch.object(harness, "CHROME", "/usr/bin/chromium"):
+        usable, reason = harness._chromium_can_serve_http(run=_raise)
 
-    assert usable is False
-    assert "could not be launched" in reason
+        assert usable is False
+        assert "could not be launched" in reason
 
 
 def test_the_probe_never_raises() -> None:
@@ -107,10 +116,12 @@ def test_the_probe_never_raises() -> None:
     def _explode(*args: object, **kwargs: object):
         raise RuntimeError("something unforeseen")
 
-    usable, reason = harness._chromium_can_serve_http(run=_explode)
+    # Mock CHROME to be a string so the early return doesn't happen
+    with mock.patch.object(harness, "CHROME", "/usr/bin/chromium"):
+        usable, reason = harness._chromium_can_serve_http(run=_explode)
 
-    assert usable is False
-    assert reason
+        assert usable is False
+        assert reason
 
 
 def test_the_skip_is_decided_by_the_probe_not_by_path_presence() -> None:
