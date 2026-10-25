@@ -1,7 +1,24 @@
 """Local llama.cpp model gateway.
 
-Connects Forge to an OpenAI-compatible llama.cpp server running locally.
-No credential is required. Policy and permissions remain outside the gateway.
+Connects Forge to an OpenAI-compatible server running on the local machine --
+llama.cpp's own server by default, and anything else that speaks the same two
+paths (Ollama among them) once the endpoints are configured. No credential is
+required. Policy and permissions remain outside the gateway.
+
+Two configuration variables select the endpoints, because a tunnel or an
+alternate port is a fact about the machine, not about the model:
+
+``FORGE_LOCAL_ENDPOINT``
+    The ``/v1/chat/completions`` URL. Defaults to
+    ``http://127.0.0.1:8080/v1/chat/completions``.
+``FORGE_LOCAL_MODELS_ENDPOINT``
+    The ``/v1/models`` URL the health probe reads. Defaults to
+    ``http://127.0.0.1:8080/v1/models``.
+
+They are configured independently rather than derived from one base URL because
+a proxy can serve the two paths on different prefixes, and because deriving one
+from the other by string surgery is how a URL that happens to contain ``/v1``
+twice ends up pointed at the wrong place.
 """
 
 from __future__ import annotations
@@ -13,6 +30,7 @@ import socket
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from .base import (
     CompletionRequest,
@@ -37,6 +55,20 @@ VERIFY_TIMEOUT_SECONDS = 5.0
 
 #: The one supported override name. Named in errors, never valued in them.
 LOCAL_TIMEOUT_ENV = "FORGE_LOCAL_TIMEOUT_SECONDS"
+
+#: Endpoint override for chat completions.
+LOCAL_ENDPOINT_ENV = "FORGE_LOCAL_ENDPOINT"
+
+#: Endpoint override for model verification.
+LOCAL_MODELS_ENDPOINT_ENV = "FORGE_LOCAL_MODELS_ENDPOINT"
+
+#: Sentinel meaning "no endpoint was passed; consult the environment".
+#:
+#: Comparing against ``LOCAL_LLAMA_ENDPOINT`` cannot express this: a caller who
+#: explicitly passes the default URL is stating a choice, and a configuration
+#: variable must not silently win over it. ``None`` costs nothing to represent
+#: and makes the two cases distinguishable.
+_UNSET = None
 
 
 class LocalConfigurationError(GatewayError):
@@ -81,37 +113,122 @@ def resolve_timeout_seconds(environ: Mapping[str, str]) -> float:
     return value
 
 
+def resolve_endpoint(
+    environ: Mapping[str, str], env_var: str, default: str
+) -> str:
+    """An OpenAI-compatible endpoint URL read from ``environ``.
+
+    An absent or blank value means "not set", so an empty export behaves like an
+    unset one rather than as a configuration error -- the same rule
+    :func:`resolve_timeout_seconds` applies.
+
+    Only the *configured* value is validated. An endpoint passed explicitly to a
+    constructor is trusted rather than validated, as the timeout has always been:
+    a caller that supplies a literal is not being configured.
+
+    Raises:
+        LocalConfigurationError: the value is not a string, is not an ``http``
+            or ``https`` URL, names no host, or carries embedded credentials.
+
+    **The message names the variable and the rule, never the value.** A URL can
+    carry a user-info component, and this endpoint takes no credential; echoing
+    the offending string is how a rejected configuration becomes a leaked one.
+    """
+    raw = environ.get(env_var, "")
+
+    if raw is None:
+        return default
+
+    if not isinstance(raw, str):
+        raise LocalConfigurationError(
+            f"{env_var} must be a URL string beginning with http:// or https://; "
+            f"it is {type(raw).__name__}"
+        )
+
+    value = raw.strip()
+
+    if not value:
+        return default
+
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise LocalConfigurationError(
+            f"{env_var} must be a URL string beginning with http:// or https://; "
+            "it is not a parseable URL"
+        ) from None
+
+    scheme = parts.scheme.lower() if parts.scheme else ""
+
+    if scheme not in ("http", "https"):
+        raise LocalConfigurationError(
+            f"{env_var} must be an http:// or https:// URL; it "
+            f"{f'uses the {scheme!r} scheme' if scheme else 'has no scheme'}"
+        )
+
+    if not parts.netloc:
+        raise LocalConfigurationError(
+            f"{env_var} must name a host; it has a scheme but no host"
+        )
+
+    if parts.username is not None or parts.password is not None:
+        raise LocalConfigurationError(
+            f"{env_var} must not embed credentials in the URL; this endpoint "
+            "takes no credential and sends none"
+        )
+
+    return value
+
+
 class LocalLlamaGateway:
     """ModelGateway backed by a local llama.cpp OpenAI-compatible server.
 
     Args:
         endpoint: Override for the local API URL. Present for testing; not a
-            policy hook.
+            policy hook. Given, it wins over ``FORGE_LOCAL_ENDPOINT`` and is
+            trusted rather than validated, as the timeout has always been.
         timeout: Seconds. Left ``None``, the timeout comes from
             ``FORGE_LOCAL_TIMEOUT_SECONDS``; an explicit value here wins over the
             environment, and is trusted rather than validated, as it always was.
-        environ: The mapping the timeout is read from. Passed in rather than read
-            from ``os.environ`` so a test never has to mutate the process
-            environment; ``None`` means the real process environment.
+        environ: The mapping the timeout and the endpoint are read from. Passed
+            in rather than read from ``os.environ`` so a test never has to mutate
+            the process environment; ``None`` means the real process environment.
+            The gateway and the verifier read the **same** mapping, which is what
+            lets one environment describe one local service.
 
     Raises:
         LocalConfigurationError: ``FORGE_LOCAL_TIMEOUT_SECONDS`` is set to a
-            value that is not a positive, finite number of seconds.
+            value that is not a positive, finite number of seconds, or
+            ``FORGE_LOCAL_ENDPOINT`` is set to a value that is not a usable URL.
     """
 
     def __init__(
         self,
         *,
-        endpoint: str = LOCAL_LLAMA_ENDPOINT,
+        endpoint: str | None = _UNSET,
         timeout: float | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> None:
-        self._endpoint = endpoint
-        self._timeout = (
-            float(timeout)
-            if timeout is not None
-            else resolve_timeout_seconds(os.environ if environ is None else environ)
+        env = os.environ if environ is None else environ
+
+        self._endpoint = (
+            endpoint
+            if endpoint is not _UNSET
+            else resolve_endpoint(env, LOCAL_ENDPOINT_ENV, LOCAL_LLAMA_ENDPOINT)
         )
+        self._timeout = (
+            float(timeout) if timeout is not None else resolve_timeout_seconds(env)
+        )
+
+    @property
+    def endpoint(self) -> str:
+        """The URL this gateway sends completions to.
+
+        Read-only, for the same reason :attr:`timeout_seconds` is: a caller can
+        report the effective endpoint without being able to change it after
+        construction.
+        """
+        return self._endpoint
 
     @property
     def timeout_seconds(self) -> float:
@@ -768,16 +885,41 @@ class LocalLlamaVerifier:
     **A refused connection is the common case, not an exception.** With nothing
     listening on the port, ``urlopen`` raises immediately, so the failure an
     operator hits most often is the fastest one to report.
+
+    **The endpoint is configuration, not a constant.** ``FORGE_LOCAL_MODELS_ENDPOINT``
+    selects the listing URL so a verification pass can ask the same service the
+    gateway will send to. Left unset the llama.cpp default applies, and a probe
+    of a machine with nothing running on it still reports the operational
+    "service may not be running" wording rather than a new failure mode.
     """
 
     def __init__(
         self,
         *,
-        endpoint: str = LOCAL_LLAMA_MODELS_ENDPOINT,
+        endpoint: str | None = _UNSET,
         timeout: float = VERIFY_TIMEOUT_SECONDS,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
-        self._endpoint = endpoint
+        env = os.environ if environ is None else environ
+
+        self._endpoint = (
+            endpoint
+            if endpoint is not _UNSET
+            else resolve_endpoint(
+                env, LOCAL_MODELS_ENDPOINT_ENV, LOCAL_LLAMA_MODELS_ENDPOINT
+            )
+        )
         self._timeout = timeout
+
+    @property
+    def endpoint(self) -> str:
+        """The URL this verifier asks for a model listing.
+
+        Read-only for the same reason the gateway's is: an operator can check
+        which endpoint a probe actually contacted without being able to move it
+        after construction.
+        """
+        return self._endpoint
 
     def verify(self, model: str) -> VerificationResult:
         """Check ``model`` once. Returns a result; never raises."""

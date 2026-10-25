@@ -1451,3 +1451,139 @@ def test_local_gateway_still_needs_no_credential() -> None:
     gateway = LocalLlamaGateway(environ={})
 
     assert gateway.timeout_seconds == 120.0
+
+
+# --------------------------------------------------------------------------
+# Endpoint configuration
+# --------------------------------------------------------------------------
+
+
+def test_local_gateway_defaults_to_8080() -> None:
+    """The two endpoints are the llama.cpp server by default."""
+    from forge.models.local import LocalLlamaGateway, LocalLlamaVerifier
+
+    gateway = LocalLlamaGateway(environ={})
+    verifier = LocalLlamaVerifier(environ={})
+
+    assert gateway.endpoint == "http://127.0.0.1:8080/v1/chat/completions"
+    assert verifier.endpoint == "http://127.0.0.1:8080/v1/models"
+
+
+def test_local_endpoint_env_overrides_chat_endpoint() -> None:
+    """FORGE_LOCAL_ENDPOINT selects the completions endpoint."""
+    from forge.models.local import LocalLlamaGateway
+
+    gateway = LocalLlamaGateway(
+        environ={"FORGE_LOCAL_ENDPOINT": "http://127.0.0.1:11434/v1/chat/completions"}
+    )
+
+    assert gateway.endpoint == "http://127.0.0.1:11434/v1/chat/completions"
+    # The timeout is still default.
+    assert gateway.timeout_seconds == 120.0
+
+
+def test_local_models_endpoint_env_overrides_listing_endpoint() -> None:
+    """FORGE_LOCAL_MODELS_ENDPOINT selects the verification endpoint."""
+    from forge.models.local import LocalLlamaVerifier
+
+    verifier = LocalLlamaVerifier(
+        environ={"FORGE_LOCAL_MODELS_ENDPOINT": "http://127.0.0.1:11434/v1/models"}
+    )
+
+    assert verifier.endpoint == "http://127.0.0.1:11434/v1/models"
+    assert verifier._timeout == 5.0
+
+
+def test_explicit_endpoint_wins_over_environment() -> None:
+    """A caller passing endpoint=... is stating a choice, not being configured."""
+    from forge.models.local import LocalLlamaGateway, LocalLlamaVerifier
+
+    gateway = LocalLlamaGateway(
+        endpoint="http://test:9999/v1/chat/completions",
+        environ={"FORGE_LOCAL_ENDPOINT": "http://127.0.0.1:11434/v1/chat/completions"},
+    )
+    verifier = LocalLlamaVerifier(
+        endpoint="http://test:9999/v1/models",
+        environ={"FORGE_LOCAL_MODELS_ENDPOINT": "http://127.0.0.1:11434/v1/models"},
+    )
+
+    assert gateway.endpoint == "http://test:9999/v1/chat/completions"
+    assert verifier.endpoint == "http://test:9999/v1/models"
+
+
+def test_endpoint_env_blank_is_unset() -> None:
+    """A blank value is the same as absent."""
+    from forge.models.local import LocalLlamaGateway, LocalLlamaVerifier
+
+    gateway = LocalLlamaGateway(environ={"FORGE_LOCAL_ENDPOINT": "   "})
+    verifier = LocalLlamaVerifier(environ={"FORGE_LOCAL_MODELS_ENDPOINT": ""})
+
+    assert gateway.endpoint == "http://127.0.0.1:8080/v1/chat/completions"
+    assert verifier.endpoint == "http://127.0.0.1:8080/v1/models"
+
+
+def test_endpoint_env_rejects_non_http_scheme() -> None:
+    """Only http:// and https:// are allowed; anything else is a configuration error."""
+    from forge.models.local import LocalConfigurationError, LocalLlamaGateway
+
+    with pytest.raises(LocalConfigurationError) as caught:
+        LocalLlamaGateway(environ={"FORGE_LOCAL_ENDPOINT": "ftp://localhost/v1/chat/completions"})
+
+    assert "FORGE_LOCAL_ENDPOINT" in str(caught.value)
+    assert "http:// or https://" in str(caught.value)
+    # The message names the variable and the rule, never the value.
+    assert "ftp://" not in str(caught.value)
+
+
+def test_endpoint_env_rejects_malformed_url() -> None:
+    """A string that is not a URL at all is a configuration error."""
+    from forge.models.local import LocalConfigurationError, LocalLlamaGateway
+
+    with pytest.raises(LocalConfigurationError) as caught:
+        LocalLlamaGateway(environ={"FORGE_LOCAL_ENDPOINT": "not-a-url"})
+
+    assert "FORGE_LOCAL_ENDPOINT" in str(caught.value)
+    # Either "has no scheme" or "not a parseable URL" is a valid detection.
+    reason = str(caught.value)
+    assert any(phrase in reason for phrase in ("has no scheme", "not a parseable URL"))
+
+
+def test_endpoint_env_rejects_url_with_embedded_credentials() -> None:
+    """A local endpoint takes no credential, and none may be suggested."""
+    from forge.models.local import LocalConfigurationError, LocalLlamaGateway
+
+    with pytest.raises(LocalConfigurationError) as caught:
+        LocalLlamaGateway(
+            environ={"FORGE_LOCAL_ENDPOINT": "http://user:pass@localhost/v1/chat/completions"}
+        )
+
+    assert "FORGE_LOCAL_ENDPOINT" in str(caught.value)
+    assert "must not embed credentials" in str(caught.value)
+    # The offending username and password are never echoed.
+    assert "user" not in str(caught.value)
+    assert "pass" not in str(caught.value)
+
+
+def test_endpoint_and_models_endpoint_are_independent() -> None:
+    """Setting one does not affect the other."""
+    from forge.models.local import LocalLlamaGateway, LocalLlamaVerifier
+
+    gateway = LocalLlamaGateway(
+        environ={"FORGE_LOCAL_ENDPOINT": "http://127.0.0.1:11434/v1/chat/completions"}
+    )
+    verifier = LocalLlamaVerifier(environ={})
+
+    assert gateway.endpoint == "http://127.0.0.1:11434/v1/chat/completions"
+    assert verifier.endpoint == "http://127.0.0.1:8080/v1/models"
+
+
+def test_gateway_and_verifier_read_same_environment() -> None:
+    """Both receive the injected mapping; the verifier factory passes it through."""
+    from forge.models.local import LocalLlamaGateway, LocalLlamaVerifier
+
+    env = {"FORGE_LOCAL_MODELS_ENDPOINT": "http://127.0.0.1:11434/v1/models"}
+    gateway = LocalLlamaGateway(environ=env)
+    verifier = LocalLlamaVerifier(environ=env)
+
+    assert gateway.endpoint == "http://127.0.0.1:8080/v1/chat/completions"
+    assert verifier.endpoint == "http://127.0.0.1:11434/v1/models"

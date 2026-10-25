@@ -134,15 +134,11 @@ def _local_factory() -> object:
 def _local_verifier_factory(environ: Mapping[str, str]) -> object:
     """Build a local verifier.
 
-    ``environ`` is accepted and ignored: a loopback endpoint takes no
-    credential, and the parameter exists so every verifier factory has one
-    shape rather than each call site checking which kind it has.
+    ``environ`` is handed to the verifier so it can read endpoint overrides.
     """
-    del environ
-
     from .local import LocalLlamaVerifier
 
-    return LocalLlamaVerifier()
+    return LocalLlamaVerifier(environ=environ)
 
 
 class ProviderCatalog:

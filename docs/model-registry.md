@@ -39,6 +39,38 @@ Dependencies run one way: `router -> registry -> providers -> tiers`, and
 imports `forge.tools`, or opens a socket. Deciding is not calling, and probing
 is a separate act from both.
 
+## Local endpoint configuration
+
+The `local` provider connects to an OpenAI‑compatible server on the local
+machine — by default a llama.cpp server listening on port 8080, but also any
+other service (Ollama, a tunnel, a proxy) that answers the same two HTTP paths.
+
+Two environment variables select the endpoints independently, because a proxy
+can serve the two paths on different prefixes, and because deriving one from
+the other by string surgery is how a URL that happens to contain `/v1` twice
+ends up pointed at the wrong place.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `FORGE_LOCAL_ENDPOINT` | The `/v1/chat/completions` URL. | `http://127.0.0.1:8080/v1/chat/completions` |
+| `FORGE_LOCAL_MODELS_ENDPOINT` | The `/v1/models` URL the health probe reads. | `http://127.0.0.1:8080/v1/models` |
+
+**Both are optional.** A blank or absent value means “use the default”. An
+explicit `endpoint` argument to `LocalLlamaGateway` or `LocalLlamaVerifier` wins
+over the environment, because a caller passing a literal is stating a choice,
+not being configured.
+
+**Example: Space Monkey’s Ollama tunnel.** With Ollama reachable at
+`http://127.0.0.1:11434` via an SSH tunnel, set:
+
+```sh
+export FORGE_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1/chat/completions
+export FORGE_LOCAL_MODELS_ENDPOINT=http://127.0.0.1:11434/v1/models
+```
+
+The registry can then route to `qwen3.5:4b` (or any other Ollama model) exactly
+as it would to a llama.cpp model, with the same safety and approval boundaries.
+
 ## Capability tiers
 
 A tier is **what a model is asked to do**, not what it is called. Three exist,
