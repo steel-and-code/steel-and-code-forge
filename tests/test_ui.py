@@ -1043,3 +1043,159 @@ def test_denied_operations_never_reach_the_channel(workspace: Workspace) -> None
 
     assert outcome.denied
     assert channel.pending is None
+
+
+def test_conversation_state_store_reset() -> None:
+    """Reset clears state for a workspace/agent pair."""
+    from forge.agents.state import ConversationStateStore
+    
+    store = ConversationStateStore()
+    
+    # Get state for workspace "a", agent "byte"
+    state_a = store.get("a", "byte")
+    state_a.add_user("first task")
+    state_a.add_assistant("first reply")
+    assert len(state_a.messages) == 2
+    
+    # Get state for workspace "b", agent "byte"  
+    state_b = store.get("b", "byte")
+    state_b.add_user("different workspace")
+    assert len(state_b.messages) == 1
+    
+    # Get state for workspace "a", agent "neighbor"
+    state_c = store.get("a", "neighbor")
+    state_c.add_user("different agent")
+    assert len(state_c.messages) == 1
+    
+    # Reset only workspace "a", agent "byte"
+    store.reset("a", "byte")
+    
+    # Verify workspace "a", agent "byte" is fresh
+    state_a2 = store.get("a", "byte")
+    assert len(state_a2.messages) == 0
+    assert state_a2 is not state_a  # New object
+    
+    # Verify other states unchanged
+    state_b2 = store.get("b", "byte")
+    assert len(state_b2.messages) == 1
+    assert state_b2 is state_b  # Same object
+    
+    state_c2 = store.get("a", "neighbor")
+    assert len(state_c2.messages) == 1
+    assert state_c2 is state_c  # Same object
+
+
+def test_workbench_session_reset_conversation(workspace: Workspace) -> None:
+    """Reset clears conversation while run is idle."""
+    from forge.agents.byte import BYTE
+    from forge.ui.session import WorkbenchSession
+    
+    # Create a session
+    session = WorkbenchSession(
+        workspace=workspace,
+        profile=BYTE,
+        model_id="scripted",
+        runtime_factory=lambda broker, channel: None,  # Not used for this test
+    )
+    
+    # Run a task to populate conversation state
+    # We need to mock the runtime factory to actually run
+    from forge.models.scripted import ScriptedGateway, ScriptedTurn
+    from forge.ui.runner import runtime_factory
+    
+    gateway = ScriptedGateway([ScriptedTurn(text="Done")])
+    factory = runtime_factory(
+        workspace,
+        profile=BYTE,
+        gateway=gateway,
+        model_id="scripted",
+    )
+    
+    session = WorkbenchSession(
+        workspace=workspace,
+        profile=BYTE,
+        model_id="scripted",
+        runtime_factory=factory,
+    )
+    
+    # Submit and complete a run
+    run_id = session.submit("first task")
+    # Wait for completion
+    import time
+    for _ in range(50):  # 5 second timeout
+        if session.state.value in ("completed", "failed"):
+            break
+        time.sleep(0.1)
+    
+    # Verify conversation has messages
+    status = session.status()
+    assert status["state"] == "completed"
+    
+    # Reset conversation
+    session.reset_conversation()
+    
+    # Submit another task - should start fresh
+    run_id2 = session.submit("second task")
+    # Wait for completion
+    for _ in range(50):
+        if session.state.value in ("completed", "failed"):
+            break
+        time.sleep(0.1)
+    
+    status2 = session.status()
+    assert status2["state"] == "completed"
+    # The two runs should be independent
+
+
+def test_reset_refused_during_active_run(workspace: Workspace) -> None:
+    """Reset is refused while a run is active."""
+    from forge.agents.byte import BYTE
+    from forge.ui.session import SessionBusy, WorkbenchSession
+    from forge.models.scripted import ScriptedGateway, ScriptedTurn
+    from forge.ui.runner import runtime_factory
+    
+    # Create a session with a long-running task
+    gateway = ScriptedGateway([
+        ScriptedTurn(tool_calls=(("read_file", {"path": "test.txt"}),)),
+        ScriptedTurn(tool_calls=(("read_file", {"path": "test.txt"}),)),
+        ScriptedTurn(tool_calls=(("read_file", {"path": "test.txt"}),)),
+        ScriptedTurn(text="Finally done"),
+    ])
+    
+    factory = runtime_factory(
+        workspace,
+        profile=BYTE,
+        gateway=gateway,
+        model_id="scripted",
+    )
+    
+    session = WorkbenchSession(
+        workspace=workspace,
+        profile=BYTE,
+        model_id="scripted",
+        runtime_factory=factory,
+    )
+    
+    # Start a run
+    run_id = session.submit("long task")
+    
+    # Try to reset while running - should fail
+    try:
+        session.reset_conversation()
+        assert False, "Should have raised SessionBusy"
+    except SessionBusy as exc:
+        assert run_id in str(exc)
+    
+    # Wait for completion
+    import time
+    for _ in range(50):
+        if session.state.value in ("completed", "failed"):
+            break
+        time.sleep(0.1)
+    
+    # Now reset should succeed
+    session.reset_conversation()
+    
+    # Verify we can start a new task
+    run_id2 = session.submit("fresh task")
+    assert run_id2 != run_id

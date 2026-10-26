@@ -354,6 +354,60 @@ body {
 .entry[data-role="system"] { border-left-color: var(--bad); }
 .entry[data-role="system"] .body { color: var(--ink-dim); }
 
+/* Archived conversation entries */
+.entry.archived .body {
+  color: var(--ink-dim);
+}
+
+.entry.archived .role {
+  color: var(--ink-dim);
+}
+
+/* Conversation divider */
+.conversation-divider {
+  margin: 24px 0 16px;
+  padding: 0;
+  position: relative;
+  text-align: center;
+}
+
+.conversation-divider::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--edge);
+}
+
+.divider-text {
+  display: inline-block;
+  position: relative;
+  padding: 0 12px;
+  background: var(--panel);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+/* Conversation label */
+.conversation-label {
+  margin: 0 0 20px;
+  padding: 0;
+}
+
+.label-text {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+
 /* -- composer -------------------------------------------------------- */
 
 .composer {
@@ -408,6 +462,16 @@ button {
 
 button:hover:not(:disabled) { border-color: var(--steel); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+button.secondary {
+  background: transparent;
+  border-color: var(--edge);
+  color: var(--ink-dim);
+}
+button.secondary:hover:not(:disabled) {
+  border-color: var(--steel);
+  color: var(--ink);
+}
 
 /* The Activity sheet's two controls.
 

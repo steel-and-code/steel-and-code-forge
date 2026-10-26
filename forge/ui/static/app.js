@@ -1,11 +1,12 @@
 /* Forge Workbench — page behaviour.
  *
- * Four endpoints and one stream:
+ * Five endpoints and one stream:
  *
  *   GET  /api/status           token + same-origin -> current state, approval
  *   GET  /api/models           token + same-origin -> cached model health
  *   POST /api/models/verify    token + origin      -> one bounded re-check
  *   POST /api/run              token + origin      -> 202, run id
+ *   POST /api/reset            token + origin      -> clear conversation, start fresh
  *   POST /api/events-ticket    token + origin      -> one-shot stream ticket
  *   GET  /api/events?ticket=   ticket + same-origin -> SSE activity stream
  *   POST /api/approvals/{id}   token + origin      -> the decision
@@ -130,6 +131,7 @@
     composer: document.getElementById("composer"),
     task: document.getElementById("task"),
     send: document.getElementById("send"),
+    newConversation: document.getElementById("new-conversation"),
     overlay: document.getElementById("approval-overlay"),
     approvalFields: document.getElementById("approval-fields"),
     approvalId: document.getElementById("approval-id"),
@@ -895,6 +897,90 @@
       });
   }
 
+  function resetConversation() {
+    if (!confirm("Start a fresh conversation? Previous messages will remain visible but will be marked as archived. The new conversation will start below.")) {
+      return;
+    }
+    
+    el.newConversation.disabled = true;
+    guardedFetch("/api/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    })
+      .then(function (response) {
+        if (response.status === 409) {
+          return response.json().then(function (body) {
+            showNote(
+              "Cannot reset while a run is active. " + (body.detail || "A run is already in flight.")
+            );
+            el.newConversation.disabled = false;
+          });
+        }
+        if (!response.ok) throw new Error("reset " + response.status);
+        return response.json();
+      })
+      .then(function (body) {
+        showNote("Started fresh conversation. Previous messages archived.");
+        
+        // Find the insertion point: after the last archived entry or at the end
+        var lastArchivedEntry = null;
+        var allEntries = el.thread.querySelectorAll(".entry");
+        Array.prototype.forEach.call(allEntries, function (entry) {
+          if (entry.classList.contains("archived")) {
+            lastArchivedEntry = entry;
+          }
+        });
+        
+        // Archive all non-archived entries (current conversation)
+        Array.prototype.forEach.call(allEntries, function (entry) {
+          if (!entry.classList.contains("archived")) {
+            entry.classList.add("archived");
+          }
+        });
+        
+        // Add a divider and label for the previous conversation
+        var divider = document.createElement("li");
+        divider.className = "conversation-divider";
+        
+        var dividerText = document.createElement("div");
+        dividerText.className = "divider-text";
+        dividerText.textContent = "NEW CONVERSATION";
+        divider.appendChild(dividerText);
+        
+        var label = document.createElement("li");
+        label.className = "conversation-label";
+        
+        var labelText = document.createElement("div");
+        labelText.className = "label-text";
+        labelText.textContent = "Previous conversation — Not in model context";
+        label.appendChild(labelText);
+        
+        // Insert divider and label after the last archived entry
+        if (lastArchivedEntry) {
+          lastArchivedEntry.parentNode.insertBefore(divider, lastArchivedEntry.nextSibling);
+          lastArchivedEntry.parentNode.insertBefore(label, divider.nextSibling);
+        } else if (allEntries.length > 0) {
+          // No archived entries yet, insert after the last entry
+          var lastEntry = allEntries[allEntries.length - 1];
+          lastEntry.parentNode.insertBefore(divider, lastEntry.nextSibling);
+          lastEntry.parentNode.insertBefore(label, divider.nextSibling);
+        } else {
+          // No entries at all
+          el.thread.appendChild(divider);
+          el.thread.appendChild(label);
+        }
+        
+        refreshStatus();
+      })
+      .catch(function (error) {
+        showNote("Could not reset conversation: " + error.message);
+      })
+      .finally(function () {
+        el.newConversation.disabled = false;
+      });
+  }
+
   function submit(task) {
     el.send.disabled = true;
     guardedFetch("/api/run", {
@@ -1512,6 +1598,10 @@
 
   el.approve.addEventListener("click", function () { decide(true); });
   el.reject.addEventListener("click", function () { decide(false); });
+
+  if (el.newConversation) {
+    el.newConversation.addEventListener("click", function () { resetConversation(); });
+  }
 
   if (el.modelsRecheck) {
     el.modelsRecheck.addEventListener("click", function () { recheckModels(); });
