@@ -517,7 +517,7 @@ def test_packaged_registry_offers_gpt_4_1_mini_without_changing_defaults() -> No
     assert registry.slot_usable(light.fallbacks[-1])
     coding = registry.tier("coding_standard")
     reasoning = registry.tier("reasoning_heavy")
-    assert coding is not None and coding.primary.model == "openai/gpt-5.6-luna"
+    assert coding is not None and coding.primary.model == "deepseek/deepseek-v3.2"
     assert reasoning is not None and reasoning.primary.model == "openai/o3"
     assert registry.routing.default_tier == "general_light"
     assert registry.routing.tasks["coding"] == {

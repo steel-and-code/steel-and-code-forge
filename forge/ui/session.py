@@ -498,6 +498,30 @@ class WorkbenchSession:
             }
         return body
 
+    # -- reset ----------------------------------------------------------
+
+    def reset_conversation(self) -> None:
+        """Clear the conversation state for this workspace and agent.
+        
+        Starts a fresh conversation without restarting the Workbench server.
+        Removes all previous model messages and cached denials.
+        
+        Raises:
+            SessionBusy: a run is already in flight or an approval is pending.
+        """
+        if self.busy:
+            with self._lock:
+                record = self._record
+            raise SessionBusy(record.run_id if record else "unknown")
+        
+        # Also check for pending approval
+        if self.state == UiSessionState.WAITING_FOR_APPROVAL:
+            with self._lock:
+                record = self._record
+            raise SessionBusy(record.run_id if record else "unknown")
+        
+        self._conversation_states.reset(self.workspace.root, self.profile.name)
+
     # -- shutdown --------------------------------------------------------
 
     def shutdown(self) -> None:

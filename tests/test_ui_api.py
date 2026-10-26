@@ -1146,3 +1146,165 @@ def test_no_live_network_or_model_calls_anywhere(workspace: Workspace) -> None:
     for request in harness.model.requests:
         assert "FORGE_OPENROUTER_API_KEY" not in request.system
         assert harness.token.value not in request.system
+
+
+def test_reset_conversation_api(workspace: Workspace) -> None:
+    """POST /api/reset clears conversation state."""
+    gateway = ScriptedGateway([
+        ScriptedTurn(text="First reply"),
+        ScriptedTurn(text="Second reply"),
+    ])
+    
+    token = UiToken()
+    session = WorkbenchSession(
+        workspace=workspace,
+        profile=BYTE,
+        model_id="scripted",
+        runtime_factory=runtime_factory(
+            workspace,
+            profile=BYTE,
+            gateway=gateway,
+            model_id="scripted",
+        ),
+    )
+    
+    app = create_app(
+        workspace=workspace,
+        session=session,
+        gateway=gateway,
+        token=token,
+        port=PORT,
+        health=None,
+    )
+    
+    client = TestClient(app)
+    
+    # First run
+    response = client.post(
+        "/api/run",
+        json={"task": "first task"},
+        headers={TOKEN_HEADER: token.value, "Origin": ORIGIN},
+    )
+    assert response.status_code == 202
+    
+    # Wait for completion
+    for _ in range(50):
+        status = client.get(
+            "/api/status",
+            headers={TOKEN_HEADER: token.value, SEC_FETCH_SITE_HEADER: "same-origin"},
+        )
+        if status.json()["state"] == "completed":
+            break
+        time.sleep(0.1)
+    
+    # Second run - continues conversation
+    response = client.post(
+        "/api/run",
+        json={"task": "second task"},
+        headers={TOKEN_HEADER: token.value, "Origin": ORIGIN},
+    )
+    assert response.status_code == 202
+    
+    # Wait for completion
+    for _ in range(50):
+        status = client.get(
+            "/api/status",
+            headers={TOKEN_HEADER: token.value, SEC_FETCH_SITE_HEADER: "same-origin"},
+        )
+        if status.json()["state"] == "completed":
+            break
+        time.sleep(0.1)
+    
+    # Reset conversation
+    response = client.post(
+        "/api/reset",
+        json={},
+        headers={TOKEN_HEADER: token.value, "Origin": ORIGIN},
+    )
+    assert response.status_code == 200
+    
+    # Verify we can start a fresh run
+    response = client.post(
+        "/api/run",
+        json={"task": "fresh task"},
+        headers={TOKEN_HEADER: token.value, "Origin": ORIGIN},
+    )
+    assert response.status_code == 202
+
+
+def test_reset_refused_during_active_run_api(workspace: Workspace) -> None:
+    """POST /api/reset is refused while a run is active (waiting for approval)."""
+    # Use GATED_TURNS which creates a run that waits for approval
+    harness = Harness(workspace, GATED_TURNS)
+    
+    # Start a run that will wait for approval
+    response = harness.submit("clean up")
+    assert response.status_code == 202
+    run_id = response.json()["run_id"]
+    
+    # Wait for the run to reach WAITING_FOR_APPROVAL state
+    assert harness.wait_state(UiSessionState.WAITING_FOR_APPROVAL)
+    
+    # Try to reset while waiting for approval - should be refused
+    response = harness.client.post(
+        "/api/reset",
+        json={},
+        headers=harness.auth(),
+    )
+    assert response.status_code == 409
+    assert "run is already in progress" in response.json()["detail"]
+    assert run_id in response.json()["detail"] or run_id[:8] in response.json()["detail"]
+    
+    # Complete the approval
+    approval_id = harness.wait_pending().approval_id
+    harness.approve(approval_id, "no")
+    assert harness.wait_state(UiSessionState.COMPLETED)
+    
+    # Now reset should succeed
+    response = harness.client.post(
+        "/api/reset",
+        json={},
+        headers=harness.auth(),
+    )
+    assert response.status_code == 200
+
+
+def test_reset_excludes_old_messages_from_next_gateway_request(
+    workspace: Workspace,
+) -> None:
+    """After a reset, the next run's model request carries only the new task.
+
+    Acceptance criterion: old conversation text must not re-enter the model
+    context. This asserts it on the wire: the messages the ScriptedGateway
+    received for the run *after* reset must not contain the prior task's text.
+    """
+    harness = Harness(
+        workspace,
+        [ScriptedTurn(text="first reply"), ScriptedTurn(text="second reply")],
+    )
+
+    # First run seeds the conversation with a distinctive phrase.
+    response = harness.submit("policy review alpha-47")
+    assert response.status_code == 202
+    assert harness.wait_state(UiSessionState.COMPLETED)
+
+    # Reset clears the conversation for this workspace/agent pair.
+    response = harness.client.post(
+        "/api/reset",
+        json={},
+        headers=harness.auth(),
+    )
+    assert response.status_code == 200
+
+    # Second run. Every gateway request issued from now on must not reference
+    # the first run's task text.
+    requests_seen = len(harness.model.requests)
+    response = harness.submit("draft the release notes")
+    assert response.status_code == 202
+    assert harness.wait_state(UiSessionState.COMPLETED)
+
+    new_requests = harness.model.requests[requests_seen:]
+    assert new_requests, "expected the second run to issue gateway requests"
+    for request in new_requests:
+        for message in request.messages:
+            assert "policy review alpha-47" not in message.content

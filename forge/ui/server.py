@@ -855,6 +855,28 @@ def create_app(
 
         return JSONResponse({"approval_id": approval_id, "state": session.state.value})
 
+    @app.post("/api/reset")
+    async def api_reset(
+        request: Request, _: None = Depends(guarded)
+    ) -> JSONResponse:
+        """Clear the conversation state and start fresh.
+        
+        Starts a new conversation without restarting the Workbench server.
+        Removes all previous model messages and cached denials for the current
+        workspace and agent.
+        
+        409 when a run is in flight or an approval is pending; 200 on success.
+        """
+        try:
+            session.reset_conversation()
+        except SessionBusy as busy:
+            return JSONResponse(
+                {"detail": str(busy), "run_id": busy.run_id, "state": session.state.value},
+                status_code=409,
+            )
+        
+        return JSONResponse({"state": session.state.value})
+
     @app.get("/api/events")
     async def api_events(
         request: Request,

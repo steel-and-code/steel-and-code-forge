@@ -2221,7 +2221,9 @@ def main(
 
     out_stream: TextIO = out if out is not None else sys.stdout
     err_stream: TextIO = err if err is not None else sys.stderr
-    env: dict[str, str] = environ if environ is not None else dict(os.environ)
+    # Load API key from ~/.config/forge/openrouter.key if not in environment
+    from .env_loader import enrich_environ
+    env: dict[str, str] = enrich_environ(environ)
 
     parser = build_parser()
 

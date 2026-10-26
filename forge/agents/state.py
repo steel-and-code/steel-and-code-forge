@@ -126,3 +126,15 @@ class ConversationStateStore:
         key = self._key(workspace, agent)
         with self._lock:
             return self._states.setdefault(key, ConversationState())
+    
+    def reset(self, workspace: str | Path, agent: str) -> None:
+        """Clear the conversation state for this workspace and agent.
+        
+        Used when an operator wants to start a fresh conversation without
+        restarting the Workbench server. Removes all messages and cached
+        denials for this workspace/agent pair.
+        """
+        key = self._key(workspace, agent)
+        with self._lock:
+            if key in self._states:
+                del self._states[key]

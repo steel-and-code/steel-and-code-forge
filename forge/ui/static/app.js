@@ -1,11 +1,13 @@
 /* Forge Workbench — page behaviour.
  *
- * Four endpoints and one stream:
+ * Five endpoints and one stream:
  *
  *   GET  /api/status           token + same-origin -> current state, approval
  *   GET  /api/models           token + same-origin -> cached model health
  *   POST /api/models/verify    token + origin      -> one bounded re-check
  *   POST /api/run              token + origin      -> 202, run id
+ *   POST /api/run-hermes       token + origin      -> 202, run id (text-only)
+ *   POST /api/reset            token + origin      -> clear conversation, start fresh
  *   POST /api/events-ticket    token + origin      -> one-shot stream ticket
  *   GET  /api/events?ticket=   ticket + same-origin -> SSE activity stream
  *   POST /api/approvals/{id}   token + origin      -> the decision
@@ -129,7 +131,9 @@
     activityClose: document.getElementById("activity-close"),
     composer: document.getElementById("composer"),
     task: document.getElementById("task"),
+    runMode: document.getElementById("run-mode"),
     send: document.getElementById("send"),
+    newConversation: document.getElementById("new-conversation"),
     overlay: document.getElementById("approval-overlay"),
     approvalFields: document.getElementById("approval-fields"),
     approvalId: document.getElementById("approval-id"),
@@ -163,9 +167,17 @@
    */
   function renderFinalAnswer(status) {
     if (!status || status.state !== "completed") return;
-    var result = status.result;
-    if (!result || !result.text) return;
-    reconcileFinalAnswer(status.run_id, result.text);
+    if (status.result && status.result.text) {
+      reconcileFinalAnswer(status.run_id, status.result.text);
+      return;
+    }
+    // The Hermes path reports its answer under `hermes_result`, not `result`:
+    // a text-only run has no turns or tool calls to summarise, only the
+    // child's own words. The same run_id-guarded reconciliation applies, so a
+    // reconnect that replays the tail still renders exactly one answer.
+    if (status.hermes_result && status.hermes_result.text) {
+      reconcileFinalAnswer(status.run_id, status.hermes_result.text);
+    }
   }
 
   // -- rendering -------------------------------------------------------
@@ -310,6 +322,18 @@
         return { text: "Byte is writing an answer", kind: "work" };
       case "run.started":
         return { text: "Byte is working", kind: "work" };
+      case "hermes.started":
+        return { text: "Hermes is working", kind: "work" };
+      case "hermes.result":
+        // The child's answer text is deliberately not read here. This line is a
+        // status, never a transcript, and the answer arrives whole from
+        // /api/status under `hermes_result` -- not through this reducer.
+        return { text: "Hermes answered", kind: "good" };
+      case "hermes.failed":
+        return {
+          text: "Hermes failed: " + (fields.detail || "unknown"),
+          kind: "bad",
+        };
       case "run.submitted":
         return { text: "Starting", kind: "work" };
       case "session.state":
@@ -565,6 +589,9 @@
     "run.failed": "bad",
     "run.submitted": "",
     "run.error": "bad",
+    "hermes.started": "",
+    "hermes.result": "good",
+    "hermes.failed": "bad",
     "tool.call": "",
     "tool.result": "",
     "approval.required": "warn",
@@ -895,9 +922,107 @@
       });
   }
 
+  function resetConversation() {
+    if (!confirm("Start a fresh conversation? Previous messages will remain visible but will be marked as archived. The new conversation will start below.")) {
+      return;
+    }
+    
+    el.newConversation.disabled = true;
+    guardedFetch("/api/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    })
+      .then(function (response) {
+        if (response.status === 409) {
+          return response.json().then(function (body) {
+            showNote(
+              "Cannot reset while a run is active. " + (body.detail || "A run is already in flight.")
+            );
+            el.newConversation.disabled = false;
+          });
+        }
+        if (!response.ok) throw new Error("reset " + response.status);
+        return response.json();
+      })
+      .then(function (body) {
+        showNote("Started fresh conversation. Previous messages archived.");
+        
+        // Find the insertion point: after the last archived entry or at the end
+        var lastArchivedEntry = null;
+        var allEntries = el.thread.querySelectorAll(".entry");
+        Array.prototype.forEach.call(allEntries, function (entry) {
+          if (entry.classList.contains("archived")) {
+            lastArchivedEntry = entry;
+          }
+        });
+        
+        // Archive all non-archived entries (current conversation)
+        Array.prototype.forEach.call(allEntries, function (entry) {
+          if (!entry.classList.contains("archived")) {
+            entry.classList.add("archived");
+          }
+        });
+        
+        // Add a divider and label for the previous conversation
+        var divider = document.createElement("li");
+        divider.className = "conversation-divider";
+        
+        var dividerText = document.createElement("div");
+        dividerText.className = "divider-text";
+        dividerText.textContent = "NEW CONVERSATION";
+        divider.appendChild(dividerText);
+        
+        var label = document.createElement("li");
+        label.className = "conversation-label";
+        
+        var labelText = document.createElement("div");
+        labelText.className = "label-text";
+        labelText.textContent = "Previous conversation — Not in model context";
+        label.appendChild(labelText);
+        
+        // Insert divider and label after the last archived entry
+        if (lastArchivedEntry) {
+          lastArchivedEntry.parentNode.insertBefore(divider, lastArchivedEntry.nextSibling);
+          lastArchivedEntry.parentNode.insertBefore(label, divider.nextSibling);
+        } else if (allEntries.length > 0) {
+          // No archived entries yet, insert after the last entry
+          var lastEntry = allEntries[allEntries.length - 1];
+          lastEntry.parentNode.insertBefore(divider, lastEntry.nextSibling);
+          lastEntry.parentNode.insertBefore(label, divider.nextSibling);
+        } else {
+          // No entries at all
+          el.thread.appendChild(divider);
+          el.thread.appendChild(label);
+        }
+        
+        refreshStatus();
+      })
+      .catch(function (error) {
+        showNote("Could not reset conversation: " + error.message);
+      })
+      .finally(function () {
+        el.newConversation.disabled = false;
+      });
+  }
+
+  /* Which run path a send takes, read from the Byte/Hermes selector.
+   *
+   * The value is read at send time and nowhere else, and defaults to Byte when
+   * the control is absent (a page from before this control existed, or a probe
+   * that did not model it). It is a routing choice, never a decision: the
+   * server still owns the safety profile and refuses what it must. The string
+   * is compared, not stored -- the value never leaves this function's return.
+   */
+  function agentMode() {
+    var select = el.runMode;
+    return select && select.value === "hermes" ? "hermes" : "byte";
+  }
+
   function submit(task) {
     el.send.disabled = true;
-    guardedFetch("/api/run", {
+    var endpoint = agentMode() === "hermes" ? "/api/run-hermes" : "/api/run";
+    guardedFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task: task }),
@@ -984,6 +1109,23 @@
         // operator can see, and truncating it twice would only lose more.
         assistantPreview = addMessage("assistant", data.text || "");
         break;
+      case "hermes.started":
+        // No thread entry: the accept message already said the run was
+        // accepted, and the derived activity line reads "Hermes is working".
+        // A text-only run emits no turns or tool calls to announce.
+        break;
+      case "hermes.result":
+        // The child finished successfully. Its answer arrives clipped on the
+        // stream, so this is not the place to render it: the whole of it is
+        // read back from /api/status under `hermes_result`, exactly as the
+        // native path recovers its own answer.
+        el.send.disabled = false;
+        refreshStatus();
+        break;
+      case "hermes.failed":
+        addMessage("system", "Hermes run failed: " + (data.detail || "unknown"));
+        el.send.disabled = false;
+        break;
       case "run.completed":
         // The turn/tool counts come from the event; the *answer* does not, so
         // the summary line is written first and the transcript is repaired
@@ -1025,6 +1167,13 @@
         // the same fact, and overwriting the chip from a stale event would
         // contradict what the operator is looking at.
         if (data.state && el.overlay.hidden) setState(data.state);
+        // A terminal transition is the one *reliable* end-of-run signal for the
+        // Hermes path, which emits no run.completed / run.failed. Re-reading the
+        // server here is what recovers the text-only answer (or the error) when
+        // hermes.result and the state change land in the same instant. For the
+        // native path this is a harmless repeat: reconcileFinalAnswer is
+        // idempotent per run_id, so a run already reconciled is not duplicated.
+        if (data.state === "completed" || data.state === "failed") refreshStatus();
         break;
       case "stream.dropped":
         showNote(
@@ -1066,6 +1215,7 @@
         [
           "run.started", "run.submitted", "model.reply", "run.completed",
           "run.failed", "run.error", "tool.call", "tool.result",
+          "hermes.started", "hermes.result", "hermes.failed",
           "approval.required", "approval.answered", "session.state",
           "stream.dropped", "stream.truncated",
         ].forEach(function (name) {
@@ -1512,6 +1662,10 @@
 
   el.approve.addEventListener("click", function () { decide(true); });
   el.reject.addEventListener("click", function () { decide(false); });
+
+  if (el.newConversation) {
+    el.newConversation.addEventListener("click", function () { resetConversation(); });
+  }
 
   if (el.modelsRecheck) {
     el.modelsRecheck.addEventListener("click", function () { recheckModels(); });
