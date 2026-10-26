@@ -440,6 +440,37 @@ body {
   margin-top: 10px;
 }
 
+/* The Byte/Hermes run selector. A label and a select in the composer's action
+   row, so the choice of run path is visible next to the control that spawns it
+   and never in the header beside the passive workspace/agent/model facts. The
+   select is a plain control; active state is the browser's, not a class the
+   script must keep in step. */
+.composer .run-mode {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-faint);
+}
+
+.composer select#run-mode {
+  background: #0f1216;
+  color: var(--ink);
+  border: 1px solid var(--edge-hot);
+  border-radius: var(--radius);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+}
+
+.composer select#run-mode:focus-visible {
+  outline: 2px solid var(--steel);
+  outline-offset: 1px;
+}
+
 .note {
   margin: 0;
   font-size: 11px;

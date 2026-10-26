@@ -155,10 +155,27 @@
       </div>
       <ol class="thread" id="thread" aria-live="polite"></ol>
       <form class="composer" id="composer" autocomplete="off">
-        <label class="sr-only" for="task">Task for Byte</label>
-        <textarea id="task" name="task" rows="3" placeholder="Give Byte a task. It will classify every operation it attempts; some will need your approval."></textarea>
+        <label class="sr-only" for="task">Task for the agent</label>
+        <textarea id="task" name="task" rows="3" placeholder="Give the agent a task."></textarea>
         <div class="composer-actions">
-          <button type="submit" id="send">Send to Byte</button>
+          <!--
+            The Byte/Hermes selector. It chooses *which* run path a send takes:
+            Byte posts to /api/run (native agent, tools, approvals); Hermes posts
+            to /api/run-hermes (the text-only external subprocess). It is a
+            selector, not a decision: the page still asks the server, which owns
+            the safety profile and refuses what it must. The value is read at
+            send time and nowhere else -- it is never stored, so a refresh
+            returns to the Byte default and no browser-side copy of the choice
+            survives.
+          -->
+          <label class="run-mode" for="run-mode">
+            <span>Run via</span>
+            <select id="run-mode" name="run-mode">
+              <option value="byte" selected>Byte</option>
+              <option value="hermes">Hermes</option>
+            </select>
+          </label>
+          <button type="submit" id="send">Send</button>
           <button type="button" id="new-conversation" class="secondary">New Conversation</button>
           <p class="note">
             No stop button in v1: cancellation is not implemented through the
