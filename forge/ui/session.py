@@ -59,6 +59,7 @@ from ..agents.state import ConversationStateStore
 from ..events import emit
 from ..external.base import ExternalResult
 from ..models.base import GatewayError
+from ..tools.session_grant import SessionGrant, build_test_grant
 from ..tools.workspace import Workspace
 from .broker import SseBroker
 from .channel import WebApprovalChannel
@@ -139,6 +140,7 @@ class _RunRecord:
     error: str | None = None
     finished_at: str | None = None
     max_turns: int | None = None
+    session_tests: bool = False
     turns: int = 0
     tool_calls: int = 0
     activity: str = "Starting"
@@ -182,7 +184,9 @@ class WorkbenchSession:
         workspace: Workspace,
         profile: AgentProfile,
         model_id: str,
-        runtime_factory: Callable[[SseBroker, WebApprovalChannel], AgentRuntime],
+        runtime_factory: Callable[
+            [SseBroker, WebApprovalChannel, SessionGrant | None], AgentRuntime
+        ],
         broker: SseBroker | None = None,
         channel: WebApprovalChannel | None = None,
         hermes_runner: Callable[[SseBroker, str], ExternalResult] | None = None,
@@ -246,8 +250,15 @@ class WorkbenchSession:
 
     # -- running ---------------------------------------------------------
 
-    def submit(self, task: str) -> str:
+    def submit(self, task: str, *, session_tests: bool = False) -> str:
         """Start one run on a worker thread. Returns the run id.
+
+        Args:
+            task: The task text.
+            session_tests: Whether this run opted into the bounded ``tests``
+                session scope. Defaults ``False`` (today's exact behaviour); the
+                grant is built fresh here and never remembered, so a later run
+                does not inherit an earlier opt-in.
 
         Raises:
             ValueError: ``task`` is empty. Refused before anything starts,
@@ -260,7 +271,9 @@ class WorkbenchSession:
             raise ValueError("no task given; nothing to run")
 
         run_id = uuid.uuid4().hex
-        record = _RunRecord(run_id=run_id, task=cleaned, started=_now_iso())
+        record = _RunRecord(
+            run_id=run_id, task=cleaned, started=_now_iso(), session_tests=session_tests
+        )
 
         with self._lock:
             existing = self._record
@@ -294,7 +307,11 @@ class WorkbenchSession:
         ended for a reason nobody recorded is indistinguishable from a hang, and
         the page needs to be able to say which it was.
         """
-        runtime = self._runtime_factory(self.broker, self.channel)
+        # The grant is built fresh here, per run, and only when this run opted
+        # in. It lives and dies with this run's runtime, so a later run -- opted
+        # in or not -- never inherits an earlier grant.
+        grant = build_test_grant() if record.session_tests else None
+        runtime = self._runtime_factory(self.broker, self.channel, grant)
         with self._lock:
             record.max_turns = runtime.max_turns
         try:

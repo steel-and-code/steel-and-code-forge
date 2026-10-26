@@ -471,6 +471,22 @@ body {
   outline-offset: 1px;
 }
 
+/* The session-tests opt-in. Same row as the run selector, a plain checkbox and
+   its label. Read at send time only; no storage and no remembered state. */
+.composer .session-tests {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  cursor: pointer;
+}
+
+.composer .session-tests input {
+  accent-color: var(--steel);
+}
+
 .note {
   margin: 0;
   font-size: 11px;

@@ -871,7 +871,17 @@ class ToolDispatcher:
             workspace=self.workspace.root,
         )
 
-        if outcome.decision is not ApprovalDecision.APPROVED:
+        if outcome.decision is ApprovalDecision.SESSION_AUTHORIZED:
+            emit(
+                self.events,
+                "tool.authorized",
+                tool="exec_command",
+                scope=outcome.scope or "",
+                rule=outcome.request.rule if outcome.request is not None else "",
+                reason=outcome.detail,
+            )
+
+        if not outcome.decision.permitted:
             return self._result_from_outcome(
                 "exec_command", outcome.decision, outcome.detail
             )

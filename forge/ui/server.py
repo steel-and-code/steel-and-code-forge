@@ -226,9 +226,16 @@ class MoveOrderRequest(BaseModel):
 
 
 class RunRequest(BaseModel):
-    """``POST /api/run`` body."""
+    """``POST /api/run`` body.
+
+    ``session_tests`` is the operator's explicit per-run opt-in to the bounded
+    ``tests`` session scope. It defaults ``False`` and is never persisted
+    server-side: each run reads the flag afresh and builds a fresh grant only
+    when it is true, so no run inherits an earlier opt-in.
+    """
 
     task: str = Field(min_length=1, max_length=8000)
+    session_tests: bool = False
 
 
 class RunHermesRequest(BaseModel):
@@ -780,7 +787,7 @@ def create_app(
         started, and the stream carries what it did.
         """
         try:
-            run_id = session.submit(body.task)
+            run_id = session.submit(body.task, session_tests=body.session_tests)
         except SessionBusy as busy:
             # 409, not a queue. One process, one run; pretending otherwise would
             # imply a task the operator asked for is going to happen.

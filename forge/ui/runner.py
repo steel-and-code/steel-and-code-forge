@@ -39,6 +39,7 @@ from ..models.base import ModelGateway
 from ..tools.approval import Approver
 from ..tools.dispatcher import ToolDispatcher
 from ..tools.execution import Executor
+from ..tools.session_grant import SessionGrant
 from ..tools.workspace import Workspace
 from .broker import SseBroker
 from .channel import WebApprovalChannel
@@ -52,6 +53,7 @@ def build_dispatcher(
     profile: AgentProfile,
     channel: WebApprovalChannel,
     events: EventSink | None = None,
+    grant: SessionGrant | None = None,
 ) -> ToolDispatcher:
     """Wire the safety stack for one Workbench run.
 
@@ -66,10 +68,13 @@ def build_dispatcher(
             because this surface offers no way to configure it.
         channel: The browser approval bridge.
         events: Observational sink, normally the broker.
+        grant: The run's session grant, or ``None`` (today's exact behaviour).
+            Built fresh per run by the caller when the operator opted in; never
+            carried across runs.
     """
     return ToolDispatcher(
         workspace,
-        approver=Approver(channel),
+        approver=Approver(channel, grant=grant),
         executor=Executor(workspace),
         # The request genuinely is Byte's here, so the approval prompt says so.
         agent_name=profile.name,
@@ -88,10 +93,11 @@ def build_runtime(
     channel: WebApprovalChannel,
     broker: SseBroker,
     max_turns: int | None = None,
+    grant: SessionGrant | None = None,
 ) -> AgentRuntime:
     """Build one run's runtime, wired to the broker and the approval channel."""
     dispatcher = build_dispatcher(
-        workspace, profile=profile, channel=channel, events=broker
+        workspace, profile=profile, channel=channel, events=broker, grant=grant
     )
     return AgentRuntime(
         profile,
@@ -110,7 +116,7 @@ def runtime_factory(
     gateway: ModelGateway,
     model_id: str,
     max_turns: int | None = None,
-) -> Callable[[SseBroker, WebApprovalChannel], AgentRuntime]:
+) -> Callable[[SseBroker, WebApprovalChannel, SessionGrant | None], AgentRuntime]:
     """A factory matching :class:`~forge.ui.session.WorkbenchSession`.
 
     The session builds a fresh runtime per run because the dispatcher caches
@@ -118,9 +124,19 @@ def runtime_factory(
     different tasks would be a stale answer about an operation nobody asked about
     this time. The gateway is shared deliberately: it holds the credential, and
     the credential belongs to the process rather than to a run.
+
+    The returned callable takes the broker, the approval channel, and the run's
+    session grant (``None`` when the operator did not opt in). The grant is a
+    per-run argument rather than a closure default precisely because it must not
+    survive across runs: a grant remembered inside the factory would be inherited
+    by every later run, which is the one thing a session grant must never do.
     """
 
-    def factory(broker: SseBroker, channel: WebApprovalChannel) -> AgentRuntime:
+    def factory(
+        broker: SseBroker,
+        channel: WebApprovalChannel,
+        grant: SessionGrant | None,
+    ) -> AgentRuntime:
         return build_runtime(
             workspace,
             profile=profile,
@@ -129,6 +145,7 @@ def runtime_factory(
             channel=channel,
             broker=broker,
             max_turns=max_turns,
+            grant=grant,
         )
 
     return factory

@@ -175,6 +175,18 @@
               <option value="hermes">Hermes</option>
             </select>
           </label>
+          <!--
+            The session-tests opt-in. Checked per run and read at send time, then
+            returned to unchecked once the run is accepted -- so the default is
+            always unchecked and a later run never inherits a checked box. There
+            is no storage anywhere: like every other composer control, the value
+            lives only in the DOM for the length of one send. It applies to the
+            Byte path only; the Hermes (text-only) path sends no grant.
+          -->
+          <label class="session-tests" for="session-tests">
+            <input type="checkbox" id="session-tests" name="session-tests">
+            <span>Allow routine tests for this run (max 25, 60 minutes)</span>
+          </label>
           <button type="submit" id="send">Send</button>
           <button type="button" id="new-conversation" class="secondary">New Conversation</button>
           <p class="note">

@@ -397,6 +397,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     byte_parser.add_argument(
+        "--session-tests",
+        action="store_true",
+        help=(
+            "grant the bounded 'tests' session scope: repository test runners "
+            "(pytest, tox, nox, and the *test subcommand of npm/pnpm/yarn/cargo/"
+            "go) are authorized without a per-operation prompt until the grant "
+            "budget (25) is spent, a 60-minute expiry elapses, or the run ends. "
+            "Never widens a denial; commits, pushes, destructive, credential, "
+            "and deployment operations still require approval."
+        ),
+    )
+    byte_parser.add_argument(
         "task",
         nargs="?",
         default=None,
@@ -1446,6 +1458,7 @@ def _run_agent(
     from ..models.base import GatewayError
     from ..tools.dispatcher import ToolDispatcher
     from ..tools.execution import Executor
+    from ..tools.session_grant import build_test_grant
 
     task = _read_task(args, err)
     if task is None:
@@ -1488,9 +1501,18 @@ def _run_agent(
     else:
         approver_channel = channel or TerminalApprovalChannel(prompt_stream=out)
 
+    # An explicit operator opt-in builds the session grant. Absent, or for an
+    # agent without the flag, no grant is constructed and every
+    # approval-required operation prompts as before. The grant is built fresh
+    # here and handed to the Approver for this one run, so it cannot survive
+    # into a later run.
+    grant = None
+    if getattr(args, "session_tests", False):
+        grant = build_test_grant()
+
     dispatcher = ToolDispatcher(
         workspace,
-        approver=Approver(approver_channel),
+        approver=Approver(approver_channel, grant=grant),
         executor=Executor(workspace),
         # The request genuinely is this agent's here, so the approval prompt
         # says so.
