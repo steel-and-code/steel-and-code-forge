@@ -63,6 +63,10 @@ fallbacks = [
 model = "openai/gpt-4.1-mini"
 provider = "openrouter"
 
+[agents.byte]
+model = "qwen3.5:27b-q4_K_M"
+provider = "local"
+
 [routing]
 # Used whenever no task entry matches. An unanticipated task still routes.
 default_tier = "general_light"
