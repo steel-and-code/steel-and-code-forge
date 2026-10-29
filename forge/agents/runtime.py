@@ -74,11 +74,11 @@ __all__ = [
 ]
 
 
-#: Ceiling on model round-trips for one run. A real task -- "fix the failing
-#: tests" -- plausibly needs ten to twenty tool calls, so this leaves headroom
-#: without permitting a runaway. Configurable *downward* per run; a profile may
-#: not raise it.
-MAX_TOOL_TURNS = 25
+#: Ceiling on model round-trips for one run. Seventy-five is the recovered
+#: Byte maximum: enough for a long, genuine task ("fix the failing tests")
+#: while still bounding a runaway agent. Configurable *downward* per run and by
+#: profile; a profile may never raise it.
+MAX_TOOL_TURNS = 75
 
 
 class MaxTurnsExceeded(RuntimeError):
