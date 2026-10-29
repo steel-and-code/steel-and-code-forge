@@ -91,13 +91,21 @@ def build_runtime(
     gateway: ModelGateway,
     model_id: str,
     channel: WebApprovalChannel,
-    broker: SseBroker,
+    events: EventSink | None = None,
     max_turns: int | None = None,
     grant: SessionGrant | None = None,
 ) -> AgentRuntime:
-    """Build one run's runtime, wired to the broker and the approval channel."""
+    """Build one run's runtime, wired to the approval channel and an event sink.
+
+    ``events`` is the single observational sink the runtime AND the dispatcher
+    emit their lifecycle events through. The Workbench passes the session itself
+    here, so each ``run.*``/``model.*``/``tool.*`` event advances the run record
+    (turns, tool calls, activity, liveness) and is published to the SSE broker
+    in one place. A caller that only wants the raw stream passes the broker
+    directly; ``None`` observes nothing.
+    """
     dispatcher = build_dispatcher(
-        workspace, profile=profile, channel=channel, events=broker, grant=grant
+        workspace, profile=profile, channel=channel, events=events, grant=grant
     )
     return AgentRuntime(
         profile,
@@ -105,7 +113,7 @@ def build_runtime(
         dispatcher=dispatcher,
         model_id=model_id,
         max_turns=max_turns,
-        events=broker,
+        events=events,
     )
 
 
@@ -116,7 +124,7 @@ def runtime_factory(
     gateway: ModelGateway,
     model_id: str,
     max_turns: int | None = None,
-) -> Callable[[SseBroker, WebApprovalChannel, SessionGrant | None], AgentRuntime]:
+) -> Callable[[EventSink | None, WebApprovalChannel, SessionGrant | None], AgentRuntime]:
     """A factory matching :class:`~forge.ui.session.WorkbenchSession`.
 
     The session builds a fresh runtime per run because the dispatcher caches
@@ -125,15 +133,16 @@ def runtime_factory(
     this time. The gateway is shared deliberately: it holds the credential, and
     the credential belongs to the process rather than to a run.
 
-    The returned callable takes the broker, the approval channel, and the run's
-    session grant (``None`` when the operator did not opt in). The grant is a
-    per-run argument rather than a closure default precisely because it must not
-    survive across runs: a grant remembered inside the factory would be inherited
-    by every later run, which is the one thing a session grant must never do.
+    The returned callable takes the events sink, the approval channel, and the
+    run's session grant (``None`` when the operator did not opt in). The grant is
+    a per-run argument rather than a closure default precisely because it must
+    not survive across runs: a grant remembered inside the factory would be
+    inherited by every later run, which is the one thing a session grant must
+    never do.
     """
 
     def factory(
-        broker: SseBroker,
+        events: EventSink | None,
         channel: WebApprovalChannel,
         grant: SessionGrant | None,
     ) -> AgentRuntime:
@@ -143,7 +152,7 @@ def runtime_factory(
             gateway=gateway,
             model_id=model_id,
             channel=channel,
-            broker=broker,
+            events=events,
             max_turns=max_turns,
             grant=grant,
         )

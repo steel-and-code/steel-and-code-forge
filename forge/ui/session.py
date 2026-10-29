@@ -56,7 +56,7 @@ from typing import Callable
 from ..agents.profile import AgentProfile
 from ..agents.runtime import AgentRuntime, MaxTurnsExceeded
 from ..agents.state import ConversationStateStore
-from ..events import emit
+from ..events import Event, EventSink, emit
 from ..external.base import ExternalResult
 from ..models.base import GatewayError
 from ..tools.session_grant import SessionGrant, build_test_grant
@@ -185,7 +185,7 @@ class WorkbenchSession:
         profile: AgentProfile,
         model_id: str,
         runtime_factory: Callable[
-            [SseBroker, WebApprovalChannel, SessionGrant | None], AgentRuntime
+            [EventSink | None, WebApprovalChannel, SessionGrant | None], AgentRuntime
         ],
         broker: SseBroker | None = None,
         channel: WebApprovalChannel | None = None,
@@ -311,7 +311,7 @@ class WorkbenchSession:
         # in. It lives and dies with this run's runtime, so a later run -- opted
         # in or not -- never inherits an earlier grant.
         grant = build_test_grant() if record.session_tests else None
-        runtime = self._runtime_factory(self.broker, self.channel, grant)
+        runtime = self._runtime_factory(self, self.channel, grant)
         with self._lock:
             record.max_turns = runtime.max_turns
         try:
@@ -456,6 +456,18 @@ class WorkbenchSession:
                 elif name == "run.started":
                     record.activity = "Model working"
         emit(self.broker, name, **fields)
+
+    def emit(self, event: Event) -> None:
+        """EventSink: route a lifecycle event through the record-updating funnel.
+
+        The runtime and its dispatcher hold this session as their observational
+        sink (``events=``), so every ``run.*``/``model.*``/``tool.*`` event both
+        advances the run record and is published to the broker in one place.
+        ``_emit_event`` does both, which is what keeps ``GET /api/status`` live
+        during a run -- without a second source of truth or a second publish of
+        the same event.
+        """
+        self._emit_event(event.name, **dict(event.fields))
 
     def status(self) -> dict[str, object]:
         """Everything a page needs to render the current state.

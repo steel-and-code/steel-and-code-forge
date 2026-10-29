@@ -769,7 +769,7 @@ def test_runner_builds_a_runtime(workspace: Workspace) -> None:
         gateway=ScriptedGateway([ScriptedTurn(text="hi")]),
         model_id="scripted",
         channel=WebApprovalChannel(),
-        broker=SseBroker(),
+        events=SseBroker(),
     )
     assert runtime.run("say hi").text == "hi"
 

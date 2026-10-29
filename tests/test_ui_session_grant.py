@@ -124,7 +124,7 @@ def test_build_runtime_defaults_to_no_grant(workspace: Workspace) -> None:
         gateway=ScriptedGateway([ScriptedTurn(text="hi")]),
         model_id="scripted",
         channel=WebApprovalChannel(),
-        broker=SseBroker(),
+        events=SseBroker(),
     )
     assert runtime.dispatcher.approver.grant is None
 
