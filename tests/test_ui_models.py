@@ -45,6 +45,7 @@ from forge.ui.runner import runtime_factory
 from forge.ui.security import SEC_FETCH_SITE_HEADER, TOKEN_HEADER, UiToken
 from forge.ui.server import create_app
 from forge.ui.session import UiSessionState, WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 PORT = 8765
 ORIGIN = f"http://127.0.0.1:{PORT}"
@@ -162,7 +163,7 @@ class Harness:
         self.session = WorkbenchSession(
             workspace=workspace,
             profile=BYTE,
-            model_id="alpha",
+            selector=ModelSelector({}, ModelSelection("openrouter", "alpha")),
             runtime_factory=runtime_factory(
                 workspace, profile=BYTE, gateway=self.model, model_id="alpha"
             ),

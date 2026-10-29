@@ -27,6 +27,7 @@ from forge.tools.workspace import Workspace
 from forge.ui.broker import SseBroker
 from forge.ui.runner import runtime_factory
 from forge.ui.session import WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 
 @pytest.fixture()
@@ -65,7 +66,7 @@ def _make_session(workspace: Workspace, gateway):
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace, profile=BYTE, gateway=gateway, model_id="scripted"
         ),

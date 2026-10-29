@@ -752,6 +752,31 @@ to become an agent's standing preference.
 > before testing registry behaviour, or check `forge route` output, which is
 > unaffected by the override.
 
+### The Workbench selector binds provider and model together
+
+Where `--model` overrides only the model id (the provider comes from
+`$FORGE_MODEL_PROVIDER`, defaulting to `openrouter`), the Workbench header has a
+provider selector (`Local (Space Monkey)` / `OpenRouter`) and a model selector
+that travel as **one binding**. `POST /api/selection` applies them together and
+the gateway is derived from the provider through the single
+`forge.models.providers.build_gateway` -- so a local model id can never be
+routed to the paid host.
+
+Two properties follow from that binding, and both are enforced rather than
+documented:
+
+* A selection change applies to the **next** run only. The gateway and model
+  are sampled once, at run start, and the server refuses a change (409) while a
+  run is in flight.
+* An unavailable provider is an **error, never a fallback**. The selector's
+  catalog reports the provider it could not list (`available = false` with a
+  reason), and a run still goes through the selected provider -- which fails --
+  rather than silently switching to the other one.
+
+The model list the selector offers comes from the same `/v1/models` listing the
+`forge models status --verify` probe reads, via
+`forge.models.verify.list_provider_models`, not from a second enumeration.
+
 ## Still not connected
 
 `forge byte` and `forge workbench` resolve their **default** model through the

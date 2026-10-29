@@ -44,7 +44,13 @@ from ..tools.workspace import Workspace
 from .broker import SseBroker
 from .channel import WebApprovalChannel
 
-__all__ = ["build_runtime", "build_dispatcher", "build_hermes_runner"]
+__all__ = [
+    "build_runtime",
+    "build_dispatcher",
+    "build_hermes_runner",
+    "runtime_factory",
+    "selectable_runtime_factory",
+]
 
 
 def build_dispatcher(
@@ -146,6 +152,51 @@ def runtime_factory(
         channel: WebApprovalChannel,
         grant: SessionGrant | None,
     ) -> AgentRuntime:
+        return build_runtime(
+            workspace,
+            profile=profile,
+            gateway=gateway,
+            model_id=model_id,
+            channel=channel,
+            events=events,
+            max_turns=max_turns,
+            grant=grant,
+        )
+
+    return factory
+
+
+def selectable_runtime_factory(
+    workspace: Workspace,
+    *,
+    profile: AgentProfile,
+    selector,
+    max_turns: int | None = None,
+) -> Callable[[EventSink | None, WebApprovalChannel, SessionGrant | None], AgentRuntime]:
+    """A runtime factory that resolves gateway + model from a selector per run.
+
+    The Workbench's model selectors call this instead of
+    :func:`runtime_factory`: the gateway and model are not fixed at process
+    start, but read from the selector when the run begins. That is what makes a
+    provider/model change take effect on the *next* run and never mid-run -- the
+    selection is sampled exactly once, inside the factory invocation the worker
+    thread already makes per run, and the server refuses to change the selection
+    while one is in flight.
+
+    The selector owns the provider -> gateway mapping
+    (:meth:`forge.ui.selector.ModelSelector.resolve` builds it through
+    :func:`forge.models.providers.build_gateway`), so a local model can never
+    be handed to the OpenRouter gateway. A gateway that cannot be built (for
+    example an OpenRouter selection with no credential) raises inside the
+    factory, surfacing as a failed run rather than a silent fallback.
+    """
+
+    def factory(
+        events: EventSink | None,
+        channel: WebApprovalChannel,
+        grant: SessionGrant | None,
+    ) -> AgentRuntime:
+        gateway, model_id = selector.resolve()
         return build_runtime(
             workspace,
             profile=profile,

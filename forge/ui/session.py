@@ -63,6 +63,7 @@ from ..tools.session_grant import SessionGrant, build_test_grant
 from ..tools.workspace import Workspace
 from .broker import SseBroker
 from .channel import WebApprovalChannel
+from .selector import ModelSelector
 
 __all__ = ["UiSessionState", "WorkbenchSession", "SessionBusy", "RunSummary"]
 
@@ -157,7 +158,11 @@ class WorkbenchSession:
             naming a directory would turn every other control into a
             suggestion.
         profile: Whose run this is.
-        model_id: Resolved provider model identifier.
+        selector: The current (provider, model) binding. Read by :meth:`status`
+            to report what the next run will use, and consulted by the
+            injected ``runtime_factory`` when it resolves the gateway for a run.
+            A selection change therefore applies to the next run, never one in
+            flight.
         runtime_factory: Builds an :class:`AgentRuntime` for one run, given the
             broker and the approval channel. Injected so the CLI can wire a real
             gateway and a test can wire :class:`ScriptedGateway` without either
@@ -183,7 +188,7 @@ class WorkbenchSession:
         *,
         workspace: Workspace,
         profile: AgentProfile,
-        model_id: str,
+        selector: ModelSelector,
         runtime_factory: Callable[
             [EventSink | None, WebApprovalChannel, SessionGrant | None], AgentRuntime
         ],
@@ -193,7 +198,7 @@ class WorkbenchSession:
     ) -> None:
         self.workspace = workspace
         self.profile = profile
-        self.model_id = model_id
+        self.selector = selector
         self.broker = broker if broker is not None else SseBroker()
         self._runtime_factory = runtime_factory
         self._hermes_runner = hermes_runner
@@ -482,11 +487,13 @@ class WorkbenchSession:
             state = self._state
             record = self._record
 
+        selection = self.selector.selection
         body: dict[str, object] = {
             "state": state.value,
             "workspace": str(self.workspace.root),
             "agent": self.profile.name,
-            "model": self.model_id,
+            "model": selection.model,
+            "provider": selection.provider,
             "pending_approval": self.channel.pending_public(),
         }
 

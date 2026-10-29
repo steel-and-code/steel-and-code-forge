@@ -25,13 +25,17 @@ reporting GREEN because a well-formed configuration file happened to parse.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
+
+if TYPE_CHECKING:
+    from .base import ModelGateway
 
 __all__ = [
     "ProviderSpec",
     "ProviderCatalog",
     "GatewayFactory",
     "VerifierFactory",
+    "build_gateway",
 ]
 
 
@@ -237,3 +241,34 @@ class ProviderCatalog:
         return tuple(
             name for name, spec in self._specs.items() if spec.verifier_factory
         )
+
+
+def build_gateway(provider: str, environ: Mapping[str, str]) -> ModelGateway:
+    """Construct the model gateway for ``provider`` from its environment mapping.
+
+    The single construction site for both implemented providers, shared by the
+    CLI and the Workbench model selector, so a provider name can never be
+    paired with the wrong gateway: ``"local"`` is always the local gateway and
+    ``"openrouter"`` is always OpenRouter. A model id is carried separately by
+    the caller; this function owns only the provider -> gateway mapping, which
+    is the pairing that must not drift in two places.
+
+    Both gateways accept ``environ=`` as their credential/configuration
+    mapping, which is why one call shape serves both and neither reads
+    ``os.environ`` directly.
+
+    Raises:
+        GatewayError: ``provider`` is neither ``"local"`` nor ``"openrouter"``.
+    """
+    from .base import GatewayError
+    from .local import LocalLlamaGateway
+    from .openrouter import OpenRouterGateway
+
+    if provider == "local":
+        return LocalLlamaGateway(environ=environ)
+    if provider == "openrouter":
+        return OpenRouterGateway(environ=environ)
+
+    raise GatewayError(
+        f"unknown model provider {provider!r}; expected 'openrouter' or 'local'"
+    )

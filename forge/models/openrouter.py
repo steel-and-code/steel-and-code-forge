@@ -47,6 +47,7 @@ from .base import (
     ContextTooLarge,
     GatewayError,
     Message,
+    ModelListing,
     ModelResponse,
     ToolCall,
     Usage,
@@ -711,6 +712,58 @@ class OpenRouterVerifier:
                 f"contacted ({kind})"
             ),
             detail=kind,
+        )
+
+    def list_models(self) -> ModelListing:
+        """The model ids OpenRouter is serving, or why that is unknown.
+
+        The catalog seam the Workbench model selector reads. It reuses the same
+        ``/api/v1/models`` GET, the same credential rules, and the same parse as
+        :meth:`verify`: the key travels only in the ``Authorization`` header, a
+        missing key is a reportable ``credential_missing`` state rather than a
+        construction failure, and a provider body is never echoed into the
+        reason. Only bounded, operator-safe error text leaves this method.
+        """
+        if not self._api_key:
+            return ModelListing(
+                provider="openrouter", available=False, error="credential_missing"
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Accept": "application/json",
+            "HTTP-Referer": "https://steelandcode.com",
+            "X-Title": "Steel & Code Forge",
+        }
+
+        try:
+            status, text = self._get(self._endpoint, headers, self._timeout)
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            text = ""
+        except (socket.timeout, TimeoutError):
+            return ModelListing(
+                provider="openrouter", available=False, error="timeout"
+            )
+        except (urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            return ModelListing(
+                provider="openrouter", available=False, error=type(reason).__name__
+            )
+
+        if status != 200:
+            return ModelListing(
+                provider="openrouter", available=False, error=f"http {status}"
+            )
+
+        ids, malformed = _parse_model_listing(text)
+        if malformed:
+            return ModelListing(
+                provider="openrouter", available=False, error="unparseable listing"
+            )
+
+        return ModelListing(
+            provider="openrouter", models=tuple(sorted(ids)), available=True
         )
 
 

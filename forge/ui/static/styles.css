@@ -320,6 +320,37 @@ body {
 
 .bar-selectors[hidden] { display: none; }
 
+/* A labelled select in the header's selector row. The label sits above the
+   control so the row stays a single wrapped row of compact, aligned controls. */
+.bar-select {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bar-select-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-faint);
+}
+
+.bar-select select {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+  max-width: 260px;
+}
+
+.bar-select select:focus {
+  outline: 1px solid var(--hot);
+}
+
 /* -- thread ---------------------------------------------------------- */
 
 .thread, .feed {

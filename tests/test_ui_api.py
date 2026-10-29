@@ -36,6 +36,7 @@ from forge.ui.runner import runtime_factory
 from forge.ui.security import SEC_FETCH_SITE_HEADER, TOKEN_HEADER, UiToken
 from forge.ui.server import create_app
 from forge.ui.session import UiSessionState, WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 PORT = 8765
 ORIGIN = f"http://127.0.0.1:{PORT}"
@@ -63,7 +64,7 @@ class Harness:
         self.session = WorkbenchSession(
             workspace=workspace,
             profile=BYTE,
-            model_id="scripted",
+            selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
             runtime_factory=runtime_factory(
                 workspace,
                 profile=BYTE,
@@ -582,7 +583,7 @@ def test_a_second_task_while_running_is_a_conflict(workspace: Workspace) -> None
     harness.session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace, profile=BYTE, gateway=SlowGateway(), model_id="scripted"
         ),
@@ -1159,7 +1160,7 @@ def test_reset_conversation_api(workspace: Workspace) -> None:
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace,
             profile=BYTE,

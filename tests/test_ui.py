@@ -106,11 +106,12 @@ def _session(
 ) -> WorkbenchSession:
     model = ScriptedModel(turns)
     from forge.ui.runner import runtime_factory
+    from forge.ui.selector import ModelSelection, ModelSelector
 
     return WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id=model_id,
+        selector=ModelSelector({}, ModelSelection("openrouter", model_id)),
         runtime_factory=runtime_factory(
             workspace,
             profile=BYTE,
@@ -603,11 +604,12 @@ def test_a_second_task_while_running_is_a_conflict(workspace: Workspace) -> None
             return ModelResponse(text="eventually")
 
     from forge.ui.runner import runtime_factory
+    from forge.ui.selector import ModelSelection, ModelSelector
 
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace,
             profile=BYTE,
@@ -1089,13 +1091,14 @@ def test_workbench_session_reset_conversation(workspace: Workspace) -> None:
     """Reset clears conversation while run is idle."""
     from forge.agents.byte import BYTE
     from forge.ui.session import WorkbenchSession
+    from forge.ui.selector import ModelSelection, ModelSelector
     
     # Create a session
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
-        runtime_factory=lambda broker, channel: None,  # Not used for this test
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
+        runtime_factory=lambda broker, channel, grant: None,  # Not used for this test
     )
     
     # Run a task to populate conversation state
@@ -1114,7 +1117,7 @@ def test_workbench_session_reset_conversation(workspace: Workspace) -> None:
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=factory,
     )
     
@@ -1153,6 +1156,7 @@ def test_reset_refused_during_active_run(workspace: Workspace) -> None:
     from forge.ui.session import SessionBusy, WorkbenchSession
     from forge.models.scripted import ScriptedGateway, ScriptedTurn
     from forge.ui.runner import runtime_factory
+    from forge.ui.selector import ModelSelection, ModelSelector
     
     # Create a session with a long-running task
     gateway = ScriptedGateway([
@@ -1172,7 +1176,7 @@ def test_reset_refused_during_active_run(workspace: Workspace) -> None:
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=factory,
     )
     

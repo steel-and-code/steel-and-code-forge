@@ -54,6 +54,7 @@ __all__ = [
     "ModelVerifier",
     "GatewayError",
     "ContextTooLarge",
+    "ModelListing",
 ]
 
 Role = Literal["user", "assistant", "tool"]
@@ -366,3 +367,33 @@ class ModelVerifier(Protocol):
             an unparseable body all come back as a result value.
         """
         ...
+
+
+@dataclass(frozen=True)
+class ModelListing:
+    """The models a provider is serving, or why that could not be determined.
+
+    This is the *catalog* seam, distinct from :class:`VerificationResult`:
+    verification asks "is this one model usable", a listing asks "what models
+    does this provider offer". The Workbench model selector reads it to
+    populate its per-provider model list.
+
+    An unavailable provider is a reportable value, never an exception: the
+    selector must be able to show "this provider is down" rather than crash, and
+    a listing that returns ``available=False`` is exactly that. ``error`` is a
+    short, operator-safe reason -- a transport exception type name, an HTTP
+    status, or a shape complaint -- never provider prose, for the same reason a
+    :class:`VerificationResult` never echoes a provider body.
+
+    Attributes:
+        provider: The provider name (``"local"``, ``"openrouter"``, ...).
+        models: The model ids the provider offered, sorted. Empty when the
+            listing failed or the provider offered nothing.
+        available: Whether the provider answered with a usable listing.
+        error: Why ``available`` is False. Empty on success.
+    """
+
+    provider: str
+    models: tuple[str, ...] = ()
+    available: bool = True
+    error: str = ""

@@ -43,27 +43,38 @@
         <dd id="agent" class="mono">&mdash;</dd>
       </div>
       <div class="fact">
+        <dt>Provider</dt>
+        <dd id="provider" class="mono">&mdash;</dd>
+      </div>
+      <div class="fact">
         <dt>Model</dt>
         <dd id="model" class="mono">&mdash;</dd>
       </div>
     </dl>
     <!--
-      Reserved slot for future workspace/agent/model selectors.
+      The provider/model selector. Provider and model travel as one binding --
+      a model id without its provider is how a local model gets POSTed to a paid
+      host -- so changing either control re-binds both through POST /api/selection,
+      which the server applies together and refuses while a run is in flight.
 
-      Deliberately empty and hidden in this strike. It exists so that a later
-      change can drop controls in without redesigning the header a second time:
-      the responsive rules for a wrapping row of controls already exist (see
-      `.bar-selectors` in styles.css), so the header is measured and laid out
-      for that case even though nothing fills it yet.
-
-      Two things it must not become. It is not a place to decide anything -- a
-      selector here would post a command, and the page does not decide, it asks.
-      And a future selector must not be built from anything already in the DOM:
-      workspace, agent, and model are fixed per process and are rendered from
-      GET /api/status, so a control that could change them would be advertising
-      a capability the server does not have.
+      The values are read from GET /api/selection: `providers` supplies the
+      provider options and `available[provider].models` supplies that provider's
+      model list, so the controls never offer a value the backend does not know.
+      Like every other control on this page, they hold no state of their own: a
+      refresh re-reads the server, which is the only source of truth.
     -->
-    <div class="bar-selectors" id="bar-selectors" hidden></div>
+    <div class="bar-selectors" id="bar-selectors">
+      <label class="bar-select" for="provider-select">
+        <span class="bar-select-label">Provider</span>
+        <select id="provider-select" name="provider"></select>
+      </label>
+      <label class="bar-select" for="model-select">
+        <span class="bar-select-label">Model</span>
+        <select id="model-select" name="model"></select>
+      </label>
+      <button type="button" id="selection-refresh" class="secondary">Refresh list</button>
+      <p class="models-note" id="selection-note" role="status" aria-live="polite" hidden></p>
+    </div>
     <div class="models" id="models">
       <!--
         The model-health indicator lives here, drawn by health.js from

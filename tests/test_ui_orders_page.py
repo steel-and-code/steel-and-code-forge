@@ -77,6 +77,7 @@ from forge.ui.orders import OrderStore
 from forge.ui.runner import runtime_factory
 from forge.ui.security import UiToken
 from forge.ui.session import WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 STATIC = REPO / "forge" / "ui" / "static"
@@ -386,7 +387,7 @@ def _served_page() -> str:
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace, profile=BYTE, gateway=model, model_id="scripted"
         ),

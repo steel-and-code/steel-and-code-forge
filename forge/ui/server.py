@@ -137,6 +137,7 @@ from .security import (
     check_same_origin,
 )
 from .models import HealthUnavailable, ModelHealth
+from .selector import ModelSelection, ModelSelector
 from .orders import (
     InvalidOrder,
     OrderStore,
@@ -248,6 +249,20 @@ class RunHermesRequest(BaseModel):
     """
 
     task: str = Field(min_length=1, max_length=8000)
+
+
+class SelectionRequest(BaseModel):
+    """``POST /api/selection`` body.
+
+    ``provider`` and ``model`` travel together as one binding, so a request
+    cannot name a model without naming the provider that serves it. Validated
+    against :data:`forge.ui.selector.PROVIDERS` by the selector itself, which is
+    the single place the provider vocabulary lives -- the route does not keep a
+    second copy that could drift from it.
+    """
+
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
 
 
 class ApprovalRequestBody(BaseModel):
@@ -394,6 +409,9 @@ def create_app(
     app.state.model_health = (
         health if health is not None else ModelHealth(None)
     )
+    #: The selector is owned by the session; exposed here so a test can assert
+    #: the selection routes act on the same instance the runs read.
+    app.state.model_selector = session.selector
     # The board is derived from the workspace, never from a request. Exposed on
     # app.state for the same reason the ticket store is: a test asserts against
     # the store the routes actually use.
@@ -776,6 +794,84 @@ def create_app(
             return JSONResponse({"detail": str(unavailable)}, status_code=503)
 
         return JSONResponse(body)
+
+    @app.get("/api/selection")
+    async def api_selection(
+        request: Request, _: None = Depends(guarded_read)
+    ) -> JSONResponse:
+        """The current model selection and the per-provider model catalog.
+
+        Strictly read-only, like ``GET /api/models``: it returns the selector's
+        cached state (`selected`, `providers`, `available`) and never probes. The
+        catalog only changes on ``POST /api/selection/refresh``, so a page load
+        or a refresh cannot contact a provider or present a credential.
+        """
+        selector: ModelSelector = app.state.model_selector
+        return JSONResponse(selector.snapshot())
+
+    @app.post("/api/selection")
+    async def api_set_selection(
+        body: SelectionRequest, request: Request, _: None = Depends(guarded)
+    ) -> JSONResponse:
+        """Bind a provider and model for the *next* run.
+
+        A command, so it takes the strict exact-Origin and token guards, and it
+        is refused (409) while a run is in flight: the selection is sampled once,
+        at run start, so a change mid-run could never take effect and refusing
+        it is the honest answer rather than a silent no-op.
+
+        ``provider`` and ``model`` are applied together, never one without the
+        other, and the provider is validated against the selector's own
+        vocabulary (422 on an unknown provider). The response is the full
+        snapshot, so the page renders from the server's answer rather than from
+        what it hoped it sent.
+        """
+        if session.busy:
+            return JSONResponse(
+                {
+                    "detail": (
+                        "a run is in progress; change the model while the "
+                        "workbench is idle"
+                    )
+                },
+                status_code=409,
+            )
+
+        selector: ModelSelector = app.state.model_selector
+        try:
+            selector.set_selection(ModelSelection(body.provider, body.model))
+        except ValueError as invalid:
+            raise HTTPException(status_code=422, detail=str(invalid)) from invalid
+
+        return JSONResponse(selector.snapshot())
+
+    @app.post("/api/selection/refresh")
+    async def api_refresh_selection(
+        request: Request, _: None = Depends(guarded)
+    ) -> JSONResponse:
+        """Re-list each provider's available models.
+
+        A command like ``POST /api/models/verify``: it contacts providers and
+        presents credentials (the OpenRouter key, where set), and it refuses
+        (409) while a run is in flight for the same reason that route does. The
+        listing is bounded by the verifier layer's own timeout and never raises
+        for a provider-side failure -- an unavailable local provider is recorded
+        as ``available=False`` rather than substituted.
+        """
+        if session.busy:
+            return JSONResponse(
+                {
+                    "detail": (
+                        "a run is in progress; refresh the model list while the "
+                        "workbench is idle"
+                    )
+                },
+                status_code=409,
+            )
+
+        selector: ModelSelector = app.state.model_selector
+        await asyncio.to_thread(selector.refresh_catalog)
+        return JSONResponse(selector.snapshot())
 
     @app.post("/api/run")
     async def api_run(
