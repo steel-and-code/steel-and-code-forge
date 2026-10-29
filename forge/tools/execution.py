@@ -515,8 +515,11 @@ class Executor:
         """
         if not isinstance(outcome, ApprovalOutcome):
             return "not an ApprovalOutcome"
-        if outcome.decision is not ApprovalDecision.APPROVED:
-            return f"approval decision is {outcome.decision.value}, not approved"
+        if not outcome.decision.permitted:
+            return (
+                f"approval decision is {outcome.decision.value}, "
+                f"not a permitted approval"
+            )
         if outcome.request is None:
             return "approval carries no request"
         if outcome.request.is_shell_form:

@@ -43,6 +43,7 @@ from typing import Callable, Protocol, Sequence, runtime_checkable
 
 from .commands import CommandVerdict
 from .secrets import SecretVerdict
+from .session_grant import SessionGrant
 from .workspace import Classification, strictest
 
 __all__ = [
@@ -137,6 +138,7 @@ class ApprovalDecision(str, Enum):
     """
 
     APPROVED = "approved"
+    SESSION_AUTHORIZED = "session_authorized"
     REJECTED = "rejected"
     DENIED_BY_POLICY = "denied_by_policy"
     DENIED_UNATTENDED = "denied_unattended"
@@ -145,10 +147,14 @@ class ApprovalDecision(str, Enum):
     def permitted(self) -> bool:
         """Whether the operation may proceed.
 
-        Only :attr:`APPROVED`. A denial is not a permission, and an
-        unattended failure is not a permission.
+        :attr:`APPROVED` (a human) or :attr:`SESSION_AUTHORIZED` (a granted
+        session scope). A denial is not a permission, and an unattended
+        failure is not a permission.
         """
-        return self is ApprovalDecision.APPROVED
+        return self in (
+            ApprovalDecision.APPROVED,
+            ApprovalDecision.SESSION_AUTHORIZED,
+        )
 
     @property
     def human_decided(self) -> bool:
@@ -661,6 +667,10 @@ class ApprovalOutcome:
     detail: str
     request: ApprovalRequest | None = None
     operator_response: str | None = None
+    #: The granted session scope, when ``decision`` is
+    #: ``SESSION_AUTHORIZED``. ``None`` otherwise. Carried for the audit event,
+    #: never for the executor -- the executor's decision binding is unchanged.
+    scope: str | None = None
 
     # The single-spend state. `repr=False` and `compare=False` keep it out of
     # reprs and equality; the field is private and read only through
@@ -760,6 +770,8 @@ class ApprovalOutcome:
         }
         if self.operator_response is not None:
             body["operator_response"] = self.operator_response
+        if self.scope is not None:
+            body["scope"] = self.scope
         if self.request is not None:
             body["request"] = self.request.to_public_dict()
         return body
@@ -907,8 +919,18 @@ class Approver:
             ``DENIED_UNATTENDED`` for anything approval-required.
     """
 
-    def __init__(self, channel: ApprovalChannel | None = None) -> None:
+    def __init__(
+        self,
+        channel: ApprovalChannel | None = None,
+        *,
+        grant: SessionGrant | None = None,
+    ) -> None:
         self.channel = channel
+        #: The session grant, or ``None`` (today's exact behaviour). Held
+        #: statelessness-exception: a grant is opt-in, bounded, and never
+        #: widened by this class -- it is consulted only for an
+        #: approval-required command, and only after DENY and ALLOW are settled.
+        self.grant = grant
 
     # -- routing --------------------------------------------------------
 
@@ -1060,6 +1082,30 @@ class Approver:
                 detail="classification allowed this operation; no approval needed",
                 request=request,
             )
+
+        # A session grant is consulted only here: after DENY and ALLOW are
+        # settled, and only for a command-shaped request. A secret-source
+        # request has no program and is never a candidate; a denial has already
+        # returned. The grant can therefore only ever downgrade an ordinary
+        # approval-required prompt -- never a refusal, never a secret gate.
+        if self.grant is not None and request.executable_bindable:
+            authorization = self.grant.authorize(
+                rule=request.rule,
+                program=request.program,
+                args=tuple(request.args or ()),
+                is_shell=request.is_shell_form,
+            )
+            if authorization is not None:
+                return ApprovalOutcome(
+                    decision=ApprovalDecision.SESSION_AUTHORIZED,
+                    detail=(
+                        f"authorized by session scope '{authorization.scope.value}' "
+                        f"for rule {authorization.rule}; a human was not consulted "
+                        f"and the authorization is recorded"
+                    ),
+                    request=request,
+                    scope=authorization.scope.value,
+                )
 
         if self.channel is None or not self.channel.available:
             return ApprovalOutcome(

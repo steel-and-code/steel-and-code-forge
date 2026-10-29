@@ -132,6 +132,7 @@
     composer: document.getElementById("composer"),
     task: document.getElementById("task"),
     runMode: document.getElementById("run-mode"),
+    sessionTests: document.getElementById("session-tests"),
     send: document.getElementById("send"),
     newConversation: document.getElementById("new-conversation"),
     overlay: document.getElementById("approval-overlay"),
@@ -1021,11 +1022,20 @@
 
   function submit(task) {
     el.send.disabled = true;
-    var endpoint = agentMode() === "hermes" ? "/api/run-hermes" : "/api/run";
+    var mode = agentMode();
+    var endpoint = mode === "hermes" ? "/api/run-hermes" : "/api/run";
+    // The session-tests opt-in is read once, at send time, and only for the
+    // Byte path -- the Hermes (text-only) child runs under a fixed profile and
+    // takes no grant. The value is never stored; it is cleared below once the
+    // run is accepted, so the box defaults unchecked for the next run.
+    var payload = { task: task };
+    if (mode !== "hermes") {
+      payload.session_tests = !!(el.sessionTests && el.sessionTests.checked);
+    }
     guardedFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: task }),
+      body: JSON.stringify(payload),
     })
       .then(function (response) {
         if (response.status === 409) {
@@ -1045,6 +1055,10 @@
       })
       .then(function (body) {
         if (body && body.run_id) {
+          // The opt-in was spent building this run's grant; return the box to
+          // unchecked so the next run starts from the default. A refused run
+          // (409) does not reach here, so a retry keeps the operator's choice.
+          if (el.sessionTests) el.sessionTests.checked = false;
           addMessage("system", "Run " + body.run_id.slice(0, 8) + " accepted.");
           setState("running");
           // Deliberately left disabled for the rest of the run: one process
