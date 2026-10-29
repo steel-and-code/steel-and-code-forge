@@ -211,6 +211,15 @@ class LocalLlamaGateway:
     ) -> None:
         env = os.environ if environ is None else environ
 
+        think_setting = env.get("FORGE_LOCAL_THINK", "").strip().lower()
+        if think_setting not in ("", "true", "false"):
+            raise LocalConfigurationError(
+                "FORGE_LOCAL_THINK must be true or false"
+            )
+        self._think = (
+            None if think_setting == "" else think_setting == "true"
+        )
+
         self._endpoint = (
             endpoint
             if endpoint is not _UNSET
@@ -241,6 +250,8 @@ class LocalLlamaGateway:
 
     def complete(self, request: CompletionRequest) -> ModelResponse:
         payload = self._build_payload(request)
+        if self._think is not None:
+            payload["think"] = self._think
 
         try:
             body = json.dumps(payload).encode("utf-8")

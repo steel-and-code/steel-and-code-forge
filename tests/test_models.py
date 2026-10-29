@@ -1587,3 +1587,65 @@ def test_gateway_and_verifier_read_same_environment() -> None:
 
     assert gateway.endpoint == "http://127.0.0.1:8080/v1/chat/completions"
     assert verifier.endpoint == "http://127.0.0.1:11434/v1/models"
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ("true", True),
+        ("false", False),
+        ("", None),
+    ],
+)
+def test_local_gateway_thinking_payload(
+    monkeypatch, setting, expected
+):
+    import json
+    import forge.models.local as local_module
+    from forge.models.local import LocalLlamaGateway
+
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return json.dumps({
+                "choices": [{
+                    "message": {"content": "OK"},
+                    "finish_reason": "stop",
+                }]
+            }).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        captured.update(json.loads(request.data))
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        local_module.urllib.request,
+        "urlopen",
+        fake_urlopen,
+    )
+
+    gateway = LocalLlamaGateway(
+        environ={"FORGE_LOCAL_THINK": setting}
+    )
+
+    gateway.complete(
+        CompletionRequest(
+            system="test",
+            messages=(),
+            model="qwen3.5:9b",
+        )
+    )
+
+    if expected is None:
+        assert "think" not in captured
+    else:
+        assert captured["think"] is expected

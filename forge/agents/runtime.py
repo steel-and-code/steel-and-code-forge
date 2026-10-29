@@ -78,7 +78,7 @@ __all__ = [
 #: tests" -- plausibly needs ten to twenty tool calls, so this leaves headroom
 #: without permitting a runaway. Configurable *downward* per run; a profile may
 #: not raise it.
-MAX_TOOL_TURNS = 25
+MAX_TOOL_TURNS = 75
 
 
 class MaxTurnsExceeded(RuntimeError):
