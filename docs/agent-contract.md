@@ -778,7 +778,7 @@ future improvement.
 
 A model round-trip is one turn. A response carrying five parallel tool calls
 costs one turn, because the round-trip is what costs tokens. The bound is
-`MAX_TOOL_TURNS = 25`, configurable **downward** per run and by profile; a
+`MAX_TOOL_TURNS = 75`, configurable **downward** per run and by profile; a
 caller may lower it and never raise it past the constant.
 
 **A cached denial still consumes a turn.** The cache prevents repeated classifier

@@ -193,6 +193,16 @@ def test_max_turns_is_configurable_downward_only(dispatcher_factory) -> None:
     assert attempted.max_turns == MAX_TOOL_TURNS
 
 
+def test_max_tool_turns_constant_is_seventy_five() -> None:
+    """Byte's recovered ceiling is 75 round-trips, not the old 25.
+
+    Pinned explicitly so a future edit that silently drops or grows the ceiling
+    fails here: 75 is a recovered, intentional figure -- the ability to lower it
+    is covered separately by ``test_max_turns_is_configurable_downward_only``.
+    """
+    assert MAX_TOOL_TURNS == 75
+
+
 def test_gateway_failure_propagates_rather_than_ending_the_run(dispatcher_factory) -> None:
     """A provider failure raises. It is not the model's to recover from."""
     dispatcher, _ = dispatcher_factory()
