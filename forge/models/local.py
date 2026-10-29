@@ -36,6 +36,7 @@ from .base import (
     CompletionRequest,
     ContextTooLarge,
     GatewayError,
+    ModelListing,
     ModelResponse,
     ToolCall,
     Usage,
@@ -1040,6 +1041,48 @@ class LocalLlamaVerifier:
             ),
             detail=type(reason).__name__,
         )
+
+    def list_models(self) -> ModelListing:
+        """The model ids the local endpoint is serving, or why that is unknown.
+
+        Distinct from :meth:`verify`: a listing asks "what models does this
+        provider offer", not "is this one model usable". It is the method the
+        Workbench model selector reads to populate its per-provider model list,
+        and it reuses the same ``/v1/models`` GET and the same parse as
+        verification -- one listing shape, one endpoint configuration, two
+        questions asked of it.
+
+        Never raises for a provider-side failure. An unreachable endpoint, a
+        non-200 status, and an unparseable listing are all a
+        :class:`~forge.models.base.ModelListing` with ``available=False`` and a
+        short reason, because an unavailable local service is a fact the
+        selector must surface, not an exception to catch.
+        """
+        try:
+            status, text = self._get(self._endpoint, self._timeout)
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code)
+            text = ""
+        except (socket.timeout, TimeoutError):
+            return ModelListing(provider="local", available=False, error="timeout")
+        except (urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            return ModelListing(
+                provider="local", available=False, error=type(reason).__name__
+            )
+
+        if status != 200:
+            return ModelListing(
+                provider="local", available=False, error=f"http {status}"
+            )
+
+        ids, malformed = _parse_local_listing(text)
+        if malformed:
+            return ModelListing(
+                provider="local", available=False, error="unparseable listing"
+            )
+
+        return ModelListing(provider="local", models=tuple(sorted(ids)), available=True)
 
 
 def _parse_local_listing(text: str) -> tuple[frozenset[str], str]:

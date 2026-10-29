@@ -55,6 +55,7 @@ from forge.tools.execution import Executor
 from forge.tools.workspace import Workspace
 from forge.ui.runner import runtime_factory
 from forge.ui.session import WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP_JS = REPO / "forge" / "ui" / "static" / "app.js"
@@ -627,7 +628,7 @@ def _session(tmp_path: pathlib.Path, turns: list[ScriptedTurn]) -> WorkbenchSess
     return WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace,
             profile=BYTE,

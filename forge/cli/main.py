@@ -1397,11 +1397,14 @@ def _build_model_gateway(
     provider is ``local`` must be served by the local gateway even when
     ``$FORGE_MODEL_PROVIDER`` says otherwise. ``None`` keeps the old behaviour of
     reading the environment, which is still what an operator override uses.
+
+    The provider -> gateway mapping itself lives in
+    :func:`forge.models.providers.build_gateway`, the single construction site
+    shared with the Workbench selector, so ``"local"`` can never be paired with
+    the OpenRouter gateway in one surface and the local gateway in another.
     """
 
-    from ..models.base import GatewayError
-    from ..models.local import LocalLlamaGateway
-    from ..models.openrouter import OpenRouterGateway
+    from ..models.providers import build_gateway
 
     if provider is None:
         provider = (
@@ -1410,19 +1413,7 @@ def _build_model_gateway(
             .lower()
         )
 
-    if provider == "local":
-        # ``environ`` is the same injected mapping OpenRouter reads, so the
-        # local timeout is configured the same way and no test has to mutate
-        # the process environment to exercise either gateway.
-        return LocalLlamaGateway(environ=environ)
-
-    if provider == "openrouter":
-        return OpenRouterGateway(environ=environ)
-
-    raise GatewayError(
-        f"unknown model provider {provider!r}; "
-        "expected 'openrouter' or 'local'"
-    )
+    return build_gateway(provider, environ)
 
 def _run_agent(
     args: argparse.Namespace,
@@ -1650,7 +1641,8 @@ def _run_workbench(
     from ..ui import UiUnavailable
     from ..ui.broker import SseBroker
     from ..ui.models import ModelHealth
-    from ..ui.runner import build_hermes_runner, runtime_factory
+    from ..ui.runner import build_hermes_runner, selectable_runtime_factory
+    from ..ui.selector import ModelSelection, ModelSelector
     from ..ui.security import (
         InvalidLanAddress,
         LanConfig,
@@ -1713,10 +1705,19 @@ def _run_workbench(
 
     model_id = resolved.model_id
 
+    # The selector is the Workbench's single source of truth for which
+    # (provider, model) the next run will use. It starts on the CLI's resolved
+    # pair, and the page can change it between runs. The gateway is no longer
+    # fixed here: the selector resolves it per run, from the provider, via the
+    # one shared build_gateway -- so a local model can never reach OpenRouter.
+    selector = ModelSelector(environ, ModelSelection(resolved.provider, resolved.model_id))
+
     # The credential is read here, in this process, from the injected mapping.
     # It is never threaded into the session, the broker, the app, or a response
     # body -- a page that can read the provider key is a page that can spend the
-    # operator's money.
+    # operator's money. The initial gateway still passes through the resolver so
+    # a missing credential or an unknown provider fails at startup, before any
+    # socket is bound.
     try:
         gateway = _build_model_gateway(environ, provider=resolved.provider)
     except GatewayError as exc:
@@ -1737,12 +1738,11 @@ def _run_workbench(
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id=model_id,
-        runtime_factory=runtime_factory(
+        selector=selector,
+        runtime_factory=selectable_runtime_factory(
             workspace,
             profile=BYTE,
-            gateway=gateway,
-            model_id=model_id,
+            selector=selector,
         ),
         broker=broker,
         # The external-Hermes path. Wired here because the route exists only
@@ -1750,6 +1750,19 @@ def _run_workbench(
         # refuses at request time rather than silently doing nothing.
         hermes_runner=build_hermes_runner(workspace),
     )
+
+    # Populate the per-provider model catalog once, before serving, so the
+    # first page load already has model lists to offer. A failure is not fatal:
+    # an unavailable provider is a reported ``available=False`` in the catalog,
+    # and the selector surfaces it rather than substituting anything.
+    try:
+        selector.refresh_catalog()
+    except Exception as exc:  # noqa: BLE001 - startup must still serve
+        print(
+            f"forge: model list could not be fetched ({exc}); the selector "
+            "will show the configured default",
+            file=out,
+        )
 
     # The health snapshot comes from the same resolution order `forge route` and
     # `forge models status` use -- `load_registry` reads `$FORGE_MODELS_CONFIG`,

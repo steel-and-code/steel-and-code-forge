@@ -115,7 +115,12 @@
   var el = {
     workspace: document.getElementById("workspace"),
     agent: document.getElementById("agent"),
+    provider: document.getElementById("provider"),
     model: document.getElementById("model"),
+    providerSelect: document.getElementById("provider-select"),
+    modelSelect: document.getElementById("model-select"),
+    selectionRefresh: document.getElementById("selection-refresh"),
+    selectionNote: document.getElementById("selection-note"),
     stateChip: document.getElementById("state-chip"),
     stateLabel: document.getElementById("state-label"),
     models: document.getElementById("models"),
@@ -724,6 +729,7 @@
       .then(function (status) {
         el.workspace.textContent = status.workspace || "—";
         el.agent.textContent = status.agent || "—";
+        if (el.provider) el.provider.textContent = status.provider || "—";
         el.model.textContent = status.model || "—";
         setState(status.state);
         renderRunStatus(status);
@@ -921,6 +927,214 @@
         el.modelsRecheck.textContent = "Re-check models";
         return result;
       });
+  }
+
+  // -- model selection ----------------------------------------------------
+  //
+  // Provider and model are ONE binding on the server. This section reads the
+  // cached catalog (GET /api/selection, read-only) to fill the two selects, and
+  // posts the pair together (POST /api/selection) when either control changes.
+  // It holds no state of its own: every value is the server's, a refresh
+  // re-reads it, and a change mid-run is refused by the server (409) rather
+  // than silently dropped.
+
+  var PROVIDER_LABELS = {
+    local: "Local (Space Monkey)",
+    openrouter: "OpenRouter",
+  };
+
+  var selectionSnapshot = null;
+
+  function showSelectionNote(message) {
+    if (!el.selectionNote) return;
+    if (!message) {
+      el.selectionNote.hidden = true;
+      el.selectionNote.textContent = "";
+      return;
+    }
+    el.selectionNote.textContent = message;
+    el.selectionNote.hidden = false;
+  }
+
+  function fillProviderSelect(providers) {
+    var select = el.providerSelect;
+    if (!select) return;
+    while (select.firstChild) select.removeChild(select.firstChild);
+    (providers || []).forEach(function (provider) {
+      var option = document.createElement("option");
+      option.value = provider;
+      option.textContent = PROVIDER_LABELS[provider] || provider;
+      select.appendChild(option);
+    });
+  }
+
+  function fillModelSelect(models) {
+    var select = el.modelSelect;
+    if (!select) return;
+    while (select.firstChild) select.removeChild(select.firstChild);
+    (models || []).forEach(function (model) {
+      var option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      select.appendChild(option);
+    });
+  }
+
+  /* Render the whole selector from one /api/selection payload. */
+  function renderSelection(snapshot) {
+    if (!snapshot) return;
+    selectionSnapshot = snapshot;
+    var selected = snapshot.selected || {};
+    var available = snapshot.available || {};
+
+    fillProviderSelect(snapshot.providers || []);
+
+    var listing = available[selected.provider];
+    fillModelSelect(listing ? listing.models : []);
+
+    if (el.providerSelect && selected.provider) {
+      el.providerSelect.value = selected.provider;
+    }
+    if (el.modelSelect && selected.model) {
+      el.modelSelect.value = selected.model;
+    }
+
+    // An unavailable local provider is an error, never a silent fallback to
+    // the paid host: the note says so and the selection stays put.
+    if (listing && !listing.available) {
+      showSelectionNote(
+        (PROVIDER_LABELS[selected.provider] || selected.provider) +
+          " unavailable: " + (listing.error || "no response") +
+          ". No fallback — pick another provider."
+      );
+    } else if (!listing) {
+      showSelectionNote("Model list not loaded — Refresh list.");
+    } else if (!listing.models || !listing.models.length) {
+      showSelectionNote("No models listed for this provider — Refresh list.");
+    } else {
+      showSelectionNote("");
+    }
+
+    // The header facts render the same selection from the server, so the
+    // controls and the header cannot disagree.
+    if (selected.provider && el.provider) el.provider.textContent = selected.provider;
+    if (selected.model && el.model) el.model.textContent = selected.model;
+  }
+
+  function readSelection() {
+    // The selector only exists when the page ships the provider/model controls
+    // (index.html does). A page built before this feature -- or a test probe
+    // whose DOM stubs the old header -- simply has no selection to read, and
+    // firing the request anyway would be a fetch nothing renders.
+    if (!el.providerSelect || !el.modelSelect) return Promise.resolve();
+    return guardedFetch("/api/selection")
+      .then(function (response) {
+        if (!response.ok) throw new Error("selection " + response.status);
+        return response.json();
+      })
+      .then(renderSelection)
+      .catch(function (error) {
+        showSelectionNote("Could not read the model selection: " + error.message);
+      });
+  }
+
+  /* Post the (provider, model) pair together. */
+  function bindSelection() {
+    var provider = el.providerSelect && el.providerSelect.value;
+    var model = el.modelSelect && el.modelSelect.value;
+    if (!provider || !model) return;
+
+    return guardedFetch("/api/selection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: provider, model: model }),
+    })
+      .then(function (response) {
+        if (response.status === 409 || response.status === 422) {
+          return response.json().then(function (body) {
+            showSelectionNote(
+              (response.status === 409 ? "Not changed" : "Rejected") +
+                ": " + (body.detail || "invalid selection.")
+            );
+            return readSelection();
+          });
+        }
+        if (!response.ok) throw new Error("selection " + response.status);
+        return response.json();
+      })
+      .then(function (snapshot) {
+        if (snapshot) renderSelection(snapshot);
+        refreshStatus();
+      })
+      .catch(function (error) {
+        showSelectionNote("Could not change the model: " + error.message);
+      });
+  }
+
+  function selectionOnProviderChange() {
+    var provider = el.providerSelect && el.providerSelect.value;
+    if (!provider) return;
+    var listing =
+      selectionSnapshot && (selectionSnapshot.available || {})[provider];
+
+    fillModelSelect(listing ? listing.models : []);
+
+    if (listing && listing.available && listing.models && listing.models.length) {
+      var current = el.modelSelect.value;
+      if (current && listing.models.indexOf(current) >= 0) {
+        el.modelSelect.value = current;
+      } else {
+        el.modelSelect.value = listing.models[0];
+      }
+      bindSelection();
+    } else if (listing && !listing.available) {
+      showSelectionNote(
+        (PROVIDER_LABELS[provider] || provider) + " unavailable: " +
+          (listing.error || "no response") + ". No fallback — pick another provider."
+      );
+    } else {
+      showSelectionNote(
+        "No models listed for " + (PROVIDER_LABELS[provider] || provider) +
+          " — Refresh list."
+      );
+    }
+  }
+
+  function refreshSelectionList() {
+    if (el.selectionRefresh) el.selectionRefresh.disabled = true;
+    return guardedFetch("/api/selection/refresh", { method: "POST" })
+      .then(function (response) {
+        if (response.status === 409) {
+          return response.json().then(function (body) {
+            showSelectionNote(
+              "Not refreshed: " + (body.detail || "a run is in progress.")
+            );
+            return null;
+          });
+        }
+        if (!response.ok) throw new Error("refresh " + response.status);
+        return response.json();
+      })
+      .then(function (snapshot) {
+        if (snapshot) renderSelection(snapshot);
+        return snapshot;
+      })
+      .catch(function (error) {
+        showSelectionNote("Could not refresh the model list: " + error.message);
+      })
+      .then(function () {
+        if (el.selectionRefresh) el.selectionRefresh.disabled = false;
+      });
+  }
+
+  if (el.providerSelect) {
+    el.providerSelect.addEventListener("change", selectionOnProviderChange);
+  }
+  if (el.modelSelect) {
+    el.modelSelect.addEventListener("change", bindSelection);
+  }
+  if (el.selectionRefresh) {
+    el.selectionRefresh.addEventListener("click", refreshSelectionList);
   }
 
   function resetConversation() {
@@ -1691,6 +1905,9 @@
   // when the operator asks for it, so re-fetching on a timer would be a request
   // that can only ever return the same answer.
   refreshModels();
+  // The selection catalog is also read once, on load. It is the cached
+  // listing, not a probe: GET /api/selection never contacts a provider.
+  readSelection();
 
   // A reconnection after the tab was backgrounded: the stream may have been
   // dropped, and the server may have moved on. Asking is cheap and keeps the
@@ -1698,10 +1915,12 @@
   //
   // The health refresh here re-reads the *cached* snapshot. It must never
   // re-check: a tab left open in the background would otherwise send a
-  // credential-bearing request every time it was focused.
+  // credential-bearing request every time it was focused. The selection read
+  // is cached for the same reason.
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) return;
     refreshStatus();
     refreshModels();
+    readSelection();
   });
 })();

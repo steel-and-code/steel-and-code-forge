@@ -33,6 +33,7 @@ from forge.ui.runner import build_hermes_runner, runtime_factory
 from forge.ui.security import TOKEN_HEADER, UiToken
 from forge.ui.server import create_app
 from forge.ui.session import WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 PORT = 8765
 ORIGIN = f"http://127.0.0.1:{PORT}"
@@ -79,7 +80,7 @@ class HermesHarness:
         self.session = WorkbenchSession(
             workspace=workspace,
             profile=BYTE,
-            model_id="scripted",
+            selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
             runtime_factory=runtime_factory(
                 workspace, profile=BYTE, gateway=self.model, model_id="scripted"
             ),

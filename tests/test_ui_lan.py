@@ -56,6 +56,7 @@ from forge.ui.security import (
 )
 from forge.ui.server import LOCKED_PLACEHOLDER, STATIC_DIR, create_app
 from forge.ui.session import UiSessionState, WorkbenchSession
+from forge.ui.selector import ModelSelection, ModelSelector
 
 PORT = 8765
 LAN = "192.168.1.20"
@@ -89,7 +90,7 @@ class LanHarness:
         self.session = WorkbenchSession(
             workspace=workspace,
             profile=BYTE,
-            model_id="scripted",
+            selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
             runtime_factory=runtime_factory(
                 workspace, profile=BYTE, gateway=self.model, model_id="scripted"
             ),
@@ -341,7 +342,7 @@ def test_an_app_with_lan_and_no_passphrase_refuses_to_build(
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace, profile=BYTE, gateway=ScriptedGateway([]), model_id="scripted"
         ),
@@ -440,7 +441,7 @@ def test_loopback_mode_has_no_host_check_at_all(workspace: Workspace) -> None:
     session = WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace, profile=BYTE, gateway=ScriptedGateway([]), model_id="scripted"
         ),
@@ -1261,7 +1262,7 @@ def _loopback_session(workspace: Workspace) -> WorkbenchSession:
     return WorkbenchSession(
         workspace=workspace,
         profile=BYTE,
-        model_id="scripted",
+        selector=ModelSelector({}, ModelSelection("openrouter", "scripted")),
         runtime_factory=runtime_factory(
             workspace, profile=BYTE, gateway=ScriptedGateway([]), model_id="scripted"
         ),

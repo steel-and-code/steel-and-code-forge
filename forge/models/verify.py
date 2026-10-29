@@ -44,7 +44,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .base import VerificationCode, VerificationResult
+from .base import ModelListing, VerificationCode, VerificationResult
 from .registry import Availability, ModelRegistry, ModelSlot
 
 __all__ = [
@@ -52,6 +52,7 @@ __all__ = [
     "VerificationRun",
     "verify_slots",
     "verified_registry",
+    "list_provider_models",
 ]
 
 #: The bound for a whole verification run's per-provider attempt. Chosen so a
@@ -289,3 +290,70 @@ def verified_registry(
     """
     run = verify_slots(registry, environ=environ, timeout=timeout)
     return registry.with_availability(run.availability())
+
+
+def list_provider_models(
+    provider: str,
+    *,
+    environ: Mapping[str, str],
+    timeout: float = VERIFY_TIMEOUT_SECONDS,
+) -> ModelListing:
+    """The models ``provider`` is serving, or why that cannot be determined.
+
+    The catalog seam the Workbench model selector reads to populate a
+    per-provider model list. It builds the provider's verifier -- the same
+    factory the health probe uses -- and asks for its listing rather than
+    checking one model id, so the endpoint configuration
+    (``FORGE_LOCAL_ENDPOINT`` and friends, or the OpenRouter listing URL) is
+    read from exactly the places verification already reads it.
+
+    Never raises for a provider-side failure, and tolerates a verifier that
+    cannot list: both come back as a :class:`~forge.models.base.ModelListing`
+    with ``available=False`` and a short reason. An unavailable provider is a
+    fact the selector surfaces, not an exception.
+
+    Args:
+        provider: The provider name (``"local"``, ``"openrouter"``, ...).
+        environ: The credential/configuration mapping, injected exactly as
+            verification injects it.
+        timeout: Seconds per attempt.
+    """
+    from .providers import ProviderCatalog
+
+    factory = ProviderCatalog.default().verifier_for(provider)
+    if factory is None:
+        return ModelListing(
+            provider=provider,
+            available=False,
+            error="no verification implementation",
+        )
+
+    try:
+        verifier = factory(environ)
+    except Exception as exc:  # noqa: BLE001 - a bad factory is a status, not a crash
+        return ModelListing(
+            provider=provider,
+            available=False,
+            error=f"verifier construction failed ({type(exc).__name__})",
+        )
+
+    lister = getattr(verifier, "list_models", None)
+    if not callable(lister):
+        return ModelListing(
+            provider=provider,
+            available=False,
+            error="provider cannot list models",
+        )
+
+    try:
+        listing = lister()
+    except Exception as exc:  # noqa: BLE001 - a listing failure is a status
+        return ModelListing(
+            provider=provider,
+            available=False,
+            error=type(exc).__name__,
+        )
+
+    return listing if isinstance(listing, ModelListing) else ModelListing(
+        provider=provider, available=False, error="unexpected listing result"
+    )
