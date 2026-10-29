@@ -247,6 +247,75 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        4,
+        (
+            # FORGE-14: checkpoints, external-operation records, and the
+            # lifetime attempt counter. Additive only (no ALTER of existing
+            # tables), so a v1..v3 database upgrades in place. checkpoints is
+            # the append-only step-level progress trace; external_ops is the
+            # authoritative per-operation side-effect record (PENDING is written
+            # before dispatch); attempt_state holds the monotonic lifetime retry
+            # counter; op_resolutions is the append-only operator-decision audit.
+            """
+            CREATE TABLE checkpoints (
+                job_id            TEXT NOT NULL,
+                seq               INTEGER NOT NULL,
+                attempt           INTEGER NOT NULL,
+                kind              TEXT NOT NULL,
+                step_id           TEXT NOT NULL,
+                side_effect_class TEXT,
+                idempotency_key   TEXT,
+                outcome           TEXT,
+                evidence          TEXT,
+                generation        INTEGER NOT NULL,
+                created_at        REAL NOT NULL,
+                PRIMARY KEY (job_id, seq)
+            )
+            """,
+            """
+            CREATE TABLE external_ops (
+                op_key            TEXT PRIMARY KEY,
+                job_id            TEXT NOT NULL,
+                step_id           TEXT NOT NULL,
+                op_kind           TEXT NOT NULL,
+                side_effect_class TEXT NOT NULL,
+                idempotency_key   TEXT,
+                state             TEXT NOT NULL,
+                evidence          TEXT,
+                attempt           INTEGER NOT NULL,
+                generation        INTEGER NOT NULL,
+                created_at        REAL NOT NULL,
+                updated_at        REAL NOT NULL
+            )
+            """,
+            "CREATE INDEX ix_external_ops_job_id ON external_ops (job_id)",
+            """
+            CREATE TABLE attempt_state (
+                job_id          TEXT PRIMARY KEY,
+                attempt         INTEGER NOT NULL DEFAULT 0,
+                failure_class   TEXT,
+                next_retry_at   REAL,
+                backoff_sec     REAL,
+                terminal_kind   TEXT,
+                updated_at      REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE op_resolutions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_key         TEXT NOT NULL,
+                job_id         TEXT NOT NULL,
+                resolution     TEXT NOT NULL,
+                actor_identity TEXT NOT NULL,
+                actor_role     TEXT NOT NULL,
+                reason         TEXT NOT NULL,
+                at             REAL NOT NULL
+            )
+            """,
+            "CREATE INDEX ix_op_resolutions_job_id ON op_resolutions (job_id)",
+        ),
+    ),
 )
 
 #: The current schema version. Kept equal to ``MIGRATIONS[-1][0]``; a change to
