@@ -136,6 +136,7 @@ from .security import (
     check_origin,
     check_same_origin,
 )
+from .jira_board import JiraBoard
 from .models import HealthUnavailable, ModelHealth
 from .orders import (
     InvalidOrder,
@@ -288,6 +289,7 @@ def create_app(
     port: int,
     health: ModelHealth | None = None,
     orders: OrderStore | None = None,
+    jira_board: JiraBoard | None = None,
     lan: LanConfig | None = None,
     passphrase: Passphrase | None = None,
 ) -> FastAPI:
@@ -312,6 +314,11 @@ def create_app(
             so no caller can aim the board at a directory outside the run's
             workspace root -- the same reason the root itself is not a request
             parameter. A test passes one to keep orders in a directory it owns.
+        jira_board: The read-only Jira projection the Jira board reads. Optional,
+            and built lazily from the environment when not given, so a surface
+            with no Jira configuration still serves and reports why. Injected for
+            the same reason ``health`` is: a test must be able to drive the route
+            without a credential or a socket.
         lan: LAN mode. ``None`` -- the default, and every existing caller --
             means loopback, with no Host check, no passphrase, and no unlock
             route. Present means bind-and-serve was already arranged by the CLI
@@ -391,6 +398,19 @@ def create_app(
     # app.state for the same reason the ticket store is: a test asserts against
     # the store the routes actually use.
     app.state.orders = orders if orders is not None else OrderStore(workspace.root)
+    # Unlike the board, the Jira projection is never derived from the workspace:
+    # it has no directory to live in. With no board supplied the surface reports
+    # the absence honestly rather than reading os.environ here, which is the same
+    # ruling that makes `health` default to an empty ModelHealth rather than a
+    # registry built from the process environment.
+    def _no_jira_board():
+        raise JiraBoardError(
+            "not_configured",
+            "Jira board is not configured.",
+        )
+    app.state.jira_board = (
+        jira_board if jira_board is not None else JiraBoard(loader=_no_jira_board)
+    )
 
     # -- guards ---------------------------------------------------------
 
