@@ -122,6 +122,23 @@ def _session(
     )
 
 
+def _done(summary: str, *, validation: str = "verified", limitations: str = "none") -> ScriptedTurn:
+    """A scripted turn declaring the run done with the given summary."""
+    return ScriptedTurn(
+        tool_calls=(
+            (
+                "finish",
+                {
+                    "status": "done",
+                    "summary": summary,
+                    "validation": validation,
+                    "limitations": limitations,
+                },
+            ),
+        )
+    )
+
+
 def _wait_for(predicate, timeout: float = 5.0) -> bool:
     """Poll ``predicate`` until true or ``timeout`` elapses.
 
@@ -661,10 +678,10 @@ def test_an_exhausted_turn_budget_is_reported_as_failed(workspace: Workspace) ->
 def test_a_run_returns_to_a_terminal_state_and_accepts_another(
     workspace: Workspace,
 ) -> None:
-    session = _session(workspace, [ScriptedTurn(text="one"), ScriptedTurn(text="two")])
+    session = _session(workspace, [_done("one"), _done("two")])
     first_id = session.submit("first")
     assert _wait_for(lambda: session.state is UiSessionState.COMPLETED)
-    assert session.status()["result"]["text"] == "one"
+    assert "one" in session.status()["result"]["text"]
 
     second_id = session.submit("second")
     assert second_id != first_id
@@ -672,7 +689,7 @@ def test_a_run_returns_to_a_terminal_state_and_accepts_another(
     status = session.status()
     assert status["run_id"] == second_id
     assert status["state"] == "completed"
-    assert status["result"]["text"] == "two"
+    assert "two" in status["result"]["text"]
 
 
 def test_status_reports_the_fixed_workspace(workspace: Workspace) -> None:
@@ -692,7 +709,7 @@ def test_status_reports_truthful_run_observables(workspace: Workspace) -> None:
                 text="done",
                 tool_calls=(("search_files", {"pattern": "*.py"}),),
             ),
-            ScriptedTurn(text="final"),
+            _done("final"),
         ],
         max_turns=4,
     )
@@ -701,7 +718,7 @@ def test_status_reports_truthful_run_observables(workspace: Workspace) -> None:
     status = session.status()
     assert status["max_turns"] == 4
     assert status["turns"] == 2
-    assert status["tool_calls"] == 1
+    assert status["tool_calls"] == 2  # search_files, then the finish declaration
     assert status["activity"] == "Completed"
     assert isinstance(status["elapsed_seconds"], int)
     assert isinstance(status["no_activity_seconds"], int)

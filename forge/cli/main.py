@@ -60,6 +60,7 @@ from ..models.router import ModelRouter
 from ..tools.workspace import Classification, Workspace
 from . import render
 from .render import (
+    EXIT_INCOMPLETE,
     EXIT_INTERNAL,
     EXIT_MODEL_UNAVAILABLE,
     EXIT_NEEDS_APPROVAL,
@@ -1445,7 +1446,7 @@ def _run_agent(
     make it.
     """
     from ..agents.registry import system_prompt_for
-    from ..agents.runtime import AgentRuntime, MaxTurnsExceeded, summarise
+    from ..agents.runtime import AgentRuntime, Completion, MaxTurnsExceeded, summarise
     from ..models.base import GatewayError
     from ..tools.dispatcher import ToolDispatcher
     from ..tools.execution import Executor
@@ -1535,7 +1536,9 @@ def _run_agent(
     print(summarise(result), file=out)
     print("", file=out)
     print(result.text, file=out)
-    return EXIT_OK
+    if result.completion is Completion.DONE:
+        return EXIT_OK
+    return EXIT_INCOMPLETE
 
 
 def _run_byte(

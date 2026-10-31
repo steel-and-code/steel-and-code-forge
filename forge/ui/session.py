@@ -67,6 +67,17 @@ from .selector import ModelSelector
 
 __all__ = ["UiSessionState", "WorkbenchSession", "SessionBusy", "RunSummary"]
 
+#: The activity label the status panel shows for each completion outcome, so a
+#: blocked or incomplete run reads distinctly from a finished one. The terminal
+#: ``UiSessionState`` stays ``COMPLETED`` -- the run *did* end normally -- while
+#: this label and the ``completion`` field on the status payload carry *how* it
+#: ended.
+_ACTIVITY_FOR_COMPLETION = {
+    "done": "Completed",
+    "blocked": "Blocked",
+    "incomplete": "Incomplete",
+}
+
 
 class UiSessionState(str, Enum):
     """The five states a Workbench session can be in.
@@ -120,6 +131,7 @@ class RunSummary:
     turns: int
     tool_calls: int
     denied: tuple[tuple[str, str], ...] = ()
+    completion: str = "incomplete"
 
 
 @dataclass
@@ -332,17 +344,23 @@ class WorkbenchSession:
             self._fail(record, f"{exc.__class__.__name__}: {exc}")
             return
 
+        # The runtime now reports *how* the run ended, not merely that it ended
+        # normally. A blocked or incomplete run is distinguishable from a done
+        # one everywhere it is shown.
+        completion = result.completion.value
+        activity = _ACTIVITY_FOR_COMPLETION.get(completion, "Completed")
         summary = RunSummary(
             text=result.text,
             turns=result.turns,
             tool_calls=result.tool_calls,
             denied=result.denied,
+            completion=completion,
         )
         with self._lock:
             record.summary = summary
             record.turns = result.turns
             record.tool_calls = result.tool_calls
-            record.activity = "Completed"
+            record.activity = activity
             record.finished_at = _now_iso()
         self._set_state(UiSessionState.COMPLETED)
 
@@ -520,6 +538,7 @@ class WorkbenchSession:
                 "text": record.summary.text,
                 "turns": record.summary.turns,
                 "tool_calls": record.summary.tool_calls,
+                "completion": record.summary.completion,
                 "denied": [
                     {"tool": tool, "detail": detail}
                     for tool, detail in record.summary.denied

@@ -71,10 +71,21 @@ __all__ = [
     "ToolResult",
     "ToolImpl",
     "ToolDispatcher",
+    "FINISH_TOOL",
     "MAX_READ_LINE_LIMITS",
     "MAX_SEARCH_RESULTS",
     "MAX_WRITE_BYTES",
 ]
+
+
+#: The name of the completion-declaration tool. It is the one structured way a
+#: model ends a run: calling it with ``status="done"`` or ``status="blocked"``
+#: declares the outcome, and the runtime turns that declaration into a terminal
+#: ``RunResult``. Every other tool leaves the run open, so a narration that
+#: never names a tool cannot silently finish. It lives here, next to the
+#: registry that serves it, because the dispatcher owns the tool set and the
+#: runtime reads the same name to recognise the call.
+FINISH_TOOL = "finish"
 
 
 class ToolStatus(str, Enum):
@@ -336,6 +347,52 @@ class ToolDispatcher:
                     "required": ["program"],
                 },
                 self._tool_exec_command,
+            ),
+            ToolImpl(
+                FINISH_TOOL,
+                (
+                    "Declare the run's outcome and end the run. Call exactly "
+                    "once, as your final action, to say the task is done or "
+                    "that it is blocked. The run does not end until you call "
+                    "this: writing prose about what you intend to do is not "
+                    "finishing."
+                ),
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "description": (
+                                "'done' if the task completed, 'blocked' if it "
+                                "cannot proceed."
+                            ),
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": (
+                                "What was completed, or what was attempted and "
+                                "found."
+                            ),
+                        },
+                        "validation": {
+                            "type": "string",
+                            "description": (
+                                "How the completed work was verified. Required "
+                                "for 'done'."
+                            ),
+                        },
+                        "limitations": {
+                            "type": "string",
+                            "description": (
+                                "What could not be done or verified, or what is "
+                                "needed to continue."
+                            ),
+                        },
+                    },
+                    "required": ["status", "summary"],
+                },
+                self._tool_finish,
+                requires_workspace=False,
             ),
         )
         return {impl.name: impl for impl in impls}
@@ -928,6 +985,67 @@ class ToolDispatcher:
                 "stderr_truncated": result.stderr_truncated,
             },
             detail=result.error or "",
+        )
+
+    def _tool_finish(
+        self,
+        status: str,
+        summary: str,
+        validation: str = "",
+        limitations: str = "",
+    ) -> ToolResult:
+        """Declare the outcome, ending the run.
+
+        Nothing executes and nothing is approved -- this is a declaration, not
+        an operation, so it never touches the classifier, the approver, or the
+        executor. The result is a value the runtime reads to build the terminal
+        ``RunResult``.
+
+        A ``status`` that is not ``done`` or ``blocked`` is a malformed call,
+        reported as ``invalid_arguments`` (retryable, like any other argument
+        error) rather than treated as a declaration. A ``done`` declaration
+        that omits how the work was verified, or what its limitations are, is
+        likewise refused rather than accepted as a complete report: requirement
+        3 of the completion protocol says a done outcome must identify completed
+        work, validation, and remaining limitations.
+        """
+        declared = str(status).strip().lower()
+        if declared not in ("done", "blocked"):
+            return ToolResult(
+                tool=FINISH_TOOL,
+                status=ToolStatus.INVALID_ARGUMENTS,
+                detail="status must be 'done' or 'blocked'",
+            )
+
+        if declared == "done":
+            missing = [
+                name
+                for name, value in (
+                    ("validation", validation),
+                    ("limitations", limitations),
+                )
+                if not (value or "").strip()
+            ]
+            if missing:
+                return ToolResult(
+                    tool=FINISH_TOOL,
+                    status=ToolStatus.INVALID_ARGUMENTS,
+                    detail=(
+                        f"a 'done' declaration must also state "
+                        f"{' and '.join(missing)}; say what you could not "
+                        "verify or did not do"
+                    ),
+                )
+
+        return ToolResult(
+            tool=FINISH_TOOL,
+            status=ToolStatus.OK,
+            content={
+                "status": declared,
+                "summary": summary,
+                "validation": validation,
+                "limitations": limitations,
+            },
         )
 
 

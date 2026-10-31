@@ -30,6 +30,7 @@ from forge.agents.profile import AgentProfile
 from forge.agents.runtime import (
     MAX_TOOL_TURNS,
     AgentRuntime,
+    Completion,
     MaxTurnsExceeded,
 )
 from forge.agents.state import ConversationStateStore
@@ -88,22 +89,145 @@ def _runtime(gateway: ScriptedGateway, dispatcher: ToolDispatcher, **kw) -> Agen
 # --------------------------------------------------------------------------
 
 
-def test_text_only_response_ends_the_run(dispatcher_factory) -> None:
-    """A model that answers immediately finishes after one turn."""
+def test_text_only_narration_does_not_report_success(dispatcher_factory) -> None:
+    """Prose without a declaration does not finish; the run ends INCOMPLETE.
+
+    This is the defect the completion protocol closes. A model that writes
+    "I will check whether Godot is installed" and then stops has signalled
+    nothing, so the runtime nudges it a bounded number of times and then ends
+    the run unfinished -- never as a done result.
+    """
     dispatcher, _ = dispatcher_factory()
-    gateway = ScriptedGateway([ScriptedTurn(text="Nothing to do.")])
+    gateway = ScriptedGateway(
+        [ScriptedTurn(text="I will check whether Godot is installed.")]
+    )
 
     result = _runtime(gateway, dispatcher).run("status?")
 
-    assert result.text == "Nothing to do."
-    assert result.turns == 1
+    assert result.completion is Completion.INCOMPLETE
+    assert result.text == "I will check whether Godot is installed."
     assert result.tool_calls == 0
+    assert result.turns > 1  # nudged at least once, not a one-turn success
+
+
+def test_a_done_declaration_ends_the_run(dispatcher_factory) -> None:
+    """Calling the completion tool with status 'done' finishes the run."""
+    dispatcher, _ = dispatcher_factory()
+    gateway = ScriptedGateway(
+        [
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": "Nothing to do.",
+                            "validation": "inspected the repository",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
+        ]
+    )
+
+    result = _runtime(gateway, dispatcher).run("status?")
+
+    assert result.completion is Completion.DONE
+    assert result.turns == 1
+    assert result.tool_calls == 1
+    assert "status: done" in result.text
+    assert "Nothing to do." in result.text
+
+
+def test_a_blocked_declaration_ends_the_run_distinctly(dispatcher_factory) -> None:
+    """Calling the completion tool with status 'blocked' is not a success."""
+    dispatcher, _ = dispatcher_factory()
+    gateway = ScriptedGateway(
+        [
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "blocked",
+                            "summary": "no Godot 4 installed",
+                            "limitations": "need Godot 4 to create the scene",
+                        },
+                    ),
+                )
+            ),
+        ]
+    )
+
+    result = _runtime(gateway, dispatcher).run("make the scene")
+
+    assert result.completion is Completion.BLOCKED
+    assert "status: blocked" in result.text
+    assert "no Godot 4 installed" in result.text
+
+
+def test_a_done_declaration_must_identify_validation_and_limitations(dispatcher_factory) -> None:
+    """A done declaration without validation and limitations is refused.
+
+    The first, incomplete declaration is an invalid_arguments result the model
+    reads and corrects; only the complete second one ends the run -- a done
+    outcome that never says how the work was verified cannot be reported.
+    """
+    dispatcher, _ = dispatcher_factory()
+    gateway = ScriptedGateway(
+        [
+            ScriptedTurn(
+                tool_calls=(("finish", {"status": "done", "summary": "done it"}),)
+            ),
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": "done it",
+                            "validation": "ran the suite",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
+        ]
+    )
+
+    result = _runtime(gateway, dispatcher).run("make the scene")
+
+    assert result.completion is Completion.DONE
+    assert result.turns == 2
+    # The malformed first declaration was returned to the model, not accepted.
+    tool_messages = [m for m in result.state.messages if m.role == "tool"]
+    assert '"status":"invalid_arguments"' in tool_messages[0].content
 
 
 def test_state_store_preserves_two_turn_message_continuity(dispatcher_factory, workspace) -> None:
     dispatcher, _ = dispatcher_factory()
     state = ConversationStateStore().get(workspace.root, "BYTE")
-    gateway = ScriptedGateway([ScriptedTurn(text="first"), ScriptedTurn(text="second")])
+    gateway = ScriptedGateway(
+        [
+            ScriptedTurn(
+                tool_calls=(("finish", {"status": "blocked", "summary": "remembered"}),)
+            ),
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": "second",
+                            "validation": "v",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
+        ]
+    )
     runtime = _runtime(gateway, dispatcher)
 
     runtime.run("remember this", state=state)
@@ -129,17 +253,29 @@ def test_tool_call_dispatches_appends_and_continues(dispatcher_factory, workspac
     gateway = ScriptedGateway(
         [
             ScriptedTurn(tool_calls=(("read_file", {"path": "notes.txt"}),)),
-            ScriptedTurn(text="The file says hello."),
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": "The file says hello.",
+                            "validation": "read the file",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
         ]
     )
 
     result = _runtime(gateway, dispatcher).run("what does notes.txt say?")
 
-    assert result.text == "The file says hello."
+    assert result.completion is Completion.DONE
+    assert "The file says hello." in result.text
     assert result.turns == 2
-    assert result.tool_calls == 1
+    assert result.tool_calls == 2  # read_file, then the finish declaration
     tool_messages = [m for m in result.state.messages if m.role == "tool"]
-    assert len(tool_messages) == 1
     assert "hello" in tool_messages[0].content
 
 
@@ -159,14 +295,27 @@ def test_multiple_tool_calls_in_one_turn_count_as_one_turn(dispatcher_factory) -
                     ("read_file", {"path": "c.txt"}),
                 )
             ),
-            ScriptedTurn(text="done"),
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": "read all three",
+                            "validation": "opened each file",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
         ]
     )
 
     result = _runtime(gateway, dispatcher).run("read three files")
 
     assert result.turns == 2
-    assert result.tool_calls == 3
+    # Three parallel reads in one turn, plus the one finish declaration.
+    assert result.tool_calls == 4
 
 
 def test_max_turn_limit_raises(dispatcher_factory) -> None:
@@ -994,7 +1143,11 @@ def test_repeated_rejection_does_not_reprompt(dispatcher_factory) -> None:
                     ("exec_command", {"program": "git", "args": ["push", "origin", "main"]}),
                 )
             ),
-            ScriptedTurn(text="I cannot push."),
+            ScriptedTurn(
+                tool_calls=(
+                    ("finish", {"status": "blocked", "summary": "I cannot push."}),
+                )
+            ),
         ]
     )
 
@@ -1002,8 +1155,9 @@ def test_repeated_rejection_does_not_reprompt(dispatcher_factory) -> None:
 
     # One prompt, not two: the operator said no once and is not asked again.
     assert len(channel.presented) == 1
+    assert result.completion is Completion.BLOCKED
     assert result.turns == 3
-    assert result.tool_calls == 2
+    assert result.tool_calls == 3  # two denials, then the blocked declaration
 
 
 def test_repeated_denial_does_not_invoke_the_classifier_again(dispatcher_factory) -> None:

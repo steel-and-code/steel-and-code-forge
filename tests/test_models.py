@@ -713,6 +713,39 @@ def test_local_gateway_parses_qwen_tool_call_markup() -> None:
     }
 
 
+def test_local_gateway_never_surfaces_reasoning_as_the_answer() -> None:
+    """Qwen's `reasoning` scratch is dropped, never promoted to the answer.
+
+    A thinking model emits its chain of thought in a `reasoning` field and
+    leaves `content` empty. The gateway must not dress that reasoning up as the
+    final answer -- an empty `content` is "not finished" (the runtime nudges for
+    an action or a declaration), not a result. This pins that gap so a future
+    "fix" that merges reasoning into text fails here.
+    """
+    from forge.models.local import LocalLlamaGateway
+
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "",
+                    "reasoning": (
+                        "The workspace has no Godot project; check whether "
+                        "Godot 4 is installed."
+                    ),
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    response = LocalLlamaGateway._parse_response(payload, allowed_tools=set())
+
+    assert response.text == ""
+    assert not response.wants_tools
+    assert "Godot" not in response.text
+
+
 def test_local_gateway_parses_qwen_xml_style_tool_call() -> None:
     """Qwen XML-style self-closing tool calls are normalised."""
     from forge.models.local import LocalLlamaGateway

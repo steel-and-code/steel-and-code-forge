@@ -49,6 +49,7 @@ from ..tools.workspace import Classification
 __all__ = [
     "EXIT_OK",
     "EXIT_MODEL_UNAVAILABLE",
+    "EXIT_INCOMPLETE",
     "EXIT_REFUSED",
     "EXIT_USAGE",
     "EXIT_NEEDS_APPROVAL",
@@ -99,6 +100,14 @@ EXIT_INTERNAL = 4
 #: conflate them if they shared a code. Shares EXIT_REFUSED's *class* -- both
 #: mean "this did not happen" -- while staying distinguishable.
 EXIT_MODEL_UNAVAILABLE = 5
+
+#: An agent run finished without the model declaring success: ``blocked`` (the
+#: model declared it could not proceed) or ``incomplete`` (it stopped talking
+#: without declaring anything). Distinct from ``EXIT_OK`` because a script must
+#: be able to tell "the assignment is done" from "the run ended and it is not".
+#: The rendered outcome labels the two cases apart; the code is shared because
+#: both mean "not successfully completed".
+EXIT_INCOMPLETE = 6
 
 # --------------------------------------------------------------------------
 # States

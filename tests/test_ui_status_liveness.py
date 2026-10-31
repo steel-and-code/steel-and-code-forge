@@ -75,6 +75,23 @@ def _make_session(workspace: Workspace, gateway):
     return session, broker
 
 
+def _done(summary: str) -> ScriptedTurn:
+    """A scripted turn declaring the run done with the given summary."""
+    return ScriptedTurn(
+        tool_calls=(
+            (
+                "finish",
+                {
+                    "status": "done",
+                    "summary": summary,
+                    "validation": "verified",
+                    "limitations": "none",
+                },
+            ),
+        )
+    )
+
+
 def _wait_state(session: WorkbenchSession, state: str, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -90,7 +107,7 @@ def test_mid_run_status_reports_live_progress(workspace: Workspace) -> None:
     gateway = GatedGateway(
         [
             ScriptedTurn(tool_calls=(("read_file", {"path": "notes.txt"}),)),
-            ScriptedTurn(text="all done"),
+            _done("all done"),
         ],
         block_on_call=2,
     )
@@ -110,9 +127,9 @@ def test_mid_run_status_reports_live_progress(workspace: Workspace) -> None:
     gateway.release.set()
     _wait_state(session, "completed")
     final = session.status()
-    assert cast(dict, final["result"])["text"] == "all done"
+    assert "all done" in cast(dict, final["result"])["text"]
     assert final["turns"] == 2
-    assert final["tool_calls"] == 1
+    assert final["tool_calls"] == 2  # read_file, then the finish declaration
 
 
 def test_lifecycle_events_reach_the_broker_exactly_once(workspace: Workspace) -> None:
@@ -121,7 +138,7 @@ def test_lifecycle_events_reach_the_broker_exactly_once(workspace: Workspace) ->
     gateway = ScriptedGateway(
         [
             ScriptedTurn(tool_calls=(("read_file", {"path": "notes.txt"}),)),
-            ScriptedTurn(text="done"),
+            _done("done"),
         ]
     )
     session, broker = _make_session(workspace, gateway)
@@ -138,8 +155,8 @@ def test_lifecycle_events_reach_the_broker_exactly_once(workspace: Workspace) ->
     # Each lifecycle event is published exactly once; model.reply is once per turn.
     assert counts["run.started"] == 1, counts
     assert counts["run.completed"] == 1, counts
-    assert counts["tool.call"] == 1, counts
-    assert counts["tool.result"] == 1, counts
+    assert counts["tool.call"] == 2, counts  # read_file + the finish declaration
+    assert counts["tool.result"] == 2, counts
     assert counts["model.reply"] == 2, counts
     assert counts["run.submitted"] == 1, counts
 
@@ -149,7 +166,7 @@ def test_status_reads_are_thread_safe_during_a_run(workspace: Workspace) -> None
     (workspace.root / "notes.txt").write_text("hello")
     # Enough tool-call turns to keep the worker emitting while readers hammer.
     turns = [ScriptedTurn(tool_calls=(("read_file", {"path": "notes.txt"}),)) for _ in range(20)]
-    turns.append(ScriptedTurn(text="finished"))
+    turns.append(_done("finished"))
     session, _ = _make_session(workspace, ScriptedGateway(turns))
 
     session.submit("read repeatedly")
@@ -180,5 +197,5 @@ def test_status_reads_are_thread_safe_during_a_run(workspace: Workspace) -> None
     _wait_state(session, "completed")
     final = session.status()
     assert final["turns"] == 21
-    assert final["tool_calls"] == 20
-    assert cast(dict, final["result"])["text"] == "finished"
+    assert final["tool_calls"] == 21  # 20 reads, then the finish declaration
+    assert "finished" in cast(dict, final["result"])["text"]

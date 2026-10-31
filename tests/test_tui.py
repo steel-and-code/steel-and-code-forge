@@ -15,6 +15,25 @@ from forge.cli.main import build_parser, main
 from forge.cli.render import EXIT_OK, EXIT_USAGE
 
 
+def _done(summary: str):
+    """A scripted turn declaring the run done, used as a clean terminal turn."""
+    from forge.models.scripted import ScriptedTurn
+
+    return ScriptedTurn(
+        tool_calls=(
+            (
+                "finish",
+                {
+                    "status": "done",
+                    "summary": summary,
+                    "validation": "verified",
+                    "limitations": "none",
+                },
+            ),
+        )
+    )
+
+
 def test_tui_command_accepts_explicit_workspace(tmp_path: Path) -> None:
     args = build_parser().parse_args(["tui", "--workspace", str(tmp_path)])
     assert args.subcommand == "tui"
@@ -205,7 +224,7 @@ def test_activity_shows_observed_turns_and_tool_calls(tmp_path: Path, monkeypatc
 
     cli = importlib.import_module("forge.cli.main")
     monkeypatch.setattr(cli, "_build_model_gateway", lambda *a, **kw: ScriptedGateway([
-        ScriptedTurn(tool_calls=(("not_a_tool", {}),)), ScriptedTurn(text="finished"),
+        ScriptedTurn(tool_calls=(("not_a_tool", {}),)), _done("finished"),
     ]))
     screen = FakeScreen([9, ord("x"), 10,
                          ("wait_status", "Neighbor Completed", 9), ord("q")], width=110)
@@ -213,7 +232,7 @@ def test_activity_shows_observed_turns_and_tool_calls(tmp_path: Path, monkeypatc
     assert "Neighbor started" in screen.frames[-1]
     assert "Neighbor Completed" in screen.frames[-1]
     assert "2 model turns" in screen.frames[-1]
-    assert "1 tool call" in screen.frames[-1]
+    assert "2 tool call" in screen.frames[-1]
     assert "Running Neighbor..." not in screen.frames[-1]
 
 
@@ -814,12 +833,12 @@ def test_native_runner_response_is_separate_from_cli_summary(tmp_path: Path, mon
     cli = importlib.import_module("forge.cli.main")
     answer = "# Full answer\n\n" + "line\n" * 80
     monkeypatch.setattr(cli, "_build_model_gateway", lambda *args, **kwargs:
-                        ScriptedGateway([ScriptedTurn(text=answer)]))
+                        ScriptedGateway([_done(answer)]))
     code, display, error, response = tui._execute(
         tui.SubmittedTask("Neighbor", "task", tmp_path), channel=object()
     )
     assert code == 0 and error == ""
-    assert response == answer
+    assert answer in response
     assert display != response
 
 
@@ -1103,7 +1122,33 @@ def test_neighbor_tui_run_reports_provider_503_and_can_submit_again(
         requested_models.append(json.loads(body)["model"])
         if len(requested_models) == 1:
             return 200, '{"error": {"code": 503}}'
-        return 200, '{"choices": [{"message": {"content": "Neighbor answered."}}]}'
+        done = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "finish",
+                                    "arguments": json.dumps(
+                                        {
+                                            "status": "done",
+                                            "summary": "Neighbor answered.",
+                                            "validation": "verified",
+                                            "limitations": "none",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        return 200, json.dumps(done)
 
     monkeypatch.setattr(OpenRouterGateway, "_post", provider_reply)
     second_response = threading.Event()
@@ -1135,8 +1180,8 @@ def test_two_tui_messages_reach_model_with_prior_structured_history(tmp_path: Pa
     cli = importlib.import_module("forge.cli.main")
     gateways = []
     turns = [
-        [ScriptedTurn(tool_calls=(("not_a_tool", {}),)), ScriptedTurn(text="first answer")],
-        [ScriptedTurn(text="second answer")],
+        [ScriptedTurn(tool_calls=(("not_a_tool", {}),)), _done("first answer")],
+        [_done("second answer")],
     ]
 
     def gateway(*args, **kwargs):
@@ -1173,7 +1218,7 @@ def test_two_tui_messages_reach_model_with_prior_structured_history(tmp_path: Pa
     messages = gateways[1].last_request.messages
     assert [(m.role, m.content) for m in messages] == [
         ("user", "first"), ("assistant", ""), ("tool", messages[2].content),
-        ("assistant", "first answer"), ("user", "second"),
+        ("assistant", ""), ("tool", messages[4].content), ("user", "second"),
     ]
     assert messages[1].tool_calls == (ToolCall("call_1", "not_a_tool", "{}"),)
     assert messages[2].tool_call_id == "call_1"
@@ -1187,7 +1232,7 @@ def test_tui_history_is_scoped_by_normalized_workspace_and_agent(tmp_path: Path,
     gateways = []
 
     def gateway(*args, **kwargs):
-        model = ScriptedGateway([ScriptedTurn(text="ok")])
+        model = ScriptedGateway([_done("ok")])
         gateways.append(model)
         return model
 
@@ -1205,11 +1250,19 @@ def test_tui_history_is_scoped_by_normalized_workspace_and_agent(tmp_path: Path,
     assert len(submit("Neighbor", tmp_path, "neighbor first")) == 1
     assert len(submit("Byte", tmp_path, "byte first")) == 1
     assert len(submit("Neighbor", other, "other first")) == 1
-    assert [m.content for m in submit("Neighbor", tmp_path / ".", "neighbor next")] == [
-        "neighbor first", "ok", "neighbor next",
+    # A second submit in the same scope carries the prior run through: the two
+    # tasks as user messages, with the prior finish declaration between them.
+    neighbor_next = submit("Neighbor", tmp_path / ".", "neighbor next")
+    assert [m.content for m in neighbor_next if m.role == "user"] == [
+        "neighbor first", "neighbor next",
     ]
-    assert [m.content for m in submit("Byte", tmp_path, "byte next")] == [
-        "byte first", "ok", "byte next",
+    assert any(
+        m.role == "assistant" and m.tool_calls and m.tool_calls[0].name == "finish"
+        for m in neighbor_next
+    )
+    byte_next = submit("Byte", tmp_path, "byte next")
+    assert [m.content for m in byte_next if m.role == "user"] == [
+        "byte first", "byte next",
     ]
 
 
@@ -1221,10 +1274,10 @@ def test_failed_tui_turn_does_not_poison_next_turn(tmp_path: Path, monkeypatch) 
     cli = importlib.import_module("forge.cli.main")
     gateways = []
     scripts = [
-        [ScriptedTurn(text="baseline")],
+        [_done("baseline")],
         [ScriptedTurn(tool_calls=(("not_a_tool", {}),)),
          ScriptedTurn(raises=GatewayError("offline"))],
-        [ScriptedTurn(text="recovered")],
+        [_done("recovered")],
     ]
 
     def gateway(*args, **kwargs):
@@ -1241,8 +1294,9 @@ def test_failed_tui_turn_does_not_poison_next_turn(tmp_path: Path, monkeypatch) 
     assert submit("first")[0] == EXIT_OK
     assert submit("failed")[0] != EXIT_OK
     assert submit("retry")[0] == EXIT_OK
-    assert [(m.role, m.content) for m in gateways[-1].last_request.messages] == [
-        ("user", "first"), ("assistant", "baseline"), ("user", "retry"),
+    messages = gateways[-1].last_request.messages
+    assert [(m.role, m.content) for m in messages] == [
+        ("user", "first"), ("assistant", ""), ("tool", messages[2].content), ("user", "retry"),
     ]
 
 
@@ -1253,7 +1307,7 @@ def test_standalone_cli_tasks_remain_stateless(tmp_path: Path, monkeypatch) -> N
     gateways = []
 
     def gateway(*args, **kwargs):
-        model = ScriptedGateway([ScriptedTurn(text="ok")])
+        model = ScriptedGateway([_done("ok")])
         gateways.append(model)
         return model
 

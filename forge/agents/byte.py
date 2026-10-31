@@ -49,6 +49,7 @@ BYTE_TOOLS: tuple[str, ...] = (
     "write_file",
     "patch_file",
     "exec_command",
+    "finish",
 )
 
 
@@ -144,7 +145,14 @@ anything left unresolved. If you changed nothing, say that and why.
 
 When you fail: say what you attempted, what the actual error was, and what you \
 did not try next. Do not report partial work as complete. Do not describe work \
-you did not verify as verified."""
+you did not verify as verified.
+
+A run ends only when you declare it. Call the completion tool exactly once \
+when you are done or when you are blocked, and state which. A done declaration \
+names what was completed, how it was verified, and what remains unresolved. A \
+blocked declaration names what was attempted and what stopped you. Prose about \
+what you intend to do is not finishing: keep working, or declare done or \
+blocked."""
 
 
 BLOCKS: tuple[str, ...] = (

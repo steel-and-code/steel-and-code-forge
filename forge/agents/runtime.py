@@ -53,6 +53,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from ..events import EventSink, emit
@@ -62,15 +63,22 @@ from ..models.base import (
     Message,
     ModelGateway,
 )
-from ..tools.dispatcher import ToolDispatcher, ToolResult, ToolStatus
+from ..tools.dispatcher import (
+    FINISH_TOOL,
+    ToolDispatcher,
+    ToolResult,
+    ToolStatus,
+)
 from .profile import AgentProfile
 from .state import ConversationState
 
 __all__ = [
     "AgentRuntime",
     "RunResult",
+    "Completion",
     "MaxTurnsExceeded",
     "MAX_TOOL_TURNS",
+    "MAX_CONTINUATION_NUDGES",
 ]
 
 
@@ -79,6 +87,44 @@ __all__ = [
 #: while still bounding a runaway agent. Configurable *downward* per run and by
 #: profile; a profile may never raise it.
 MAX_TOOL_TURNS = 75
+
+
+class Completion(str, Enum):
+    """How a run ended.
+
+    The model is the only thing that can *declare* completion: it does so by
+    calling the ``finish`` tool with a ``status`` of ``done`` or ``blocked``.
+    Absent that declaration the runtime never reports success -- a run whose
+    model merely stopped emitting tool calls ends ``INCOMPLETE``, not ``DONE``.
+
+        DONE        the model declared the task complete, with a report.
+        BLOCKED     the model declared it could not proceed, with a report.
+        INCOMPLETE  the model stopped talking without ever declaring an
+                    outcome; its last prose is preserved, flagged as unresolved.
+    """
+
+    DONE = "done"
+    BLOCKED = "blocked"
+    INCOMPLETE = "incomplete"
+
+
+#: How many consecutive narration turns (a reply with no tool call and no
+#: ``finish`` declaration) the runtime tolerates before it ends the run
+#: ``INCOMPLETE``. Bounded so a model that only ever narrates intent cannot
+#: spin the whole 75-turn budget; each nudge is appended as a model-visible
+#: prompt to either act or declare an outcome.
+MAX_CONTINUATION_NUDGES = 2
+
+#: The prompt appended when a turn ended in narration with no tool call. It is
+#: a ``user`` message rather than the system prompt, because it is issued
+#: mid-run in response to the model's own behaviour, not a standing instruction.
+CONTINUE_NUDGE = (
+    "You have not signalled completion. Continue the task: make the next tool "
+    "call, or, if the work is done, call the completion tool with status "
+    "'done' and a summary, validation, and limitations; if you are blocked, "
+    "call it with status 'blocked'. Writing what you intend to do does not end "
+    "the run."
+)
 
 
 class MaxTurnsExceeded(RuntimeError):
@@ -105,7 +151,10 @@ class RunResult:
     Attributes:
         text: The model's final message. Its own words -- the runtime never
             synthesises a summary, because an operator reading a summary cannot
-            tell it apart from the model's actual answer.
+            tell it apart from the model's actual answer. For ``DONE`` and
+            ``BLOCKED`` this is a rendering of the model's own ``finish``
+            declaration fields; for ``INCOMPLETE`` it is the model's last prose,
+            preserved verbatim.
         turns: Model round-trips consumed.
         tool_calls: Individual tool calls dispatched. Greater than ``turns`` when
             a turn carried parallel calls.
@@ -114,6 +163,9 @@ class RunResult:
         denied: Permission refusals that occurred, as ``(tool, detail)`` pairs.
             Surfaced separately because an operator needs to know what was
             refused without reading the transcript.
+        completion: How the run ended. ``DONE`` and ``BLOCKED`` only when the
+            model declared it via the ``finish`` tool; ``INCOMPLETE`` when it
+            stopped talking without declaring anything.
     """
 
     text: str
@@ -121,6 +173,7 @@ class RunResult:
     tool_calls: int
     state: ConversationState
     denied: tuple[tuple[str, str], ...] = ()
+    completion: Completion = Completion.INCOMPLETE
 
 
 class AgentRuntime:
@@ -206,6 +259,7 @@ class AgentRuntime:
         )
 
         try:
+            nudges = 0
             for turn in range(self.max_turns):
                 state.turns = turn + 1
 
@@ -230,20 +284,26 @@ class AgentRuntime:
                 )
 
                 if not response.wants_tools:
-                    emit(
-                        sink,
-                        "run.completed",
-                        turns=str(turn + 1),
-                        tool_calls=str(tool_call_count),
-                        denied=str(len(denied)),
-                    )
-                    return RunResult(
-                        text=response.text,
-                        turns=turn + 1,
-                        tool_calls=tool_call_count,
-                        state=state,
-                        denied=tuple(denied),
-                    )
+                    # Narration only: no tool call, no finish declaration. The
+                    # model has signalled nothing, so this must not read as
+                    # completion. Nudge it a bounded number of times to act or
+                    # declare, then end the run INCOMPLETE -- never DONE.
+                    nudges += 1
+                    if nudges > MAX_CONTINUATION_NUDGES:
+                        return self._result(
+                            state,
+                            turn,
+                            tool_call_count,
+                            tuple(denied),
+                            Completion.INCOMPLETE,
+                            response.text,
+                        )
+                    state.add_user(CONTINUE_NUDGE)
+                    continue
+
+                # A turn that acted resets the narration budget: the model is
+                # still working, not stalled.
+                nudges = 0
 
                 # Sequential, never concurrent: each call gets its own approval
                 # prompt, and two prompts on one terminal at once is not a thing.
@@ -254,6 +314,13 @@ class AgentRuntime:
 
                     if result.status.is_permission_refusal:
                         denied.append((result.tool, result.detail))
+
+                    # A valid finish declaration is terminal. A malformed one is
+                    # an ordinary invalid_arguments result the model can correct.
+                    if call.name == FINISH_TOOL and result.status is ToolStatus.OK:
+                        return self._finish_result(
+                            state, turn, tool_call_count, tuple(denied), result
+                        )
         except GatewayError as exc:
             # Observed, then re-raised unchanged. A provider failure still
             # propagates to the caller; what is added is that a surface watching
@@ -270,6 +337,95 @@ class AgentRuntime:
         )
         raise MaxTurnsExceeded(self.max_turns, tool_call_count)
 
+    def _result(
+        self,
+        state: ConversationState,
+        turn: int,
+        tool_call_count: int,
+        denied: tuple[tuple[str, str], ...],
+        completion: Completion,
+        text: str,
+    ) -> RunResult:
+        """Build and report a terminal ``RunResult``.
+
+        The one place a run ends normally -- no path returns a ``RunResult``
+        except through here, so the ``run.completed`` event (carrying the
+        outcome) is always paired with the value the caller sees.
+        """
+        emit(
+            self.events,
+            "run.completed",
+            turns=str(turn + 1),
+            tool_calls=str(tool_call_count),
+            denied=str(len(denied)),
+            completion=completion.value,
+        )
+        return RunResult(
+            text=text,
+            turns=turn + 1,
+            tool_calls=tool_call_count,
+            state=state,
+            denied=denied,
+            completion=completion,
+        )
+
+    def _finish_result(
+        self,
+        state: ConversationState,
+        turn: int,
+        tool_call_count: int,
+        denied: tuple[tuple[str, str], ...],
+        result: ToolResult,
+    ) -> RunResult:
+        """Turn a valid ``finish`` tool result into the terminal run result.
+
+        The declared ``status`` chooses ``DONE`` or ``BLOCKED``; the report text
+        is a rendering of the model's own declaration fields, never a synthesis.
+        """
+        content = result.content if isinstance(result.content, dict) else {}
+        completion = _completion_from_declaration(content)
+        return self._result(
+            state,
+            turn,
+            tool_call_count,
+            denied,
+            completion,
+            _render_finish(content),
+        )
+
+
+def _completion_from_declaration(content: dict[str, Any]) -> Completion:
+    """Map a ``finish`` declaration's ``status`` onto a :class:`Completion`."""
+    declared = content.get("status")
+    return Completion.BLOCKED if declared == "blocked" else Completion.DONE
+
+
+def _render_finish(content: dict[str, Any]) -> str:
+    """Render the model's own finish fields for the operator.
+
+    A thin, labelled transcription of what the model declared -- status, then
+    the summary, validation (done only), and limitations it chose to state. It
+    is not a summary of the transcript: every line here came from the model's
+    declaration, and nothing is paraphrased.
+    """
+    status = content.get("status", Completion.DONE.value)
+    lines = [f"status: {status}"]
+    summary = str(content.get("summary") or "").strip()
+    if summary:
+        lines.append(f"summary: {summary}")
+    if status == Completion.BLOCKED.value:
+        limitations = str(content.get("limitations") or "").strip()
+        if limitations:
+            lines.append(f"blocked on: {limitations}")
+    else:
+        validation = str(content.get("validation") or "").strip()
+        if validation:
+            lines.append(f"validation: {validation}")
+        limitations = str(content.get("limitations") or "").strip()
+        if limitations:
+            lines.append(f"limitations: {limitations}")
+    return "\n".join(lines)
+
 
 def summarise(result: RunResult) -> str:
     """A short operator-facing account of a run.
@@ -280,6 +436,7 @@ def summarise(result: RunResult) -> str:
     lines = [
         f"agent: {result.turns} model turn(s), {result.tool_calls} tool call(s)"
     ]
+    lines.append(f"outcome: {result.completion.value}")
     if result.denied:
         lines.append("permission refusals:")
         lines.extend(f"  - {tool}: {detail}" for tool, detail in result.denied)

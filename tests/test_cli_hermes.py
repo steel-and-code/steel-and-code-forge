@@ -460,7 +460,23 @@ def test_byte_still_runs_after_the_external_agent_arrived(
     monkeypatch.setattr(
         cli_module,
         "_build_model_gateway",
-        lambda *a, **k: ScriptedGateway([ScriptedTurn(text="Byte ran.")]),
+        lambda *a, **k: ScriptedGateway(
+            [
+                ScriptedTurn(
+                    tool_calls=(
+                        (
+                            "finish",
+                            {
+                                "status": "done",
+                                "summary": "Byte ran.",
+                                "validation": "ran",
+                                "limitations": "none",
+                            },
+                        ),
+                    )
+                ),
+            ]
+        ),
     )
 
     result = run(
@@ -480,7 +496,23 @@ def test_neighbor_still_runs_after_the_external_agent_arrived(
     monkeypatch.setattr(
         cli_module,
         "_build_model_gateway",
-        lambda *a, **k: ScriptedGateway([ScriptedTurn(text="Neighbor ran.")]),
+        lambda *a, **k: ScriptedGateway(
+            [
+                ScriptedTurn(
+                    tool_calls=(
+                        (
+                            "finish",
+                            {
+                                "status": "done",
+                                "summary": "Neighbor ran.",
+                                "validation": "ran",
+                                "limitations": "none",
+                            },
+                        ),
+                    )
+                ),
+            ]
+        ),
     )
 
     result = run(

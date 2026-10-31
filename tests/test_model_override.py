@@ -752,7 +752,21 @@ def test_a_full_run_with_an_override_writes_nothing(
         module,
         "_build_model_gateway",
         lambda *a, **k: ScriptedGateway(
-            [ScriptedTurn(text="Ran on the pinned model.")]
+            [
+                ScriptedTurn(
+                    tool_calls=(
+                        (
+                            "finish",
+                            {
+                                "status": "done",
+                                "summary": "Ran on the pinned model.",
+                                "validation": "ran",
+                                "limitations": "none",
+                            },
+                        ),
+                    )
+                ),
+            ]
         ),
     )
 

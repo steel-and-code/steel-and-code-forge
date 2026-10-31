@@ -950,14 +950,26 @@ def test_the_stream_carries_run_and_tool_activity(workspace: Workspace) -> None:
         workspace,
         [
             ScriptedTurn(text="looking", tool_calls=(("search_files", {"pattern": "*"}),)),
-            ScriptedTurn(text="done"),
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": "done",
+                            "validation": "searched",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
         ],
     )
 
     def trigger():
         harness.submit("look around")
 
-    frames, _ = _collect(harness, 8, trigger=trigger)
+    frames, _ = _collect(harness, 12, trigger=trigger)
     names = [frame["event"] for frame in frames]
 
     assert "run.started" in names, names
