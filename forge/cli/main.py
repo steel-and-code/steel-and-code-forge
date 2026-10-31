@@ -180,6 +180,8 @@ Hermes picks its own model; Forge only reports it.
 `forge workbench` serves a local browser view of one Byte run on loopback, or
 on one named LAN address with `--lan --lan-address` when you want to watch it
 on a tablet.
+`forge start` starts the Space Monkey local model (container + SSH tunnel) and
+serves the Workbench on it, pinned to the local provider, in one command.
 
 Usage:
   forge check command --workspace DIR [-- PROGRAM [ARG...]]
@@ -800,6 +802,67 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         default=None,
         help=f"explicit workspace root (required; may also be set via {WORKSPACE_ENV})",
+    )
+
+    start_parser = sub.add_parser(
+        "start",
+        help="start the Space Monkey local model and serve the Workbench",
+        description=(
+            "One command to launch the Workbench on the Space Monkey local "
+            "model. Starts the remote Ollama container if needed, opens (or "
+            "reuses) the SSH tunnel, verifies the selected model, and then "
+            "serves the same browser surface `forge workbench` serves -- "
+            "pinned to the local provider, so a successful start can never "
+            "silently route to a paid model.\n\n"
+            "Machine-specific facts (SSH alias, container name, ports, default "
+            "model) are read from the environment, not stored in code; see "
+            "docs/forge-start.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  forge start --workspace .\n"
+            "  forge start --workspace . --model qwen3.5:9b\n"
+            "  forge start --workspace . --no-smoke\n"
+        ),
+    )
+    start_parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        default=None,
+        help=(
+            "explicit workspace root (required; may also be set via "
+            f"{WORKSPACE_ENV}). Not inferred from the current directory."
+        ),
+    )
+    start_parser.add_argument(
+        "--model",
+        metavar="ID",
+        default=None,
+        help=(
+            "local model id served by Space Monkey. Defaults to "
+            "${FORGE_START_MODEL}, then qwen3.5:27b-q4_K_M. The provider is "
+            "always local; this never routes to a paid provider."
+        ),
+    )
+    start_parser.add_argument(
+        "--port",
+        metavar="N",
+        type=int,
+        default=DEFAULT_WORKBENCH_PORT,
+        help=(
+            "workbench port to bind (default: %(default)s). The model tunnel "
+            "port is separate and set with ${FORGE_START_LOCAL_PORT}."
+        ),
+    )
+    start_parser.add_argument(
+        "--no-smoke",
+        action="store_true",
+        help=(
+            "skip the inference smoke test. By default `forge start` runs one "
+            "tiny completion to prove the model actually answers before it "
+            "serves the Workbench."
+        ),
     )
 
     return parser
@@ -1867,6 +1930,73 @@ def _run_workbench(
     return EXIT_OK
 
 
+def _run_start(
+    args: argparse.Namespace,
+    workspace: Workspace,
+    *,
+    out: TextIO,
+    err: TextIO,
+    environ: dict[str, str],
+) -> int:
+    """One command: Space Monkey local model + the Workbench.
+
+    Brings up the remote Ollama container, opens (or reuses) the SSH tunnel,
+    verifies the selected model with a smoke inference, then serves the same
+    Workbench ``forge workbench`` serves -- pinned to the local provider so a
+    successful start can never silently route to a paid model or a model other
+    than the one just verified.
+
+    Every machine-specific fact (SSH alias, container, ports, default model) is
+    read in ``forge/startup/orchestrator.py``, which is imported lazily here for
+    the same reason the Hermes runner is imported lazily: ``forge check`` must
+    not import a module that can open a socket or a subprocess.
+    """
+    from ..startup.orchestrator import (
+        StartError,
+        bring_up,
+        close_tunnel,
+        load_config,
+    )
+
+    # Configuration is read -- and validated -- first, because it is the reason
+    # this command exists and a typo should not cost a subprocess or a probe.
+    try:
+        config = load_config(environ)
+    except StartError as exc:
+        print(f"forge: {exc}", file=err)
+        return EXIT_USAGE
+
+    # Pin the local provider and the model before the Workbench resolves
+    # anything. The endpoints follow the tunnel port the start layer owns, and
+    # the provider is forced to ``local`` so routing can never fall back to a
+    # paid provider on this path.
+    local_environ = dict(environ)
+    local_environ[MODEL_PROVIDER_ENV] = "local"
+    local_environ["FORGE_LOCAL_ENDPOINT"] = config.chat_endpoint
+    local_environ["FORGE_LOCAL_MODELS_ENDPOINT"] = config.models_endpoint
+    if not getattr(args, "model", None):
+        args.model = config.model
+
+    tunnel = None
+    try:
+        tunnel = bring_up(config, smoke=not bool(getattr(args, "no_smoke", False)))
+    except StartError as exc:
+        print(f"forge: could not start the local model: {exc}", file=err)
+        print(
+            "forge: recovery: see docs/forge-start.md (container logs, stale "
+            "tunnel, or missing model)",
+            file=err,
+        )
+        return EXIT_MODEL_UNAVAILABLE
+
+    try:
+        return _run_workbench(
+            args, workspace, out=out, err=err, environ=local_environ
+        )
+    finally:
+        # Only a tunnel this run opened is torn down; a tunnel owned by another
+        # process is left alone.
+        close_tunnel(tunnel)
 
 
 # --------------------------------------------------------------------------
@@ -2375,6 +2505,22 @@ def main(
                 return EXIT_USAGE
 
             return _run_workbench(
+                args,
+                workspace,
+                out=out_stream,
+                err=err_stream,
+                environ=env,
+            )
+
+        if args.subcommand == "start":
+            workspace, problem = _resolve_workspace(
+                getattr(args, "workspace", None), env
+            )
+            if workspace is None:
+                print(f"forge: {problem}", file=err_stream)
+                return EXIT_USAGE
+
+            return _run_start(
                 args,
                 workspace,
                 out=out_stream,
