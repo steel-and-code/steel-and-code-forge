@@ -35,6 +35,7 @@ from forge.cli.main import (
     build_parser,
     main,
 )
+from forge.cli import render
 from forge.models.registry import MODELS_CONFIG_ENV
 from forge.models.scripted import ScriptedGateway, ScriptedTurn
 
@@ -405,7 +406,22 @@ def test_a_neighbor_run_completes_end_to_end(
     tmp_path: Path, workspace_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`forge neighbor` runs the agent loop and prints the model's own words."""
-    _with_scripted_gateway(monkeypatch, ScriptedTurn(text="It builds and tests Forge."))
+    _with_scripted_gateway(
+        monkeypatch,
+        ScriptedTurn(
+            tool_calls=(
+                (
+                    "finish",
+                    {
+                        "status": "done",
+                        "summary": "It builds and tests Forge.",
+                        "validation": "ran the build and tests",
+                        "limitations": "none",
+                    },
+                ),
+            )
+        ),
+    )
 
     result = run(
         ["neighbor", "--workspace", str(workspace_dir), "--unattended", "what is this?"],
@@ -414,7 +430,7 @@ def test_a_neighbor_run_completes_end_to_end(
 
     assert result.code == 0, result.err
     assert "It builds and tests Forge." in result.out
-    # The model's own words, not a synthesised summary.
+    # The model's own declaration, not a synthesised summary.
     assert "agent: 1 model turn(s)" in result.out
 
 
@@ -427,7 +443,22 @@ def test_a_byte_run_is_unchanged_end_to_end(
     text, and still report one turn. Anything the shared runner changed for
     Byte would surface here.
     """
-    _with_scripted_gateway(monkeypatch, ScriptedTurn(text="Done."))
+    _with_scripted_gateway(
+        monkeypatch,
+        ScriptedTurn(
+            tool_calls=(
+                (
+                    "finish",
+                    {
+                        "status": "done",
+                        "summary": "Done.",
+                        "validation": "ran the suite",
+                        "limitations": "none",
+                    },
+                ),
+            )
+        ),
+    )
 
     result = run(
         ["byte", "--workspace", str(workspace_dir), "--unattended", "fix it"],
@@ -464,7 +495,19 @@ def test_the_approval_prompt_names_the_agent_that_actually_ran(
                 ),
             )
         ),
-        ScriptedTurn(text="I stopped."),
+        ScriptedTurn(
+            tool_calls=(
+                (
+                    "finish",
+                    {
+                        "status": "done",
+                        "summary": "I stopped.",
+                        "validation": "n/a",
+                        "limitations": "commit was denied",
+                    },
+                ),
+            )
+        ),
     )
 
     class _RecordingChannel:
@@ -527,7 +570,18 @@ def test_an_unattended_neighbor_run_fails_closed_on_an_approval(
                 ),
             )
         ),
-        ScriptedTurn(text="I stopped."),
+        ScriptedTurn(
+            tool_calls=(
+                (
+                    "finish",
+                    {
+                        "status": "blocked",
+                        "summary": "I stopped.",
+                        "limitations": "the commit was refused unattended",
+                    },
+                ),
+            )
+        ),
     )
 
     result = run(
@@ -535,7 +589,9 @@ def test_an_unattended_neighbor_run_fails_closed_on_an_approval(
         environ=_env(_registry(tmp_path)),
     )
 
-    assert result.code == 0, result.err
+    # A refused command leaves the task blocked, which is a distinct, non-zero
+    # exit -- not a success, and not an internal failure either.
+    assert result.code == render.EXIT_INCOMPLETE, result.err
     # The run continued and the model saw a refusal it could read, rather than
     # the command having silently executed.
     assert "I stopped." in result.out

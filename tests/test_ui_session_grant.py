@@ -237,12 +237,36 @@ def test_a_new_run_does_not_inherit_the_previous_grant(workspace: Workspace) -> 
             text="run the tests",
             tool_calls=(("exec_command", {"program": "pytest", "args": ["-q"]}),),
         ),
-        ScriptedTurn(text="first done."),
+        ScriptedTurn(
+            tool_calls=(
+                (
+                    "finish",
+                    {
+                        "status": "done",
+                        "summary": "first done.",
+                        "validation": "ran tests",
+                        "limitations": "none",
+                    },
+                ),
+            )
+        ),
         ScriptedTurn(
             text="run them again",
             tool_calls=(("exec_command", {"program": "pytest", "args": ["-q"]}),),
         ),
-        ScriptedTurn(text="second, gated."),
+        ScriptedTurn(
+            tool_calls=(
+                (
+                    "finish",
+                    {
+                        "status": "done",
+                        "summary": "second, gated.",
+                        "validation": "ran tests",
+                        "limitations": "none",
+                    },
+                ),
+            )
+        ),
     ]
     harness = GrantHarness(workspace, turns)
 

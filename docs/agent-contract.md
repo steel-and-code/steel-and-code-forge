@@ -487,11 +487,27 @@ at a failure it cannot diagnose, and rule circumvention.
 > When you fail: say what you attempted, what the actual error was, and what you
 > did not try next. Do not report partial work as complete. Do not describe work
 > you did not verify as verified.
+>
+> A run ends only when you declare it. Call the completion tool exactly once when
+> you are done or when you are blocked, and state which. A done declaration names
+> what was completed, how it was verified, and what remains unresolved. A blocked
+> declaration names what was attempted and what stopped you. Prose about what you
+> intend to do is not finishing: keep working, or declare done or blocked.
 
 The distinction between *verified* and *believed* is the point of the whole
 block. An agent that reports an unverified change as verified has made the
 operator's review meaningless, and the operator cannot tell the difference from
 the report alone.
+
+The third paragraph is the completion signal, and it exists because a *report*
+is not the same thing as an *ending*. Without it, the only thing the runtime
+could observe was silence: a model that wrote its plan ("I will do X") and then
+stopped was indistinguishable from one that had finished, so a run could be
+reported complete with the work undone. The paragraph therefore makes finishing
+an explicit act — the completion tool is called once, with either `done` or
+`blocked` — and the runtime treats prose that declares no outcome as unfinished
+rather than finished. This is a rule about *signalling*: it changes nothing the
+first two paragraphs say about what a truthful report must contain.
 
 #### What the blocks deliberately omit
 
@@ -1116,12 +1132,24 @@ Byte's, unchanged. Each trigger is architecture-level rather than role-level.
 > When you fail: say what you attempted, what the actual error was, and what
 > you did not try next. Do not report partial work as complete. Do not describe
 > work you did not verify as verified.
+>
+> A run ends only when you declare it. Call the completion tool exactly once when
+> you are done or when you are blocked, and state which. A done declaration names
+> what was completed, how it was verified, and what remains unresolved. A blocked
+> declaration names what was attempted and what stopped you. Prose about what you
+> intend to do is not finishing: keep working, or declare done or blocked.
 
 Byte's, plus one sentence. The verified/believed distinction is Byte's and
 carries over unchanged; the added sentence covers the case Byte cannot produce,
 which is a run that ended in an answer rather than a change — where "what you
 changed" is empty, and an operator needs to be told that is the whole result
 rather than left to infer it from silence.
+
+The completion-signal paragraph is shared, word for word, because a run ends
+the same way for every agent: only an explicit declaration closes it. The
+answer-only case Neighbor adds above is reported through the completion tool
+exactly as a change is -- with `done` and a summary that names the question
+answered rather than "what was changed".
 
 ### Model configuration
 

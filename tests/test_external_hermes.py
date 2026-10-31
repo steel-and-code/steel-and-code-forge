@@ -780,7 +780,7 @@ def test_native_agents_are_unaffected_by_the_external_package() -> None:
     assert BYTE.model is None
     assert NEIGHBOR.model is None
     assert BYTE.allowed_tools == NEIGHBOR.allowed_tools
-    assert len(BYTE.allowed_tools) == 6
+    assert len(BYTE.allowed_tools) == 7
 
 
 def test_the_external_package_imports_no_native_agent_runtime() -> None:

@@ -396,6 +396,13 @@ class LocalLlamaGateway:
                 "(no message)"
             )
 
+        # ``content`` is the answer; ``reasoning`` (a thinking model's scratch
+        # work, e.g. Qwen's) is deliberately read nowhere and never promoted
+        # into ``text``. Surfacing reasoning as the answer would hand the
+        # operator the model's chain of thought dressed up as a result. A reply
+        # that is reasoning-only therefore yields empty text and no tool calls,
+        # and the runtime treats that as "not finished" (it nudges for an
+        # action or a declaration) rather than as a silent empty completion.
         text = message.get("content") or ""
 
         if not isinstance(text, str):

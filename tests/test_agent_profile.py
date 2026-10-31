@@ -95,7 +95,7 @@ def test_neighbor_carries_no_task_kind() -> None:
 
 
 def test_neighbor_takes_the_baseline_tool_set() -> None:
-    """Six tools, the Forge-wide baseline, and the same six Byte has."""
+    """Seven tools, the Forge-wide baseline, and the same seven Byte has."""
     assert NEIGHBOR_TOOLS == BYTE.allowed_tools
     assert set(NEIGHBOR_TOOLS) == {
         "read_file",
@@ -104,6 +104,7 @@ def test_neighbor_takes_the_baseline_tool_set() -> None:
         "write_file",
         "patch_file",
         "exec_command",
+        "finish",
     }
 
 
@@ -343,14 +344,31 @@ def test_neighbor_runs_through_the_unchanged_runtime() -> None:
     root = pathlib.Path(__file__).resolve().parent.parent
     runtime = AgentRuntime(
         NEIGHBOR,
-        gateway=ScriptedGateway([ScriptedTurn(text="All done.")]),
+        gateway=ScriptedGateway(
+            [
+                ScriptedTurn(
+                    tool_calls=(
+                        (
+                            "finish",
+                            {
+                                "status": "done",
+                                "summary": "All done.",
+                                "validation": "read the project",
+                                "limitations": "none",
+                            },
+                        ),
+                    )
+                ),
+            ]
+        ),
         dispatcher=_dispatcher_for(NEIGHBOR, root),
         model_id="scripted",
     )
 
     result = runtime.run("what does this project do?")
 
-    assert result.text == "All done."
+    assert "All done." in result.text
+    assert result.completion.value == "done"
     assert result.turns == 1
 
 

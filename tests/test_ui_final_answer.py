@@ -181,14 +181,31 @@ def test_the_status_payload_carries_the_whole_answer(tmp_path: pathlib.Path) -> 
 
 def test_a_completed_run_still_reports_its_counts(tmp_path: pathlib.Path) -> None:
     """Recovery must not have replaced the summary the operator reads."""
-    session = _session(tmp_path, [ScriptedTurn(text=LONG_ANSWER)])
+    session = _session(
+        tmp_path,
+        [
+            ScriptedTurn(
+                tool_calls=(
+                    (
+                        "finish",
+                        {
+                            "status": "done",
+                            "summary": LONG_ANSWER,
+                            "validation": "verified",
+                            "limitations": "none",
+                        },
+                    ),
+                )
+            ),
+        ],
+    )
 
     session.submit("explain the repair")
     assert _wait(lambda: session.state.value == "completed")
 
     body = session.status()
     assert body["result"]["turns"] == 1
-    assert body["result"]["tool_calls"] == 0
+    assert body["result"]["tool_calls"] == 1  # the finish declaration
     assert body["result"]["denied"] == []
 
 
